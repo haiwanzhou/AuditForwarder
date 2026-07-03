@@ -1,4 +1,4 @@
-﻿﻿# Test configuration
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿# Test configuration
 agent:
   id: "test-agent"
   data_dir: "C:\\AuditData"

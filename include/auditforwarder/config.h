@@ -3,6 +3,7 @@
 
 #include "auditforwarder/types.h"
 #include <map>
+#include <sstream>
 #include <string>
 #include <variant>
 #include <vector>
@@ -11,7 +12,7 @@ namespace af {
 
 class ConfigValue;
 
-// 为实现翻译单元暴露的解析函数。
+// 为配置加载和规则引擎暴露的轻量解析函数。
 Result<void> parse_minimal_json(const std::string& content, ConfigValue& out);
 Result<void> parse_minimal_yaml(const std::string& content, ConfigValue& out);
 Result<void> parse_minimal(const std::string& content, const std::string& format, ConfigValue& out);
@@ -62,6 +63,8 @@ public:
     std::string dump_json() const;
 
 private:
+    void dump_json_locked(std::ostringstream& o, int indent) const;
+
     Type                                              type_ { Type::Null };
     std::variant<bool, long long, double, std::string,
                  std::vector<ConfigValue>,

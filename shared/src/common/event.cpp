@@ -193,6 +193,7 @@ std::string AuditEvent::to_json() const {
         o << '"' << k << "\":\"" << json_escape(v) << '"';
     };
     o << "\"pid\":" << actor.pid << ",\"tid\":" << actor.tid;
+    first = false;
     w("name",    actor.name);
     w("path",    actor.path);
     w("user",    actor.user);
@@ -202,6 +203,7 @@ std::string AuditEvent::to_json() const {
     o << "},\"target\":{";
     first = true;
     o << "\"port\":" << target.port;
+    first = false;
     w("kind",     target.kind);
     w("path",     target.path);
     w("address",  target.address);

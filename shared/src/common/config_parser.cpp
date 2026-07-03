@@ -211,11 +211,59 @@ std::string unquote(const std::string& s) {
     return s;
 }
 
+std::string strip_inline_comment(const std::string& s) {
+    bool in_quote = false;
+    char quote = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if ((c == '"' || c == '\'') && (!in_quote || c == quote)) {
+            in_quote = !in_quote;
+            quote = in_quote ? c : 0;
+            continue;
+        }
+        if (c == '#' && !in_quote && (i == 0 || s[i - 1] == ' ' || s[i - 1] == '\t')) {
+            auto out = s.substr(0, i);
+            while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
+            return out;
+        }
+    }
+    return s;
+}
+
 ConfigValue parse_scalar(const std::string& s) {
-    if (s.empty() || s == "~" || s == "null" || s == "Null" || s == "NULL") return ConfigValue();
-    if (s == "true" || s == "True" || s == "yes" || s == "on")  return ConfigValue(true);
-    if (s == "false" || s == "False" || s == "no" || s == "off") return ConfigValue(false);
-    auto t = s;
+    auto value = strip_inline_comment(s);
+    if (value.empty() || value == "~" || value == "null" || value == "Null" || value == "NULL") return ConfigValue();
+    if (value == "true" || value == "True" || value == "yes" || value == "on")  return ConfigValue(true);
+    if (value == "false" || value == "False" || value == "no" || value == "off") return ConfigValue(false);
+    if (value.size() >= 2 && value.front() == '[' && value.back() == ']') {
+        std::vector<ConfigValue> values;
+        std::string item;
+        bool in_quote = false;
+        char quote = 0;
+        std::string inner = value.substr(1, value.size() - 2);
+        for (char c : inner) {
+            if ((c == '"' || c == '\'') && (!in_quote || c == quote)) {
+                in_quote = !in_quote;
+                quote = in_quote ? c : 0;
+                item.push_back(c);
+                continue;
+            }
+            if (c == ',' && !in_quote) {
+                auto v = item;
+                while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(0, 1);
+                while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+                if (!v.empty()) values.push_back(parse_scalar(v));
+                item.clear();
+            } else {
+                item.push_back(c);
+            }
+        }
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.erase(0, 1);
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.pop_back();
+        if (!item.empty()) values.push_back(parse_scalar(item));
+        return ConfigValue(std::move(values));
+    }
+    auto t = value;
     bool numeric = !t.empty();
     if (t.front() == '-' || t.front() == '+') t.erase(0, 1);
     bool has_dot = t.find('.') != std::string::npos;
@@ -225,15 +273,19 @@ ConfigValue parse_scalar(const std::string& s) {
     }
     if (numeric && all_digit) {
         try {
-            if (has_dot) return ConfigValue(std::stod(s));
-            return ConfigValue(static_cast<long long>(std::stoll(s)));
+            if (has_dot) return ConfigValue(std::stod(value));
+            return ConfigValue(static_cast<long long>(std::stoll(value)));
         } catch (...) {}
     }
-    return ConfigValue(unquote(s));
+    return ConfigValue(unquote(value));
 }
 
 bool is_list_item(const std::string& c) {
     return c.size() >= 2 && c[0] == '-' && (c[1] == ' ' || c[1] == '\t');
+}
+
+bool is_ignorable_yaml_line(const YamlLine& line) {
+    return line.content.empty() || line.content[0] == '#';
 }
 
 Result<ConfigValue> parse_yaml_map(const std::vector<YamlLine>& lines, std::size_t& idx, int base_indent) {
@@ -259,11 +311,15 @@ Result<ConfigValue> parse_yaml_map(const std::vector<YamlLine>& lines, std::size
         ++idx;
 
         if (rest.empty()) {
+            while (idx < lines.size() && lines[idx].indent > base_indent && is_ignorable_yaml_line(lines[idx])) ++idx;
             if (idx < lines.size() && lines[idx].indent > base_indent) {
                 if (is_list_item(lines[idx].content) && lines[idx].indent == base_indent + 2) {
                     // List of maps/mixed
                     std::vector<ConfigValue> arr;
-                    while (idx < lines.size() && lines[idx].indent == base_indent + 2 && is_list_item(lines[idx].content)) {
+                    while (idx < lines.size()) {
+                        if (is_ignorable_yaml_line(lines[idx])) { ++idx; continue; }
+                        if (lines[idx].indent != base_indent + 2) break;
+                        if (!is_list_item(lines[idx].content)) break;
                         std::size_t saved = idx;
                         ++idx;
                         // After "- ", there may be a same-line key:value or a child block
@@ -280,6 +336,11 @@ Result<ConfigValue> parse_yaml_map(const std::vector<YamlLine>& lines, std::size
                             }
                         } else {
                             // Inline sub key: value, build a single-key map and merge subsequent lines
+                            if (sub.size() >= 2 && ((sub.front() == '"' && sub.back() == '"') ||
+                                                     (sub.front() == '\'' && sub.back() == '\''))) {
+                                arr.push_back(parse_scalar(sub));
+                                continue;
+                            }
                             auto sub_colon = sub.find(':');
                             if (sub_colon != std::string::npos) {
                                 std::string kk = sub.substr(0, sub_colon);
@@ -293,6 +354,14 @@ Result<ConfigValue> parse_yaml_map(const std::vector<YamlLine>& lines, std::size
                                     if (inner.is_err()) return inner;
                                     m.emplace(kk, std::move(inner).value());
                                 } else m.emplace(kk, ConfigValue());
+                                if (idx < lines.size() && lines[idx].indent > base_indent + 2) {
+                                    auto extra = parse_yaml_block(lines, idx, lines[idx].indent);
+                                    if (extra.is_err()) return extra;
+                                    ConfigValue merged(std::move(m));
+                                    merged.merge(extra.value());
+                                    arr.push_back(std::move(merged));
+                                    continue;
+                                }
                                 arr.push_back(ConfigValue(std::move(m)));
                             } else {
                                 arr.push_back(parse_scalar(sub));
@@ -316,10 +385,14 @@ Result<ConfigValue> parse_yaml_map(const std::vector<YamlLine>& lines, std::size
 }
 
 Result<ConfigValue> parse_yaml_block(const std::vector<YamlLine>& lines, std::size_t& idx, int base_indent) {
+    while (idx < lines.size() && lines[idx].indent >= base_indent && is_ignorable_yaml_line(lines[idx])) ++idx;
     // 判断是列表还是映射
     if (idx < lines.size() && is_list_item(lines[idx].content) && lines[idx].indent == base_indent) {
         std::vector<ConfigValue> arr;
-        while (idx < lines.size() && lines[idx].indent == base_indent && is_list_item(lines[idx].content)) {
+        while (idx < lines.size()) {
+            if (is_ignorable_yaml_line(lines[idx])) { ++idx; continue; }
+            if (lines[idx].indent != base_indent) break;
+            if (!is_list_item(lines[idx].content)) break;
             std::size_t saved = idx;
             ++idx;
             auto sub = lines[saved].content.substr(2);
@@ -331,6 +404,11 @@ Result<ConfigValue> parse_yaml_block(const std::vector<YamlLine>& lines, std::si
                     arr.push_back(std::move(inner).value());
                 } else arr.push_back(ConfigValue());
             } else {
+                if (sub.size() >= 2 && ((sub.front() == '"' && sub.back() == '"') ||
+                                         (sub.front() == '\'' && sub.back() == '\''))) {
+                    arr.push_back(parse_scalar(sub));
+                    continue;
+                }
                 auto sub_colon = sub.find(':');
                 if (sub_colon != std::string::npos) {
                     std::string kk = sub.substr(0, sub_colon);
@@ -344,6 +422,14 @@ Result<ConfigValue> parse_yaml_block(const std::vector<YamlLine>& lines, std::si
                         if (inner.is_err()) return inner;
                         m.emplace(kk, std::move(inner).value());
                     } else m.emplace(kk, ConfigValue());
+                    if (idx < lines.size() && lines[idx].indent > base_indent) {
+                        auto extra = parse_yaml_block(lines, idx, lines[idx].indent);
+                        if (extra.is_err()) return extra;
+                        ConfigValue merged(std::move(m));
+                        merged.merge(extra.value());
+                        arr.push_back(std::move(merged));
+                        continue;
+                    }
                     arr.push_back(ConfigValue(std::move(m)));
                 } else {
                     arr.push_back(parse_scalar(sub));

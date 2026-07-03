@@ -85,19 +85,22 @@ ByteBuffer zlib_decompress(const ByteBuffer& in) {
 
 std::string event_batch_to_canonical_json(const chain::EventBatch& b) {
     std::ostringstream o;
-    o << "{\"id\":\"" << b.id << "\","
-      << "\"merkle_root\":\"" << b.merkle_root << "\","
-      << "\"signature\":\"" << b.signature << "\","
-      << "\"count\":" << b.events.size() << ",";
+    o << "{\n"
+      << "  \"id\": \"" << b.id << "\",\n"
+      << "  \"merkle_root\": \"" << b.merkle_root << "\",\n"
+      << "  \"signature\": \"" << b.signature << "\",\n"
+      << "  \"count\": " << b.events.size() << ",\n";
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   b.created_at.time_since_epoch()).count();
-    o << "\"created_at\":" << us << ","
-      << "\"events\":[";
+    o << "  \"created_at\": " << us << ",\n"
+      << "  \"events\": [\n";
     for (std::size_t i = 0; i < b.events.size(); ++i) {
-        if (i) o << ',';
-        o << b.events[i].to_json();
+        o << "    " << b.events[i].to_json();
+        if (i < b.events.size() - 1) o << ",";
+        o << "\n";
     }
-    o << "]}";
+    o << "  ]\n"
+      << "}";
     return o.str();
 }
 
@@ -297,7 +300,7 @@ UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer&
         r.error = "tls verify failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r;
     }
 
-    // Build HTTP/1.1 request
+    // 构造 HTTP/1.1 请求。
     std::ostringstream req;
     req << "POST " << path << " HTTP/1.1\r\n"
         << "Host: " << host << "\r\n"
@@ -355,15 +358,17 @@ void HttpsTransport::persist_index() {
     if (checkpoint_path_.empty()) return;
     std::ofstream o(checkpoint_path_, std::ios::binary);
     if (!o) return;
-    o << "{\"resumed\":[";
+    o << "{\n";
+    o << "  \"resumed\": [\n";
     bool first = true;
     std::lock_guard<std::mutex> lk(mtx_);
     for (const auto& [k, v] : resume_index_) {
-        if (!first) o << ',';
+        if (!first) o << ",\n";
         first = false;
-        o << '"' << k << '"';
+        o << "    \"" << k << "\"";
     }
-    o << "]}";
+    o << "\n  ]\n";
+    o << "}\n";
 }
 
 void HttpsTransport::load_index() {

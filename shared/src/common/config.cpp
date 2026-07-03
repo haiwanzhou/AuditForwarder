@@ -147,6 +147,12 @@ void ConfigValue::merge(const ConfigValue& other) {
 
 std::string ConfigValue::dump_json() const {
     std::ostringstream o;
+    dump_json_locked(o, 0);
+    return o.str();
+}
+
+void ConfigValue::dump_json_locked(std::ostringstream& o, int indent) const {
+    std::string spaces(indent * 2, ' ');
     switch (type_) {
         case Type::Null:   o << "null"; break;
         case Type::Bool:   o << (std::get<bool>(data_) ? "true" : "false"); break;
@@ -173,27 +179,39 @@ std::string ConfigValue::dump_json() const {
             o << '"'; break;
         }
         case Type::List: {
-            o << '[';
             const auto& v = std::get<std::vector<ConfigValue>>(data_);
-            for (std::size_t i = 0; i < v.size(); ++i) {
-                if (i) o << ',';
-                o << v[i].dump_json();
+            if (v.empty()) {
+                o << "[]";
+            } else {
+                o << "[\n";
+                for (std::size_t i = 0; i < v.size(); ++i) {
+                    o << spaces << "  ";
+                    v[i].dump_json_locked(o, indent + 1);
+                    if (i < v.size() - 1) o << ',';
+                    o << "\n";
+                }
+                o << spaces << "]";
             }
-            o << ']'; break;
+            break;
         }
         case Type::Map: {
-            o << '{';
             const auto& m = std::get<std::map<std::string, ConfigValue>>(data_);
-            bool first = true;
-            for (const auto& [k, v] : m) {
-                if (!first) o << ',';
-                first = false;
-                o << '"' << k << "\":" << v.dump_json();
+            if (m.empty()) {
+                o << "{}";
+            } else {
+                o << "{\n";
+                bool first = true;
+                for (const auto& [k, v] : m) {
+                    if (!first) o << ",\n";
+                    first = false;
+                    o << spaces << "  \"" << k << "\": ";
+                    v.dump_json_locked(o, indent + 1);
+                }
+                o << "\n" << spaces << "}";
             }
-            o << '}'; break;
+            break;
         }
     }
-    return o.str();
 }
 
 // ---------------- Config ----------------
@@ -267,9 +285,13 @@ std::string Config::get_string(const std::string& p, const std::string& def) con
 
 // ---------------- 简易 YAML/JSON 解析器 ----------------
 
-// 尝试检测格式并解析。公开接口，其他翻译单元（如 rule_engine）可通过头文件声明使用。
+// 尝试检测格式并解析。公开接口，规则引擎等模块可通过头文件声明使用。
 Result<void> parse_minimal(const std::string& content, const std::string& format, ConfigValue& out) {
     auto fmt = to_lower(format);
+    auto slash = fmt.find_last_of("/\\");
+    if (slash != std::string::npos) fmt = fmt.substr(slash + 1);
+    auto dot = fmt.find_last_of('.');
+    if (dot != std::string::npos) fmt = fmt.substr(dot + 1);
     if (fmt.empty()) {
         if (!content.empty() && (content[0] == '{' || content[0] == '[')) fmt = "json";
         else fmt = "yaml";
@@ -279,7 +301,7 @@ Result<void> parse_minimal(const std::string& content, const std::string& format
     return Result<void>(Error(Error::Code::InvalidArgument, "unsupported config format"));
 }
 
-// We split parser implementations into separate translation units to keep this file small.
+// Parser implementations live in separate source files to keep this file small.
 Result<void> Config::load_from_string(const std::string& content, const std::string& format) {
     ConfigValue v;
     auto r = parse_minimal(content, format, v);

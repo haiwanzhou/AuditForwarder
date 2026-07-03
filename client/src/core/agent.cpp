@@ -7,6 +7,7 @@
 #include "auditforwarder/manager.h"
 #include "auditforwarder/processor.h"
 #include "auditforwarder/process.h"
+#include "auditforwarder/remote_client.h"
 #include "auditforwarder/self_protect.h"
 #include "auditforwarder/transport.h"
 #include "auditforwarder/detector.h"
@@ -67,6 +68,93 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     if (!cfg_.config_path.empty() && fs::exists(cfg_.config_path)) {
         auto r = Config::instance().load_from_file(cfg_.config_path);
         if (r.is_err()) AF_LOG_WARN("config: load failed: " << r.error().message());
+        else {
+            auto& c = Config::instance();
+            cfg_.agent_id = c.get_string("agent.id", cfg_.agent_id);
+            cfg_.data_dir = c.get_string("agent.data_dir", cfg_.data_dir);
+            cfg_.config_path = c.get_string("agent.config_path", cfg_.config_path);
+            cfg_.log_level = severity_from_string(c.get_string("log.level", to_string(cfg_.log_level)));
+            cfg_.log_file = c.get_string("log.file", cfg_.log_file);
+            cfg_.log_max_bytes = static_cast<std::size_t>(c.get_int("log.max_bytes", static_cast<long long>(cfg_.log_max_bytes)));
+            cfg_.manager_enabled  = c.get_bool("manager.enabled", cfg_.manager_enabled);
+            cfg_.manager_listen   = c.get_string("manager.listen", cfg_.manager_listen);
+            cfg_.manager_token    = c.get_string("manager.auth_token", cfg_.manager_token);
+            cfg_.manager_use_tls  = c.get_bool("manager.use_tls", cfg_.manager_use_tls);
+            cfg_.manager_tls_cert = c.get_string("manager.tls_cert", cfg_.manager_tls_cert);
+            cfg_.manager_tls_key  = c.get_string("manager.tls_key", cfg_.manager_tls_key);
+            cfg_.manager_tls_ca_cert = c.get_string("manager.tls_ca_cert", cfg_.manager_tls_ca_cert);
+            cfg_.manager_require_client_cert = c.get_bool("manager.require_client_cert", cfg_.manager_require_client_cert);
+            cfg_.manager_tls_crl_check = c.get_bool("manager.tls_crl_check", cfg_.manager_tls_crl_check);
+            cfg_.manager_enrollment_key = c.get_string("manager.enrollment_key", cfg_.manager_enrollment_key);
+            cfg_.manager_max_host_count = static_cast<std::size_t>(c.get_int("manager.max_host_count", static_cast<long long>(cfg_.manager_max_host_count)));
+            cfg_.chain_batch_size = static_cast<std::size_t>(c.get_int("chain.batch_size", static_cast<long long>(cfg_.chain_batch_size)));
+            cfg_.chain_signing_key = c.get_string("chain.signing_key", cfg_.chain_signing_key);
+            cfg_.chain_hmac_key = c.get_string("chain.hmac_key", cfg_.chain_hmac_key);
+            cfg_.transport_mode = c.get_string("transport.mode", cfg_.transport_mode);
+            cfg_.transport_interval_sec = static_cast<int>(c.get_int("transport.interval_sec", cfg_.transport_interval_sec));
+            cfg_.transport_max_backoff_sec = static_cast<int>(c.get_int("transport.max_backoff_sec", cfg_.transport_max_backoff_sec));
+            cfg_.transport_compress = c.get_bool("transport.compress", cfg_.transport_compress);
+            cfg_.transport_encrypt = c.get_bool("transport.encrypt_payload", cfg_.transport_encrypt);
+            cfg_.transport_auth_token = c.get_string("transport.auth_token", cfg_.transport_auth_token);
+            cfg_.transport_verify_tls = c.get_bool("transport.verify_tls", cfg_.transport_verify_tls);
+            cfg_.ca_cert = c.get_string("transport.ca_cert", cfg_.ca_cert);
+            cfg_.client_cert = c.get_string("transport.client_cert", cfg_.client_cert);
+            cfg_.client_key = c.get_string("transport.client_key", cfg_.client_key);
+            const auto& servers = c.root().at("transport").at("servers").as_list();
+            if (!servers.empty()) {
+                cfg_.server_urls.clear();
+                for (const auto& s : servers) {
+                    auto url = s.as_string();
+                    if (!url.empty()) cfg_.server_urls.push_back(url);
+                }
+            }
+            cfg_.remote_enabled = c.get_bool("remote.enabled", cfg_.remote_enabled);
+            cfg_.remote_host_id = c.get_string("remote.host_id", cfg_.remote_host_id);
+            const auto& remote_servers = c.root().at("remote").at("servers").as_list();
+            if (!remote_servers.empty()) {
+                cfg_.remote_server_urls.clear();
+                for (const auto& s : remote_servers) {
+                    auto url = s.as_string();
+                    if (!url.empty()) cfg_.remote_server_urls.push_back(url);
+                }
+            }
+            cfg_.remote_heartbeat_interval_sec = static_cast<int>(c.get_int("remote.heartbeat_interval_sec", cfg_.remote_heartbeat_interval_sec));
+            cfg_.remote_command_poll_interval_sec = static_cast<int>(c.get_int("remote.command_poll_interval_sec", cfg_.remote_command_poll_interval_sec));
+            cfg_.remote_audit_summary_interval_sec = static_cast<int>(c.get_int("remote.audit_summary_interval_sec", cfg_.remote_audit_summary_interval_sec));
+            cfg_.remote_production_mode = c.get_bool("remote.production_mode", cfg_.remote_production_mode);
+            cfg_.remote_require_tls = c.get_bool("remote.require_tls", cfg_.remote_require_tls);
+            cfg_.remote_crl_check = c.get_bool("remote.crl_check", cfg_.remote_crl_check);
+            cfg_.remote_enrollment_key = c.get_string("remote.enrollment_key", cfg_.remote_enrollment_key);
+            cfg_.self_protect_enabled = c.get_bool("self_protect.enabled", cfg_.self_protect_enabled);
+            cfg_.rules_path = c.get_string("detector.rules_path", cfg_.rules_path);
+            cfg_.collectors_enabled = c.get_bool("collectors.enabled", cfg_.collectors_enabled);
+            const auto& allowed = c.root().at("remote").at("allowed_commands").as_list();
+            if (!allowed.empty()) {
+                cfg_.remote_allowed_commands.clear();
+                for (const auto& cmd : allowed) {
+                    auto value = cmd.as_string();
+                    if (!value.empty()) cfg_.remote_allowed_commands.push_back(value);
+                }
+            }
+        }
+    }
+
+    // 配置文件可能覆盖日志路径、级别和数据目录，读取后需要重新应用一次。
+    lcfg.level       = cfg_.log_level;
+    lcfg.file_path   = cfg_.log_file;
+    lcfg.max_bytes   = cfg_.log_max_bytes;
+    lcfg.targets     = static_cast<u8>(LogTarget::Console);
+    if (!cfg_.log_file.empty()) {
+        lcfg.targets = static_cast<u8>(static_cast<LogTarget>(lcfg.targets) | LogTarget::File);
+    }
+#ifdef AF_PLATFORM_UNIX
+    lcfg.targets = static_cast<u8>(static_cast<LogTarget>(lcfg.targets) | LogTarget::Syslog);
+#endif
+    Logger::instance().configure(lcfg);
+
+    if (!cfg_.data_dir.empty()) {
+        auto r = fs::create_directories(cfg_.data_dir);
+        if (r.is_err()) return r;
     }
 
     // 初始化链
@@ -85,6 +173,7 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     // Register batch callback to forward to the transport once it is set.
     chain_->on_batch([this](const chain::EventBatch& b) {
         if (transport_) transport_->send_batch(b);
+        if (remote_client_) remote_client_->enqueue_batch_summary(b);
     });
 
     // 构建默认处理器链
@@ -141,9 +230,31 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     tc.client_cert     = cfg_.client_cert;
     tc.client_key      = cfg_.client_key;
     tc.ca_cert         = cfg_.ca_cert;
+    tc.auth_token      = cfg_.transport_auth_token.empty() ? cfg_.manager_token : cfg_.transport_auth_token;
+    tc.verify_tls      = cfg_.transport_verify_tls;
     tc.agent_id        = cfg_.agent_id;
     tc.data_dir        = cfg_.data_dir;
     transport_ = std::make_unique<HttpsTransport>(tc);
+
+    RemoteClientConfig rc;
+    rc.enabled = cfg_.remote_enabled;
+    rc.server_urls = cfg_.remote_server_urls.empty() ? cfg_.server_urls : cfg_.remote_server_urls;
+    rc.auth_token = tc.auth_token;
+    rc.host_id = cfg_.remote_host_id.empty() ? cfg_.agent_id : cfg_.remote_host_id;
+    rc.data_dir = cfg_.data_dir;
+    rc.heartbeat_interval_sec = cfg_.remote_heartbeat_interval_sec;
+    rc.command_poll_interval_sec = cfg_.remote_command_poll_interval_sec;
+    rc.audit_summary_interval_sec = cfg_.remote_audit_summary_interval_sec;
+    rc.production_mode = cfg_.remote_production_mode;
+    rc.require_tls = cfg_.remote_require_tls;
+    rc.verify_tls = cfg_.transport_verify_tls;
+    rc.crl_check = cfg_.remote_crl_check;
+    rc.ca_cert = cfg_.ca_cert;
+    rc.client_cert = cfg_.client_cert;
+    rc.client_key = cfg_.client_key;
+    rc.enrollment_key = cfg_.remote_enrollment_key;
+    rc.allowed_commands = cfg_.remote_allowed_commands;
+    remote_client_ = std::make_unique<RemoteAgentClient>(rc);
 
     // Self protect
     if (cfg_.self_protect_enabled) {
@@ -162,6 +273,14 @@ Result<void> Agent::init(const AgentConfig& cfg) {
         ManagerConfig mc;
         mc.listen     = cfg_.manager_listen;
         mc.auth_token = cfg_.manager_token;
+        mc.use_tls    = cfg_.manager_use_tls;
+        mc.tls_cert   = cfg_.manager_tls_cert;
+        mc.tls_key    = cfg_.manager_tls_key;
+        mc.tls_ca_cert = cfg_.manager_tls_ca_cert;
+        mc.require_client_cert = cfg_.manager_require_client_cert;
+        mc.tls_crl_check = cfg_.manager_tls_crl_check;
+        mc.enrollment_key = cfg_.manager_enrollment_key;
+        mc.max_host_count = cfg_.manager_max_host_count;
         mc.data_dir   = cfg_.data_dir;
         manager_ = std::make_unique<SimpleHttpManager>(mc);
     }
@@ -177,7 +296,7 @@ Result<void> Agent::start() {
 
     // 构建平台特定的采集器
     std::vector<std::unique_ptr<Collector>> created;
-    if (collectors_.empty()) {
+    if (cfg_.collectors_enabled && collectors_.empty()) {
 #ifdef AF_PLATFORM_LINUX
         create_linux_collectors(created, *this);
 #elif defined(AF_PLATFORM_WINDOWS)
@@ -185,10 +304,14 @@ Result<void> Agent::start() {
 #endif
         collectors_ = std::move(created);
     }
-    for (auto& c : collectors_) {
-        auto r = c->start(*this);
-        if (r.is_err()) AF_LOG_ERROR("collector: " << c->name() << " start failed: " << r.error().message());
-        else AF_LOG_INFO("collector: " << c->name() << " started");
+    if (cfg_.collectors_enabled) {
+        for (auto& c : collectors_) {
+            auto r = c->start(*this);
+            if (r.is_err()) AF_LOG_ERROR("collector: " << c->name() << " start failed: " << r.error().message());
+            else AF_LOG_INFO("collector: " << c->name() << " started");
+        }
+    } else {
+        AF_LOG_INFO("collectors: disabled by configuration");
     }
 
     if (self_protect_) {
@@ -200,7 +323,18 @@ Result<void> Agent::start() {
         if (r.is_err()) AF_LOG_ERROR("manager: " << r.error().message());
     }
     if (detector_) detector_->start(*this);
-    if (transport_) transport_->start(*this);
+    if (transport_ && !cfg_.server_urls.empty()) {
+        transport_->start(*this);
+    } else {
+        AF_LOG_INFO("transport: disabled, no server configured");
+    }
+    const bool has_remote_server = !cfg_.remote_server_urls.empty() || !cfg_.server_urls.empty();
+    if (remote_client_ && cfg_.remote_enabled && has_remote_server) {
+        auto r = remote_client_->start(*this);
+        if (r.is_err()) AF_LOG_ERROR("remote_client: " << r.error().message());
+    } else {
+        AF_LOG_INFO("remote_client: disabled, no server configured");
+    }
 
     install_signal_handlers();
     g_agent = this;
@@ -212,6 +346,7 @@ Result<void> Agent::start() {
 void Agent::stop() {
     if (!running_.exchange(false)) return;
     AF_LOG_INFO("agent: stopping");
+    if (remote_client_) remote_client_->stop();
     if (transport_) transport_->stop();
     if (manager_)   manager_->stop();
     if (detector_)  detector_->stop();

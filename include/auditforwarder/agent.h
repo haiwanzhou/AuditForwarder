@@ -19,6 +19,7 @@ class Transport;
 class Detector;
 class ManagerServer;
 class SelfProtect;
+class RemoteAgentClient;
 
 struct AgentConfig {
     std::string agent_id;
@@ -45,6 +46,21 @@ struct AgentConfig {
     std::string client_cert;
     std::string client_key;
     std::string ca_cert;
+    std::string transport_auth_token;
+    bool transport_verify_tls { true };
+
+    // Agent 主动连接中心服务：心跳、资源指标、批次摘要、远控命令轮询。
+    bool remote_enabled { true };
+    std::vector<std::string> remote_server_urls;
+    std::string remote_host_id;
+    int remote_heartbeat_interval_sec { 30 };
+    int remote_command_poll_interval_sec { 10 };
+    int remote_audit_summary_interval_sec { 30 };
+    bool remote_production_mode { false };
+    bool remote_require_tls { false };
+    bool remote_crl_check { false };
+    std::string remote_enrollment_key;
+    std::vector<std::string> remote_allowed_commands { "collect_status", "echo" };
 
     // 自我保护
     bool self_protect_enabled { true };
@@ -53,9 +69,20 @@ struct AgentConfig {
     bool manager_enabled { true };
     std::string manager_listen {"127.0.0.1:8443"};
     std::string manager_token;
+    bool        manager_use_tls { false };
+    std::string manager_tls_cert;
+    std::string manager_tls_key;
+    std::string manager_tls_ca_cert;
+    bool        manager_require_client_cert { false };
+    bool        manager_tls_crl_check { false };
+    std::string manager_enrollment_key;
+    std::size_t manager_max_host_count { 1000 };
 
     // 检测规则
     std::string rules_path;
+
+    // 是否启动本机采集器。服务端单独运行时应关闭采集器，只保留管理接口。
+    bool collectors_enabled { true };
 
     // 隐藏安装 / 系统级操作
     bool elevate_required { false };
@@ -119,6 +146,7 @@ private:
     std::vector<std::unique_ptr<Collector>> collectors_;
     std::vector<std::unique_ptr<Processor>> processors_;
     std::unique_ptr<Transport>              transport_;
+    std::unique_ptr<RemoteAgentClient>       remote_client_;
     std::unique_ptr<Detector>               detector_;
     std::unique_ptr<ManagerServer>          manager_;
     std::unique_ptr<SelfProtect>            self_protect_;

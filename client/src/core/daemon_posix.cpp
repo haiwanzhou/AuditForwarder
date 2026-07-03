@@ -27,11 +27,11 @@ int install_systemd(const std::string& data_dir, const std::string& config_path)
 
     std::ofstream f(unit);
     if (!f) {
-        std::fprintf(stderr, "cannot write %s: %s\n", unit.c_str(), strerror(errno));
+        std::fprintf(stderr, "无法写入 %s：%s\n", unit.c_str(), strerror(errno));
         return 1;
     }
     f << "[Unit]\n"
-      << "Description=AuditForwarder Security Audit Agent\n"
+      << "Description=AuditForwarder 安全审计 Agent\n"
       << "After=network-online.target\n"
       << "Wants=network-online.target\n"
       << "\n"
@@ -54,13 +54,13 @@ int install_systemd(const std::string& data_dir, const std::string& config_path)
     ::chmod(unit.c_str(), 0644);
 
     int rc = std::system("systemctl daemon-reload");
-    if (rc != 0) std::fprintf(stderr, "systemctl daemon-reload returned %d\n", rc);
+    if (rc != 0) std::fprintf(stderr, "systemctl daemon-reload 返回 %d\n", rc);
     rc = std::system("systemctl enable " AF_SYSTEMD_UNIT);
-    if (rc != 0) std::fprintf(stderr, "systemctl enable returned %d\n", rc);
+    if (rc != 0) std::fprintf(stderr, "systemctl enable 返回 %d\n", rc);
     rc = std::system("systemctl start " AF_SYSTEMD_UNIT);
-    if (rc != 0) std::fprintf(stderr, "systemctl start returned %d\n", rc);
+    if (rc != 0) std::fprintf(stderr, "systemctl start 返回 %d\n", rc);
 
-    std::printf("AuditForwarder installed and started.\n");
+    std::printf("AuditForwarder 已安装并启动。\n");
     return 0;
 }
 

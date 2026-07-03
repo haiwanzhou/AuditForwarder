@@ -1,0 +1,50 @@
+# AuditForwarder - Windows 服务端测试配置
+
+agent:
+  id: "auditforwarder-server"
+  data_dir: C:\Users\30952\Desktop\AuditForwarder\data\server
+  config_path: C:\Users\30952\Desktop\AuditForwarder\config\server_windows.yaml
+
+log:
+  level: debug
+  file: C:\Users\30952\Desktop\AuditForwarder\data\server\server.log
+  max_bytes: 52428800
+  max_backups: 5
+
+chain:
+  batch_size: 10
+  sign_batches: false
+  auto_persist: true
+  hmac_key: "server-test-hmac-key"
+
+transport:
+  servers: []
+  auth_token: "test-token-12345"
+  verify_tls: false
+
+remote:
+  enabled: false
+  servers: []
+
+detector:
+  rules_path: C:\Users\30952\Desktop\AuditForwarder\config\rules.yaml
+  enable_behavior_baseline: false
+
+self_protect:
+  enabled: false
+
+manager:
+  enabled: true
+  listen: 127.0.0.1:8443
+  auth_token: "test-token-12345"
+  enrollment_key: "specific_key"
+  max_host_count: 1000
+  use_tls: false
+  require_client_cert: false
+  tls_crl_check: false
+
+collectors:
+  enabled: false
+
+processors:
+  - type: enricher

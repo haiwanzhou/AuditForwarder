@@ -119,16 +119,16 @@ End-point Agent 接收来自操作员的各类事件（file, process, network, c
 
 | 模块 | 职责 | 文件位置 |
 |-----|------|---------|
-| Core | 代理编排、生命周期管理 | src/core/agent.cpp |
-| Collectors | 操作系统事件采集 | src/collector/ |
-| Processors | 事件预处理管道 | src/processor/ |
-| Detector | 规则引擎与行为基线检测 | src/detector/ |
-| Chain | 哈希链与 Merkle 签名 | src/crypto/chain.cpp |
-| Crypto | 密码学原语 | src/crypto/crypto.cpp |
-| Transport | HTTPS 上传 | src/transport/ |
-| Manager | 远程管理 API | src/manager/ |
-| Self-Protect | 完整性校验与看门狗 | src/core/self_protect.cpp |
-| Common | 通用工具（日志、配置、线程池等） | src/common/ |
+| Core | 客户端代理编排、生命周期管理 | client/src/core/agent.cpp |
+| Collectors | 客户端操作系统事件采集 | client/src/collector/ |
+| Processors | 客户端事件预处理管道 | client/src/processor/ |
+| Detector | 共享规则引擎与行为基线检测 | shared/src/detector/ |
+| Chain | 共享哈希链与 Merkle 签名 | shared/src/crypto/chain.cpp |
+| Crypto | 共享密码学原语 | shared/src/crypto/crypto.cpp |
+| Transport | 客户端 HTTPS 上传 | client/src/transport/ |
+| Manager | 服务端远程管理 API | server/src/manager/ |
+| Self-Protect | 客户端完整性校验与看门狗 | client/src/core/self_protect.cpp |
+| Common | 共享通用工具（日志、配置、线程池等） | shared/src/common/ |
 
 ---
 

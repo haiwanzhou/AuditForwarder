@@ -1,5 +1,5 @@
-# AuditForwarder - PowerShell installer for Windows
-# Run as Administrator:
+# AuditForwarder - Windows PowerShell 安装脚本
+# 请以管理员身份运行：
 #   powershell -ExecutionPolicy Bypass -File install_windows.ps1
 
 [CmdletBinding()]
@@ -21,13 +21,13 @@ function Require-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = New-Object Security.Principal.WindowsPrincipal($id)
     if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "This script must be run as Administrator."
+        throw "此脚本必须以管理员身份运行。"
     }
 }
 
 function Stop-Service {
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-        Write-Host "[stop] stopping service $ServiceName..."
+        Write-Host "[停止] 正在停止服务 $ServiceName..."
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     }
 }
@@ -35,14 +35,14 @@ function Stop-Service {
 function Remove-Service {
     Stop-Service
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-        Write-Host "[uninstall] removing service..."
+        Write-Host "[卸载] 正在删除服务..."
         sc.exe delete $ServiceName | Out-Null
     }
 }
 
 function Install-Binary {
     $src = Join-Path $SourceDir $ExeName
-    if (-not (Test-Path $src)) { throw "Binary not found: $src" }
+    if (-not (Test-Path $src)) { throw "未找到程序文件：$src" }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item $src "$InstallDir\$ExeName" -Force
 }
@@ -58,11 +58,11 @@ function Install-Config {
 function Generate-Keys {
     $keyPath = "$ConfigDir\keys\agent.pem"
     if (-not (Test-Path $keyPath)) {
-        Write-Host "[keys] generating Ed25519 signing key..."
+        Write-Host "[密钥] 正在生成 Ed25519 签名密钥..."
         New-Item -ItemType Directory -Force -Path (Split-Path $keyPath) | Out-Null
         openssl genpkey -algorithm ed25519 -out $keyPath 2>$null
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "[keys] openssl not found; using HMAC fallback"
+            Write-Host "[密钥] 未找到 openssl，将使用 HMAC 备用方案"
         } else {
             openssl pkey -in $keyPath -pubout -out "$ConfigDir\keys\agent.pub"
         }
@@ -72,16 +72,16 @@ function Generate-Keys {
 function New-Service {
     $binPath = "`"$InstallDir\$ExeName`" -c `"$ConfigDir\agent.yaml`" -d $DataDir"
     New-Service -Name $ServiceName -BinaryPathName $binPath `
-        -DisplayName "AuditForwarder Security Audit Agent" `
-        -Description "Enterprise cross-platform security audit agent." `
+        -DisplayName "AuditForwarder 安全审计 Agent" `
+        -Description "企业级跨平台安全审计 Agent。" `
         -StartupType Automatic | Out-Null
-    Write-Host "[service] created: $ServiceName"
+    Write-Host "[服务] 已创建：$ServiceName"
 }
 
 function Start-IfRequested {
     if ($Start) {
         Start-Service -Name $ServiceName
-        Write-Host "[service] started: $ServiceName"
+        Write-Host "[服务] 已启动：$ServiceName"
     }
 }
 
@@ -91,7 +91,7 @@ if ($Uninstall) {
     Require-Admin
     Remove-Service
     Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
-    Write-Host "AuditForwarder uninstalled.  Data left in $ConfigDir."
+    Write-Host "AuditForwarder 已卸载。数据已保留在 $ConfigDir。"
     exit 0
 }
 
@@ -107,12 +107,12 @@ New-Service
 Start-IfRequested
 
 Write-Host ""
-Write-Host "AuditForwarder installed successfully."
-Write-Host "  Binary:  $InstallDir\$ExeName"
-Write-Host "  Config:  $ConfigDir\agent.yaml"
-Write-Host "  Rules:   $ConfigDir\rules.yaml"
-Write-Host "  Data:    $DataDir"
-Write-Host "  Logs:    $LogDir"
+Write-Host "AuditForwarder 安装成功。"
+Write-Host "  程序文件：$InstallDir\$ExeName"
+Write-Host "  配置文件：$ConfigDir\agent.yaml"
+Write-Host "  规则文件：$ConfigDir\rules.yaml"
+Write-Host "  数据目录：$DataDir"
+Write-Host "  日志目录：$LogDir"
 Write-Host ""
-Write-Host "  Manage with:  Get-Service AuditForwarder"
-Write-Host "  View logs:    Get-EventLog -LogName Application -Source AuditForwarder -Newest 50"
+Write-Host "  管理服务：Get-Service AuditForwarder"
+Write-Host "  查看日志：Get-EventLog -LogName Application -Source AuditForwarder -Newest 50"

@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(AuditForwarder
     VERSION 1.0.0
-    DESCRIPTION "Enterprise Cross-Platform Security Audit Agent"
+    DESCRIPTION "企业级跨平台安全审计 Agent"
     LANGUAGES CXX)
 
 # -----------------------------------------------------------------------------
-# Global settings
+# 全局设置
 # -----------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,10 +13,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "构建类型" FORCE)
 endif()
 
-# Compile options
+# 编译选项
 if(MSVC)
     add_compile_options(/W4 /permissive- /utf-8 /Zc:__cplusplus)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 WINVER=0x0A00)
@@ -25,7 +25,7 @@ else()
 endif()
 
 # -----------------------------------------------------------------------------
-# Dependencies
+# 依赖库
 # -----------------------------------------------------------------------------
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -44,7 +44,7 @@ if(BUILD_TESTING)
 endif()
 
 # -----------------------------------------------------------------------------
-# Platform-specific
+# 平台相关配置
 # -----------------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(AF_PLATFORM_LINUX TRUE)
@@ -63,59 +63,60 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 endif()
 
 # -----------------------------------------------------------------------------
-# Collect all sources (explicit list to control platform sources)
+# 收集核心源码，显式列出文件以便控制平台相关源码
 # -----------------------------------------------------------------------------
 set(AF_CORE_SOURCES
-    # Common
-    src/common/types.cpp
-    src/common/logger.cpp
-    src/common/config.cpp
-    src/common/config_parser.cpp
-    src/common/fs.cpp
-    src/common/thread_pool.cpp
-    src/common/process.cpp
-    src/common/event.cpp
+    # 通用模块
+    shared/src/common/types.cpp
+    shared/src/common/logger.cpp
+    shared/src/common/config.cpp
+    shared/src/common/config_parser.cpp
+    shared/src/common/fs.cpp
+    shared/src/common/thread_pool.cpp
+    shared/src/common/process.cpp
+    shared/src/common/event.cpp
 
-    # Core
-    src/core/agent.cpp
-    src/core/self_protect.cpp
+    # 客户端核心模块
+    client/src/core/agent.cpp
+    client/src/core/remote_client.cpp
+    client/src/core/self_protect.cpp
 
-    # Crypto
-    src/crypto/crypto.cpp
-    src/crypto/chain.cpp
+    # 密码学与证据链模块
+    shared/src/crypto/crypto.cpp
+    shared/src/crypto/chain.cpp
 
-    # Processor
-    src/processor/processor.cpp
+    # 事件处理模块
+    client/src/processor/processor.cpp
 
-    # Transport
-    src/transport/https_transport.cpp
+    # 传输模块
+    client/src/transport/https_transport.cpp
 
-    # Detector
-    src/detector/rule_engine.cpp
+    # 违规检测模块
+    shared/src/detector/rule_engine.cpp
 
-    # Manager
-    src/manager/manager_server.cpp
+    # 服务端管理模块
+    server/src/manager/manager_server.cpp
 
-    # Collector base
-    src/collector/collector_base.cpp
+    # 采集器基类
+    client/src/collector/collector_base.cpp
 )
 
 if(AF_PLATFORM_LINUX)
     list(APPEND AF_CORE_SOURCES
-        src/collector/linux/collectors_linux.cpp
-        src/core/daemon_posix.cpp
+        client/src/collector/linux/collectors_linux.cpp
+        client/src/core/daemon_posix.cpp
     )
 elseif(AF_PLATFORM_WINDOWS)
     list(APPEND AF_CORE_SOURCES
-        src/collector/windows/collectors_win.cpp
-        src/core/service_win.cpp
+        client/src/collector/windows/collectors_win.cpp
+        client/src/core/service_win.cpp
     )
 else()
     list(APPEND AF_CORE_SOURCES
-        src/collector/windows/collectors_win.cpp
-        src/core/service_win.cpp
+        client/src/collector/windows/collectors_win.cpp
+        client/src/core/service_win.cpp
     )
-    message(WARNING "Unknown platform, defaulting to Windows build")
+    message(WARNING "未知平台，默认按 Windows 方式构建")
 endif()
 
 add_library(auditforwarder_core STATIC ${AF_CORE_SOURCES})
@@ -123,7 +124,9 @@ add_library(auditforwarder_core STATIC ${AF_CORE_SOURCES})
 target_include_directories(auditforwarder_core
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/client/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/server/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shared/src"
 )
 
 target_link_libraries(auditforwarder_core
@@ -163,23 +166,31 @@ else()
 endif()
 
 # -----------------------------------------------------------------------------
-# Executable: auditforwarderd
+# 可执行程序
 # -----------------------------------------------------------------------------
-add_executable(auditforwarderd src/main.cpp)
+add_executable(auditforwarderd client/src/main.cpp)
 target_link_libraries(auditforwarderd PRIVATE auditforwarder_core)
+
+add_executable(auditforwarder-client client/src/client_main.cpp)
+target_link_libraries(auditforwarder-client PRIVATE auditforwarder_core)
+
+add_executable(auditforwarder-server server/src/server_main.cpp)
+target_link_libraries(auditforwarder-server PRIVATE auditforwarder_core)
 
 if(AF_PLATFORM_WINDOWS)
     set_target_properties(auditforwarderd PROPERTIES WIN32_EXECUTABLE TRUE)
+    set_target_properties(auditforwarder-client PROPERTIES WIN32_EXECUTABLE TRUE)
+    set_target_properties(auditforwarder-server PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
-install(TARGETS auditforwarderd
+install(TARGETS auditforwarderd auditforwarder-client auditforwarder-server
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 
 # -----------------------------------------------------------------------------
-# Tests
+# 测试
 # -----------------------------------------------------------------------------
 if(BUILD_TESTING AND GTest_FOUND)
     file(GLOB AF_TESTS CONFIGURE_DEPENDS
@@ -196,7 +207,9 @@ if(BUILD_TESTING AND GTest_FOUND)
         target_include_directories(auditforwarder_tests
             PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${CMAKE_CURRENT_SOURCE_DIR}/client/src"
+                "${CMAKE_CURRENT_SOURCE_DIR}/server/src"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shared/src"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests"
         )
         add_test(NAME auditforwarder_tests COMMAND auditforwarder_tests)
@@ -204,8 +217,9 @@ if(BUILD_TESTING AND GTest_FOUND)
 endif()
 
 # -----------------------------------------------------------------------------
-# Install configuration & scripts
+# 安装配置与脚本
 # -----------------------------------------------------------------------------
 install(DIRECTORY config/ DESTINATION etc/auditforwarder OPTIONAL)
 install(DIRECTORY scripts/ DESTINATION share/auditforwarder/scripts USE_SOURCE_PERMISSIONS OPTIONAL)
 install(DIRECTORY docs/ DESTINATION share/auditforwarder/docs OPTIONAL)
+install(DIRECTORY server/web/ DESTINATION share/auditforwarder/web OPTIONAL)

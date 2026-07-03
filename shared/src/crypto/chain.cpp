@@ -131,19 +131,27 @@ void Chain::persist_batch(const EventBatch& b) {
     std::string path = cfg_.data_dir + "/batches/" + b.id + ".json";
     std::ofstream o(path, std::ios::binary);
     if (!o) return;
-    o << "{\"id\":\"" << b.id << "\","
-      << "\"merkle_root\":\"" << b.merkle_root << "\","
-      << "\"signature\":\"" << b.signature << "\","
-      << "\"count\":" << b.events.size() << ",";
+    o << "{\n"
+      << "  \"id\": \"" << b.id << "\",\n"
+      << "  \"merkle_root\": \"" << b.merkle_root << "\",\n"
+      << "  \"signature\": \"" << b.signature << "\",\n"
+      << "  \"count\": " << b.events.size() << ",\n";
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   b.created_at.time_since_epoch()).count();
-    o << "\"created_at\":" << us << ",";
-    o << "\"events\":[";
+    o << "  \"created_at\": " << us << ",\n";
+    o << "  \"events\": [\n";
     for (std::size_t i = 0; i < b.events.size(); ++i) {
-        if (i) o << ',';
-        o << b.events[i].to_json();
+        o << "    " << b.events[i].to_json();
+        if (i + 1 < b.events.size()) o << ',';
+        o << "\n";
     }
-    o << "]}";
+    o << "  ]\n"
+      << "}\n";
+    o.close();
+    if (!o) {
+        AF_LOG_WARN("chain: failed to persist batch file " << path);
+        return;
+    }
 }
 
 Result<std::vector<EventBatch>> Chain::recent_batches(std::size_t n) const {

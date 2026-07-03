@@ -1,5 +1,6 @@
-﻿# Build artifacts
+# 构建产物
 build/
+build_release/
 *.o
 *.obj
 *.exe
@@ -8,7 +9,7 @@ build/
 *.a
 *.lib
 
-# CMake
+# CMake 生成文件
 CMakeCache.txt
 CMakeFiles/
 Makefile
@@ -17,15 +18,15 @@ install_manifest.txt
 CPackConfig.cmake
 CPackSourceConfig.cmake
 
-# Logs
+# 日志文件
 *.log
 *.out
 
-# Data directories
+# 运行数据目录
 data/
 var/
 
-# Windows
+# Windows 本地文件
 *.pdb
 *.ilk
 *.exp
@@ -34,11 +35,11 @@ var/
 .vscode/
 .vs/
 
-# Dependencies
+# 本地依赖目录
 .vcpkg/
 msys64/
 
-# Environment
+# 环境与系统文件
 .env
 .DS_Store
 Thumbs.db

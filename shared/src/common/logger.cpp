@@ -26,15 +26,15 @@ namespace {
 const char* level_str(Severity s) {
     switch (s) {
         case Severity::Debug:     return "DEBUG";
-        case Severity::Info:      return "INFO ";
-        case Severity::Notice:    return "NOTE ";
-        case Severity::Warning:   return "WARN ";
+        case Severity::Info:      return "INFO";
+        case Severity::Notice:    return "NOTICE";
+        case Severity::Warning:   return "WARN";
         case Severity::Error:     return "ERROR";
-        case Severity::Critical:  return "CRIT ";
+        case Severity::Critical:  return "CRIT";
         case Severity::Alert:     return "ALERT";
         case Severity::Emergency: return "EMERG";
     }
-    return "?    ";
+    return "?";
 }
 
 int syslog_priority(Severity s) {
@@ -55,8 +55,16 @@ int syslog_priority(Severity s) {
 
 std::string basename(const char* path) {
     if (!path) return "";
-    const char* p = std::strrchr(path, AF_PATH_SEPARATOR);
-    return p ? std::string(p + 1) : std::string(path);
+    const char* p = std::strrchr(path, '/');
+    const char* p2 = std::strrchr(path, '\\');
+    if (p && p2) {
+        return std::string((p > p2 ? p : p2) + 1);
+    } else if (p) {
+        return std::string(p + 1);
+    } else if (p2) {
+        return std::string(p2 + 1);
+    }
+    return std::string(path);
 }
 
 std::string iso8601_now() {
@@ -77,6 +85,39 @@ std::string iso8601_now() {
         tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
         static_cast<long long>(millis.count()));
     return buf;
+}
+
+std::string sanitize_message(std::string_view msg) {
+    std::string result;
+    result.reserve(msg.size());
+    for (char c : msg) {
+        switch (c) {
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            case '\\': result += "\\\\"; break;
+            case '"':  result += "\\\""; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", static_cast<unsigned char>(c));
+                    result += buf;
+                } else {
+                    result += c;
+                }
+                break;
+        }
+    }
+    return result;
+}
+
+std::string module_from_file(const char* file) {
+    std::string name = basename(file);
+    auto dot = name.rfind('.');
+    if (dot != std::string::npos) {
+        name = name.substr(0, dot);
+    }
+    return name;
 }
 
 }  // namespace
@@ -127,21 +168,29 @@ void Logger::write(Severity sev, const char* file, int line, std::string_view ms
     if (!configured_.load()) return;
     if (static_cast<int>(sev) < static_cast<int>(cfg_.level)) return;
 
+    std::string clean_msg = sanitize_message(msg);
+    std::string module = module_from_file(file);
+    std::string fname = basename(file);
+
     std::ostringstream oss;
-    oss << iso8601_now() << " [" << level_str(sev) << "]";
+    oss << iso8601_now() << " [";
+    oss.fill(' ');
+    oss.width(7);
+    oss << std::left << level_str(sev) << "] ";
+    oss << "[" << std::setw(20) << std::left << module << "] ";
     if (cfg_.include_pid) {
 #ifdef AF_PLATFORM_WINDOWS
-        oss << " pid=" << ::GetCurrentProcessId();
+        oss << "pid=" << ::GetCurrentProcessId() << " ";
 #else
-        oss << " pid=" << ::getpid();
+        oss << "pid=" << ::getpid() << " ";
 #endif
     }
     if (cfg_.include_tid) {
         std::ostringstream tss;
         tss << std::this_thread::get_id();
-        oss << " tid=" << tss.str();
+        oss << "tid=" << tss.str() << " ";
     }
-    oss << " " << basename(file) << ":" << line << " - " << msg << "\n";
+    oss << fname << ":" << line << " - " << clean_msg << "\n";
     std::string line_str = oss.str();
 
     std::lock_guard<std::mutex> lk(mtx_);

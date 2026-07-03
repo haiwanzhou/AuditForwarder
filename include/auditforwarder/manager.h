@@ -15,7 +15,12 @@ struct ManagerConfig {
     std::string auth_token;
     std::string tls_cert;
     std::string tls_key;
+    std::string tls_ca_cert;
     bool        use_tls      { false };
+    bool        require_client_cert { false };
+    bool        tls_crl_check { false };
+    std::string enrollment_key;
+    std::size_t max_host_count { 1000 };
     std::string data_dir;
 };
 
@@ -30,7 +35,7 @@ public:
 
 private:
     void accept_loop();
-    void handle_client(int fd);
+    void handle_client(int fd, void* tls = nullptr);
     std::string route(const std::string& method, const std::string& path,
                       const std::string& query, const std::string& body,
                       std::string& content_type, int& status);
@@ -40,6 +45,7 @@ private:
     std::thread         thr_;
     Agent*              agent_  { nullptr };
     int                 listen_fd_ { -1 };
+    void*               tls_ctx_ { nullptr };
 };
 
 }  // namespace af

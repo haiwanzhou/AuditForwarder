@@ -1,6 +1,6 @@
 #pragma once
-// AuditForwarder - Build configuration macros
-// Auto-generated style header centralizing compile-time feature flags.
+// AuditForwarder - 构建配置宏。
+// 集中维护编译期功能开关，采用类似自动生成头文件的组织方式。
 
 #ifndef AF_VERSION_MAJOR
 #define AF_VERSION_MAJOR 1
@@ -31,7 +31,7 @@
 #  define AF_PATH_SEPARATOR '/'
 #  define AF_LINE_SEPARATOR "\n"
 #else
-#  error "Unsupported platform"
+#  error "不支持的平台"
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)

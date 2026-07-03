@@ -1,125 +1,142 @@
-# AuditForwarder - Default detection rules.
-# Each rule is evaluated against every event.  When a match occurs:
-#   * event.severity is set to the rule's severity
-#   * event.rule_id is set to the rule's id
-#   * the listed responses are dispatched
-#   * if 'block' or 'kill' is among responses, the event is dropped from the
-#     normal forwarding pipeline (an 'alert' event is still emitted)
+# AuditForwarder - 默认检测规则
+# 每条规则会对每个事件进行评估。当匹配发生时：
+#   * event.severity 设置为规则的 severity
+#   * event.rule_id 设置为规则的 id
+#   * 执行列出的 responses 响应动作
+#   * 如果 responses 中包含 'block' 或 'kill'，事件会被丢弃
+#     （但仍会发送一条 'alert' 告警事件）
 
 rules:
-  # ---- Filesystem ----------------------------------------------------------
+  # ---- 文件系统规则 ----------------------------------------------------------
+  
+  # 规则 R-FS-001：读取密码哈希文件
   - id: R-FS-001
-    name: Read of /etc/shadow
-    description: Direct read of the password-hash database
-    severity: warning
-    enabled: true
-    categories: [file]
-    actions: [read]
+    name: 读取密码哈希数据库
+    description: 直接读取密码哈希数据库文件
+    severity: warning              # 严重程度：警告
+    enabled: true                  # 启用状态：开启
+    categories: [file]             # 事件类型：文件操作
+    actions: [read]                # 动作类型：读取
     path_match:
-      - /etc/shadow
-    responses: [alert]
+      - /etc/shadow                # 匹配路径：/etc/shadow
+    responses: [alert]             # 响应动作：告警
 
+  # 规则 R-FS-002：敏感系统文件被修改
   - id: R-FS-002
-    name: Sensitive system file modified
-    description: Modification of sudoers or PAM configs
-    severity: critical
+    name: 敏感系统文件修改
+    description: sudoers 或 PAM 配置文件被修改
+    severity: critical             # 严重程度：严重
     enabled: true
     categories: [file]
-    actions: [write, rename, chmod]
+    actions: [write, rename, chmod]  # 动作：写入、重命名、修改权限
     path_match:
-      - /etc/sudoers
-      - /etc/sudoers.d/.*
-      - /etc/pam\\.d/.*
-    responses: [alert, block]
+      - /etc/sudoers               # sudoers 主配置文件
+      - /etc/sudoers.d/.*          # sudoers 子配置目录
+      - /etc/pam\.d/.*             # PAM 配置目录
+    responses: [alert, block]      # 响应：告警 + 阻止
 
-  # ---- Process ------------------------------------------------------------
+  # ---- 进程规则 ------------------------------------------------------------
+  
+  # 规则 R-PROC-001：异常父进程
   - id: R-PROC-001
-    name: Unusual parent process
-    description: A shell is spawned by a non-shell process (possible injection)
+    name: 异常父进程
+    description: Shell 由非 Shell 进程启动（可能的注入攻击）
     severity: warning
     enabled: true
     categories: [process]
-    actions: [spawn]
+    actions: [spawn]               # 动作：创建进程
     actor_match:
-      - "^(?!.*(bash|sh|zsh|dash|fish)).*$"
+      - "^(?!.*(bash|sh|zsh|dash|fish)).*$"  # 父进程名不是 shell
     match:
-      actor.name: "bash"
-    threshold: 1
-    window_sec: 60
+      actor.name: "bash"           # 子进程是 bash
+    threshold: 1                   # 阈值：1次
+    window_sec: 60                 # 时间窗口：60秒
     responses: [alert]
 
-  # ---- Network ------------------------------------------------------------
+  # ---- 网络规则 ------------------------------------------------------------
+  
+  # 规则 R-NET-001：连接可疑顶级域名
   - id: R-NET-001
-    name: Connection to suspicious TLD
+    name: 连接可疑顶级域名
     severity: warning
     enabled: true
     categories: [network]
     actions: [connect]
     path_match:
-      - .*\\.(ru|cn|tk|xyz|top)$"
+      - .*\. (ru|cn|tk|xyz|top)$   # 匹配 .ru/.cn/.tk/.xyz/.top 域名
     responses: [alert]
 
+  # 规则 R-NET-002：异常端口出站连接
   - id: R-NET-002
-    name: Outbound on unusual port
+    name: 异常端口出站连接
     severity: warning
     enabled: true
     categories: [network]
     actions: [connect]
     match:
-      target.port: "4444"
+      target.port: "4444"          # 端口 4444（常用于反向 shell）
     responses: [alert]
 
-  # ---- Command ------------------------------------------------------------
+  # ---- 命令规则 ------------------------------------------------------------
+  
+  # 规则 R-CMD-001：潜在反向 shell
   - id: R-CMD-001
-    name: Potential reverse shell
-    severity: critical
+    name: 潜在反向 shell
+    severity: critical             # 严重程度：严重
     enabled: true
     categories: [command]
     cmd_match:
-      - "bash\\s+-i.*>&?\\s*/dev/tcp/"
-      - "nc\\s+-e\\s+/bin/(ba)?sh"
-      - "python.*-c.*socket\\.socket"
-      - "socat.*exec.*bash"
-    responses: [alert, kill]
+      - "bash\s+-i.*>&?\s*/dev/tcp/"     # bash 反向 shell
+      - "nc\s+-e\s+/bin/(ba)?sh"          # nc 反向 shell
+      - "python.*-c.*socket\.socket"      # Python 反向 shell
+      - "socat.*exec.*bash"               # socat 反向 shell
+    responses: [alert, kill]       # 响应：告警 + 终止进程
 
+  # 规则 R-CMD-002：通过 sudo 提权
   - id: R-CMD-002
-    name: Privilege escalation via sudo
+    name: 通过 sudo 提权
     severity: warning
     enabled: true
     categories: [command]
     cmd_match:
-      - "^sudo\\s+su"
-      - "^sudo\\s+bash"
+      - "^sudo\s+su"               # sudo su 提权
+      - "^sudo\s+bash"             # sudo bash 提权
     responses: [alert]
 
-  # ---- Auth ---------------------------------------------------------------
+  # ---- 认证规则 ---------------------------------------------------------------
+  
+  # 规则 R-AUTH-001：多次登录失败
   - id: R-AUTH-001
-    name: Multiple failed logins
+    name: 多次登录失败
     severity: warning
     enabled: true
     categories: [auth]
     actions: [auth_fail]
-    threshold: 5
-    window_sec: 60
+    threshold: 5                   # 阈值：5次失败
+    window_sec: 60                 # 时间窗口：60秒
     responses: [alert]
 
-  # ---- Driver load --------------------------------------------------------
+  # ---- 驱动加载规则 --------------------------------------------------------
+  
+  # 规则 R-DRV-001：加载未签名驱动
   - id: R-DRV-001
-    name: Unsigned driver loaded
+    name: 加载未签名驱动
     severity: critical
     enabled: true
     categories: [driver]
     actions: [load]
     match:
-      attrs.signed: "false"
+      attrs.signed: "false"        # 未签名的驱动
     responses: [alert, block]
 
-  # ---- Behavior -----------------------------------------------------------
+  # ---- 行为规则 -----------------------------------------------------------
+  
+  # 规则 R-BEH-001：行为异常
   - id: R-BEH-001
-    name: Behavior anomaly
-    description: Triggered when the runtime baseline detects an unusual pattern
+    name: 行为异常
+    description: 当运行时基线检测到异常模式时触发
     severity: notice
     enabled: true
     match:
-      attrs.behavior_anomaly: "true"
+      attrs.behavior_anomaly: "true"  # 行为异常标记
     responses: [alert]
