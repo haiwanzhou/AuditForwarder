@@ -1,6 +1,9 @@
 # 构建产物
 build/
+build_*/
 build_release/
+out/
+dist/
 *.o
 *.obj
 *.exe
@@ -37,9 +40,18 @@ var/
 
 # 本地依赖目录
 .vcpkg/
+node_modules/
 msys64/
+vcpkg_installed/
 
 # 环境与系统文件
 .env
 .DS_Store
 Thumbs.db
+
+.env
+.env.*
+!.env.example
+*.zip
+
+$zlibInstall/
