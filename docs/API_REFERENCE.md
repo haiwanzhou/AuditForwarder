@@ -8,6 +8,53 @@ Authorization: Bearer <manager.auth_token>
 
 生产环境应启用 HTTPS/TLS；如开启 mTLS，应同时配置客户端证书。
 
+## 数据库存储说明
+
+当前服务端 API 路径保持稳定，关系型数据库升级方案见：
+
+- `docs/DATABASE_DESIGN.md`：数据库 ER 图、表结构、字段说明、索引、权限模型和备份策略。
+- `docs/DATABASE_API.md`：主机 CRUD、操作日志、管理员账号、权限控制的 SQL/API 映射和示例代码。
+- `scripts/database/postgresql/001_schema.sql`：PostgreSQL 建表脚本。
+- `scripts/database/postgresql/002_seed.sql`：基础角色、管理员占位账号和测试主机初始化脚本。
+- `scripts/database/postgresql/backup_restore.ps1`：备份与恢复脚本。
+
+## 认证与登录
+
+### POST /auth/login
+
+用途：管理员登录。前端会先使用 Web Crypto 计算密码 SHA-256，再提交到服务端；服务端与配置中的 `manager.login_username` 和 `manager.login_password_sha256` 做严格匹配。
+
+请求示例：
+
+```json
+{
+  "username": "admin",
+  "password_sha256": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+}
+```
+
+成功响应：
+
+```json
+{
+  "token": "af-...",
+  "token_type": "Bearer",
+  "expires_in": 28800,
+  "username": "admin",
+  "redirect": "/"
+}
+```
+
+失败响应统一返回“账号或密码不正确”，不会暴露具体是账号错误还是密码错误。连续 3 次失败后，同一账号与来源 IP 会临时锁定 15 分钟并返回 `429 login_locked`。
+
+登录审计记录保存到：
+
+```text
+data/server/login_audit.jsonl
+```
+
+生产环境必须启用 HTTPS/TLS，避免认证令牌和密码哈希在明文 HTTP 中传输。
+
 ## 状态与配置
 
 ### GET /health

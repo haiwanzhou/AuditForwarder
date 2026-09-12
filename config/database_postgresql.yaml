@@ -1,0 +1,21 @@
+# AuditForwarder - PostgreSQL 数据库配置示例
+# 该文件用于服务端关系型数据库升级方案，生产环境请通过环境变量或密钥系统注入密码。
+
+database:
+  enabled: true
+  driver: postgresql
+  host: 127.0.0.1
+  port: 5432
+  name: auditforwarder
+  user: auditforwarder
+  password: "请替换为强密码，禁止提交真实生产密码"
+  pool_size: 8
+  connect_timeout_sec: 5
+  statement_timeout_ms: 5000
+  sslmode: prefer
+
+backup:
+  enabled: true
+  directory: .\backups
+  retention_days: 30
+  schedule: "每天 02:00 执行一次 pg_dump 逻辑备份"

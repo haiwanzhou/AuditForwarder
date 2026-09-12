@@ -69,7 +69,8 @@
 ## 本地验证命令
 
 ```powershell
-$env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;$env:PATH"
+$env:MSYS2_ROOT = "<MSYS2安装目录>"
+$env:PATH = "$env:MSYS2_ROOT\ucrt64\bin;$env:MSYS2_ROOT\usr\bin;$env:PATH"
 make -C build -j4
 ctest --test-dir build --output-on-failure
 node --check server\web\assets\app.js

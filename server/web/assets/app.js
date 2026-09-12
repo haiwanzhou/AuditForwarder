@@ -5,12 +5,25 @@ const state = {
   hosts: [],
   operationRecords: parseJson(localStorage.getItem("af.operationRecords") || "[]", []),
   actorIdentity: localStorage.getItem("af.actorIdentity") || "本地控制台用户",
+  autoRefresh: localStorage.getItem("af.autoRefresh") !== "false",
+  refreshInFlight: false,
+  liveRefreshInFlight: false,
+  lastRenderedHostsKey: "",
+  currentUser: localStorage.getItem("af.currentUser") || "",
 };
 
 const $ = (id) => document.getElementById(id);
 
 const els = {
+  loginView: $("loginView"),
+  appShell: $("appShell"),
+  loginForm: $("loginForm"),
+  loginUsername: $("loginUsername"),
+  loginPassword: $("loginPassword"),
+  loginMessage: $("loginMessage"),
+  loginSubmitBtn: $("loginSubmitBtn"),
   endpointText: $("endpointText"),
+  autoRefreshToggle: $("autoRefreshToggle"),
   refreshBtn: $("refreshBtn"),
   tokenBtn: $("tokenBtn"),
   notice: $("notice"),
@@ -30,6 +43,8 @@ const els = {
   batchCount: $("batchCount"),
   hostList: $("hostList"),
   hostCount: $("hostCount"),
+  hostSearch: $("hostSearch"),
+  hostStatusFilter: $("hostStatusFilter"),
   hostHistoryTitle: $("hostHistoryTitle"),
   hostHistoryOutput: $("hostHistoryOutput"),
   refreshSecurityBtn: $("refreshSecurityBtn"),
@@ -81,12 +96,80 @@ const validationRules = {
   remotePayload: { label: "指令参数", max: 2048, optional: true },
   upgradeUrl: { label: "升级包 URL", required: true, format: "httpUrl", max: 2048 },
   tokenInput: { label: "管理 Token", max: 256, optional: true },
+  loginUsername: { label: "账号", required: true, min: 2, max: 64, pattern: /^[A-Za-z0-9_.@-]+$/, message: "账号只能包含字母、数字、点、下划线、短横线或 @。" },
+  loginPassword: { label: "密码", required: true, min: 6, max: 128 },
 };
 
 function authHeaders(extra = {}) {
   const headers = { ...extra };
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
   return headers;
+}
+
+function showLogin(message = "") {
+  if (els.loginView) els.loginView.classList.remove("hidden");
+  if (els.appShell) els.appShell.classList.add("hidden");
+  if (message && els.loginMessage) {
+    els.loginMessage.textContent = message;
+    els.loginMessage.className = "login-message";
+  }
+}
+
+function showApp() {
+  if (els.loginView) els.loginView.classList.add("hidden");
+  if (els.appShell) els.appShell.classList.remove("hidden");
+}
+
+async function sha256Hex(text) {
+  if (!window.crypto?.subtle) {
+    throw new Error("当前浏览器不支持 Web Crypto，无法安全处理密码。");
+  }
+  const bytes = new TextEncoder().encode(text);
+  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((item) => item.toString(16).padStart(2, "0")).join("");
+}
+
+function setLoginMessage(message, type = "error") {
+  if (!els.loginMessage) return;
+  els.loginMessage.textContent = message;
+  els.loginMessage.className = `login-message ${type === "success" ? "success" : ""}`;
+}
+
+async function login(event) {
+  event.preventDefault();
+  const errors = validateFields(["loginUsername", "loginPassword"]);
+  if (errors.length) {
+    setLoginMessage(errors[0]);
+    return;
+  }
+  const stopLoading = setLoading(els.loginSubmitBtn, "登录中...");
+  try {
+    const username = els.loginUsername.value.trim();
+    const passwordSha256 = await sha256Hex(els.loginPassword.value);
+    const response = await fetch("/auth/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password_sha256: passwordSha256 }),
+    });
+    const text = await response.text();
+    const data = parseJson(text, {});
+    if (!response.ok) {
+      throw new Error(data.message || "账号或密码不正确。");
+    }
+    state.token = data.token || "";
+    state.currentUser = data.username || username;
+    localStorage.setItem("af.managerToken", state.token);
+    localStorage.setItem("af.currentUser", state.currentUser);
+    els.loginPassword.value = "";
+    setLoginMessage("登录成功，正在进入控制台。", "success");
+    showApp();
+    refreshAll({ record: false });
+  } catch (err) {
+    setLoginMessage(err.message || "账号或密码不正确。");
+  } finally {
+    stopLoading();
+  }
 }
 
 function showNotice(message, type = "success") {
@@ -204,16 +287,11 @@ function clearOperationRecords() {
   state.operationRecords = [];
   persistOperationRecords();
   renderOperationRecords();
-  showNotice("结构化操作记录已清空。");
-  recordOperation({
-    object: "结构化操作记录",
-    type: "clear_operation_records",
-    details: `清空 ${removed} 条历史操作记录`,
-    status: "success",
-  });
+  showNotice(`结构化操作记录已清空，共移除 ${removed} 条。`);
 }
 
 function setLoading(button, loadingText) {
+  if (!button) return () => {};
   const original = button.textContent;
   button.disabled = true;
   button.textContent = loadingText;
@@ -224,22 +302,39 @@ function setLoading(button, loadingText) {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: authHeaders(options.headers || {}),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    const data = parseJson(text, null);
-    if (data && Array.isArray(data.validation_errors)) {
-      throw new Error(data.validation_errors.map((item) => `${item.field}: ${item.message}`).join("；"));
+  const timeoutMs = options.timeoutMs || 10000;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(path, {
+      ...options,
+      signal: controller.signal,
+      credentials: "same-origin",
+      headers: authHeaders(options.headers || {}),
+    }).catch((err) => {
+      if (err.name === "AbortError") throw new Error(`接口请求超时：${path}`);
+      throw err;
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      const data = parseJson(text, null);
+      if (data && Array.isArray(data.validation_errors)) {
+        throw new Error(data.validation_errors.map((item) => `${item.field}: ${item.message}`).join("；"));
+      }
+      if (response.status === 401) {
+        state.token = "";
+        localStorage.removeItem("af.managerToken");
+        showLogin("登录已失效，请重新输入账号和密码。");
+      }
+      const message = response.status === 401
+        ? "接口未授权，请重新登录。"
+        : `接口请求失败：HTTP ${response.status}`;
+      throw new Error(`${message}${text ? ` ${text}` : ""}`);
     }
-    const message = response.status === 401
-      ? "接口未授权，请设置正确的管理 Token。"
-      : `接口请求失败：HTTP ${response.status}`;
-    throw new Error(`${message}${text ? ` ${text}` : ""}`);
+    return text;
+  } finally {
+    window.clearTimeout(timer);
   }
-  return text;
 }
 
 function ensureValidationNode(input) {
@@ -440,11 +535,50 @@ function permissionList(value) {
     .filter(Boolean);
 }
 
+function debounce(fn, delay = 180) {
+  let timer = 0;
+  return (...args) => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => fn(...args), delay);
+  };
+}
+
+function filteredHosts(hosts) {
+  const keyword = String(els.hostSearch?.value || "").trim().toLowerCase();
+  const status = els.hostStatusFilter?.value || "all";
+  return hosts.filter((host) => {
+    if (status === "online" && !host.online) return false;
+    if (status === "offline" && host.online) return false;
+    if (!keyword) return true;
+    const haystack = [
+      host.id,
+      host.name,
+      host.ip_address,
+      host.os_version,
+      host.hardware,
+      host.network_status,
+      host.note,
+      ...(host.permissions || []),
+    ].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(keyword);
+  });
+}
+
 function renderHosts(data) {
-  const hosts = Array.isArray(data.hosts) ? data.hosts : [];
-  state.hosts = hosts;
+  const hosts = Array.isArray(data.hosts) ? data.hosts : state.hosts;
+  if (Array.isArray(data.hosts)) state.hosts = hosts;
+  const visibleHosts = filteredHosts(hosts);
   const onlineCount = hosts.filter((host) => host.online).length;
-  els.hostCount.textContent = `${hosts.length} 台主机，${onlineCount} 台在线`;
+  els.hostCount.textContent = visibleHosts.length === hosts.length
+    ? `${hosts.length} 台主机，${onlineCount} 台在线`
+    : `显示 ${visibleHosts.length} / ${hosts.length} 台主机，${onlineCount} 台在线`;
+  const renderKey = JSON.stringify({
+    hosts: visibleHosts,
+    keyword: els.hostSearch?.value || "",
+    status: els.hostStatusFilter?.value || "all",
+  });
+  if (renderKey === state.lastRenderedHostsKey) return;
+  state.lastRenderedHostsKey = renderKey;
   if (hosts.length === 0) {
     els.hostList.innerHTML = `
       <div class="empty-state">
@@ -454,7 +588,16 @@ function renderHosts(data) {
     `;
     return;
   }
-  els.hostList.innerHTML = hosts.map((host) => `
+  if (visibleHosts.length === 0) {
+    els.hostList.innerHTML = `
+      <div class="empty-state">
+        <strong>没有匹配的主机</strong>
+        <p>请调整搜索关键字或在线状态筛选条件。</p>
+      </div>
+    `;
+    return;
+  }
+  els.hostList.innerHTML = visibleHosts.map((host) => `
     <article class="host-card">
       <div class="host-card-head">
         <div>
@@ -555,7 +698,7 @@ function renderSecurityAnalytics(data) {
   renderBreakdown(els.alertSeverityBreakdown, data.alert_severities, "暂无告警级别统计");
 }
 
-async function loadSecurityMonitor() {
+async function loadSecurityMonitor(options = {}) {
   if (!els.alertList || !els.operationLogList) return;
   try {
     const [alertsText, logsText, analyticsText] = await Promise.all([
@@ -576,7 +719,7 @@ async function loadSecurityMonitor() {
     els.securitySummary.textContent = "加载失败";
     renderSecurityItems(els.alertList, [], "告警加载失败", "alert");
     renderSecurityItems(els.operationLogList, [], "日志加载失败", "log");
-    showNotice(err.message, "error");
+    if (!options.silent) showNotice(err.message, "error");
   }
 }
 
@@ -701,6 +844,8 @@ async function saveHost() {
 async function deleteHost(hostId) {
   if (!hostId) return;
   const host = state.hosts.find((item) => item.id === hostId);
+  const label = host?.name || hostId;
+  if (!window.confirm(`确认删除主机“${label}”吗？该操作会从监管列表移除该主机信息。`)) return;
   try {
     const text = await request(`/hosts?id=${encodeURIComponent(hostId)}`, { method: "DELETE" });
     renderHosts(parseJson(text, { hosts: [] }));
@@ -784,8 +929,16 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-async function refreshAll() {
-  const done = setLoading(els.refreshBtn, "刷新中...");
+async function refreshAll(options = {}) {
+  if (!state.token) {
+    showLogin();
+    return;
+  }
+  if (state.refreshInFlight) return;
+  state.refreshInFlight = true;
+  const record = options.record !== false;
+  const silent = Boolean(options.silent);
+  const done = silent ? () => {} : setLoading(els.refreshBtn, "刷新中...");
   try {
     const [statusText, configText, batchesText, hostsText] = await Promise.all([
       request("/status"),
@@ -797,27 +950,52 @@ async function refreshAll() {
     renderConfig(configText);
     renderBatches(parseJson(batchesText, { batches: [] }));
     renderHosts(parseJson(hostsText, { hosts: [] }));
-    await loadSecurityMonitor();
-    showNotice("数据已刷新。");
-    recordOperation({
-      object: "管理控制台数据",
-      type: "refresh_dashboard",
-      details: "刷新运行状态、配置快照、证据批次和主机列表",
-      status: "success",
-    });
+    await loadSecurityMonitor({ silent });
+    if (!silent) showNotice("数据已刷新。");
+    if (record) {
+      recordOperation({
+        object: "管理控制台数据",
+        type: "refresh_dashboard",
+        details: "刷新运行状态、配置快照、证据批次和主机列表",
+        status: "success",
+      });
+    }
   } catch (err) {
     els.statusPill.textContent = "异常";
     els.statusPill.className = "pill error";
-    showNotice(err.message, "error");
-    recordOperation({
-      object: "管理控制台数据",
-      type: "refresh_dashboard",
-      details: "刷新运行状态、配置快照、证据批次和主机列表失败",
-      status: "failure",
-      error: err,
-    });
+    if (!silent) showNotice(err.message, "error");
+    if (record) {
+      recordOperation({
+        object: "管理控制台数据",
+        type: "refresh_dashboard",
+        details: "刷新运行状态、配置快照、证据批次和主机列表失败",
+        status: "failure",
+        error: err,
+      });
+    }
   } finally {
+    state.refreshInFlight = false;
     done();
+  }
+}
+
+async function refreshLiveData() {
+  if (!state.token || !state.autoRefresh || state.liveRefreshInFlight || document.hidden) return;
+  state.liveRefreshInFlight = true;
+  try {
+    const [statusText, hostsText] = await Promise.all([
+      request("/status", { timeoutMs: 8000 }),
+      request("/hosts", { timeoutMs: 8000 }),
+    ]);
+    renderStatus(parseJson(statusText, {}));
+    renderHosts(parseJson(hostsText, { hosts: [] }));
+    await loadSecurityMonitor({ silent: true });
+  } catch (err) {
+    els.statusPill.textContent = "连接异常";
+    els.statusPill.className = "pill error";
+    els.lastUpdated.textContent = `刷新失败：${err.message}`;
+  } finally {
+    state.liveRefreshInFlight = false;
   }
 }
 
@@ -932,6 +1110,7 @@ function saveToken() {
     details: state.token ? "保存 Bearer Token，用于访问受保护接口" : "清空 Bearer Token",
     status: "success",
   });
+  if (state.token) showApp();
   refreshAll();
 }
 
@@ -946,6 +1125,8 @@ function clearToken() {
     details: "清除浏览器本地保存的 Bearer Token",
     status: "success",
   });
+  closeTokenDialog();
+  showLogin("Token 已清除，请重新登录。");
 }
 
 function saveActorIdentity() {
@@ -961,24 +1142,61 @@ function saveActorIdentity() {
 
 function bindNavigation() {
   const links = [...document.querySelectorAll(".nav-link")];
+  const byHash = new Map(links.map((link) => [link.getAttribute("href"), link]));
+  const activate = (hash) => {
+    links.forEach((item) => item.classList.toggle("active", item.getAttribute("href") === hash));
+  };
   links.forEach((link) => {
     link.addEventListener("click", () => {
-      links.forEach((item) => item.classList.remove("active"));
-      link.classList.add("active");
+      activate(link.getAttribute("href"));
     });
   });
+  if ("IntersectionObserver" in window) {
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries
+        .filter((entry) => entry.isIntersecting)
+        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (visible) activate(`#${visible.target.id}`);
+    }, { rootMargin: "-20% 0px -65% 0px", threshold: [0.1, 0.35, 0.65] });
+    byHash.forEach((_, hash) => {
+      const section = document.querySelector(hash);
+      if (section) observer.observe(section);
+    });
+  }
 }
 
 function init() {
   els.endpointText.textContent = window.location.host || "本机服务";
   els.actorIdentity.value = state.actorIdentity;
-  els.refreshBtn.addEventListener("click", refreshAll);
+  if (els.loginForm) {
+    els.loginForm.addEventListener("submit", login);
+    els.loginForm.addEventListener("reset", () => {
+      window.setTimeout(() => {
+        if (els.loginMessage) els.loginMessage.className = "login-message hidden";
+      }, 0);
+    });
+  }
+  if (els.autoRefreshToggle) {
+    els.autoRefreshToggle.checked = state.autoRefresh;
+    els.autoRefreshToggle.addEventListener("change", () => {
+      state.autoRefresh = els.autoRefreshToggle.checked;
+      localStorage.setItem("af.autoRefresh", String(state.autoRefresh));
+      showNotice(state.autoRefresh ? "已开启自动轻量刷新。" : "已暂停自动刷新。");
+    });
+  }
+  els.refreshBtn.addEventListener("click", () => refreshAll());
   if (els.refreshSecurityBtn) els.refreshSecurityBtn.addEventListener("click", loadSecurityMonitor);
   els.reloadConfigBtn.addEventListener("click", reloadConfig);
   els.copyConfigBtn.addEventListener("click", copyConfig);
   els.saveHostBtn.addEventListener("click", saveHost);
   els.resetHostFormBtn.addEventListener("click", resetHostForm);
   els.sendRemoteCommandBtn.addEventListener("click", sendRemoteCommand);
+  const updateHostFilter = debounce(() => {
+    state.lastRenderedHostsKey = "";
+    renderHosts({ hosts: state.hosts });
+  });
+  if (els.hostSearch) els.hostSearch.addEventListener("input", updateHostFilter);
+  if (els.hostStatusFilter) els.hostStatusFilter.addEventListener("change", updateHostFilter);
   els.hostList.addEventListener("click", (event) => {
     const button = event.target.closest("[data-host-action]");
     if (!button) return;
@@ -1016,8 +1234,17 @@ function init() {
   bindNavigation();
   bindValidation();
   renderOperationRecords();
-  refreshAll();
-  window.setInterval(refreshAll, 30000);
+  if (state.token) {
+    showApp();
+    refreshAll({ record: false });
+  } else {
+    showLogin();
+    if (els.loginUsername) els.loginUsername.focus();
+  }
+  window.setInterval(refreshLiveData, 30000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.token) refreshLiveData();
+  });
 }
 
 init();

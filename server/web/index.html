@@ -7,7 +7,36 @@
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
-  <div class="shell">
+  <section id="loginView" class="login-view" aria-labelledby="loginTitle">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="brand-mark">AF</div>
+        <div>
+          <p class="eyebrow">安全登录</p>
+          <h1 id="loginTitle">AuditForwarder 管理控制台</h1>
+        </div>
+      </div>
+      <p class="muted">请输入管理员账号和密码。连续 3 次失败后，该账号与当前 IP 会临时锁定 15 分钟。</p>
+      <form id="loginForm" class="login-form" autocomplete="on">
+        <label class="field">
+          <span>账号</span>
+          <input id="loginUsername" name="username" autocomplete="username" required placeholder="请输入账号">
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required placeholder="请输入密码">
+        </label>
+        <div id="loginMessage" class="login-message hidden" role="alert"></div>
+        <div class="dialog-actions">
+          <button id="loginResetBtn" class="button ghost" type="reset">重置</button>
+          <button id="loginSubmitBtn" class="button primary" type="submit">登录</button>
+        </div>
+      </form>
+      <p class="login-note">本地调试账号：<code>admin</code>，密码：<code>admin123</code>。生产环境请修改配置并启用 HTTPS/TLS。</p>
+    </div>
+  </section>
+
+  <div id="appShell" class="shell hidden">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">AF</div>
@@ -38,6 +67,10 @@
           <h2>审计代理运行状态</h2>
         </div>
         <div class="topbar-actions">
+          <label class="toggle-field" title="开启后每 30 秒只刷新运行状态、主机和日志摘要，避免频繁拉取大体积配置与批次数据。">
+            <input id="autoRefreshToggle" type="checkbox" checked>
+            <span>自动刷新</span>
+          </label>
           <button id="refreshBtn" class="button primary">刷新数据</button>
           <button id="tokenBtn" class="button ghost">设置 Token</button>
         </div>
@@ -83,7 +116,7 @@
           </div>
           <div class="help-card">
             <h4>使用提示</h4>
-            <p>如果接口返回未授权，请点击“设置 Token”，输入配置文件中的 <code>manager.auth_token</code>。</p>
+            <p>请优先使用登录页进入系统。Token 会由服务端登录接口签发，也可以在调试时手动设置。</p>
           </div>
         </div>
       </section>
@@ -129,6 +162,20 @@
             <button id="saveHostBtn" class="button primary small">保存主机</button>
             <span class="muted" id="hostCount">--</span>
           </div>
+        </div>
+        <div class="panel filter-panel">
+          <label class="field">
+            <span>主机搜索</span>
+            <input id="hostSearch" type="search" placeholder="按主机名、ID、IP、系统版本或备注搜索">
+          </label>
+          <label class="field">
+            <span>在线状态</span>
+            <select id="hostStatusFilter">
+              <option value="all">全部主机</option>
+              <option value="online">仅在线</option>
+              <option value="offline">仅离线</option>
+            </select>
+          </label>
         </div>
         <div class="panel host-panel">
           <div class="host-form">

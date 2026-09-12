@@ -2,12 +2,12 @@
 
 agent:
   id: "test-agent-001"
-  data_dir: C:\Users\30952\Desktop\AuditForwarder\data\client
-  config_path: C:\Users\30952\Desktop\AuditForwarder\config\client_windows.yaml
+  data_dir: data/client
+  config_path: config/client_windows.yaml
 
 log:
   level: debug
-  file: C:\Users\30952\Desktop\AuditForwarder\data\client\client.log
+  file: data/client/client.log
   max_bytes: 52428800
   max_backups: 5
 
@@ -43,7 +43,7 @@ remote:
     - echo
 
 detector:
-  rules_path: C:\Users\30952\Desktop\AuditForwarder\config\rules.yaml
+  rules_path: config/rules.yaml
   enable_behavior_baseline: true
 
 self_protect:

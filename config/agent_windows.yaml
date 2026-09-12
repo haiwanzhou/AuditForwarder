@@ -5,15 +5,15 @@
 # ---------------------------------------------------------------------------
 agent:
   id: "test-agent-001"
-  data_dir: C:\Users\30952\Desktop\AuditForwarder\data
-  config_path: C:\Users\30952\Desktop\AuditForwarder\config\agent_windows.yaml
+  data_dir: data
+  config_path: config/agent_windows.yaml
 
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 log:
   level: debug
-  file: C:\Users\30952\Desktop\AuditForwarder\data\agent.log
+  file: data/agent.log
   max_bytes: 52428800
   max_backups: 5
 
@@ -61,7 +61,7 @@ remote:
 # 检测
 # ---------------------------------------------------------------------------
 detector:
-  rules_path: C:\Users\30952\Desktop\AuditForwarder\config\rules.yaml
+  rules_path: config/rules.yaml
   enable_behavior_baseline: true
 
 # ---------------------------------------------------------------------------

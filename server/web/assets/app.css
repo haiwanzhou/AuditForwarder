@@ -11,6 +11,7 @@
   --success: #16a34a;
   --warning: #d97706;
   --shadow: 0 18px 45px rgba(15, 23, 42, 0.10);
+  --shadow-soft: 0 10px 26px rgba(15, 23, 42, 0.08);
 }
 
 * {
@@ -31,11 +32,76 @@ body {
   font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
 }
 
+.login-view {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(460px, 100%);
+  padding: 30px;
+  border: 1px solid rgba(219, 227, 239, 0.95);
+  border-radius: 28px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.login-brand h1 {
+  margin: 4px 0 0;
+  font-size: clamp(24px, 5vw, 32px);
+}
+
+.login-form {
+  display: grid;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.login-message {
+  padding: 12px 14px;
+  border: 1px solid rgba(220, 38, 38, 0.22);
+  border-radius: 14px;
+  color: #991b1b;
+  background: rgba(254, 226, 226, 0.85);
+}
+
+.login-message.success {
+  border-color: rgba(22, 163, 74, 0.25);
+  color: #166534;
+  background: rgba(220, 252, 231, 0.85);
+}
+
+.login-note {
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
 button,
 input,
 select,
 textarea {
   font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.26);
+  outline-offset: 3px;
 }
 
 .shell {
@@ -153,6 +219,26 @@ textarea {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.toggle-field {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.76);
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle-field input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
 }
 
 .eyebrow {
@@ -372,6 +458,14 @@ textarea {
   line-height: 1.6;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.filter-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 14px;
+  margin-bottom: 14px;
+  box-shadow: var(--shadow-soft);
 }
 
 .batch-list {
@@ -815,6 +909,21 @@ textarea {
   box-shadow: var(--shadow);
 }
 
+.host-card:hover,
+.batch-item:hover,
+.metric-card:hover,
+.analytics-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 38px rgba(15, 23, 42, 0.12);
+}
+
+.host-card,
+.batch-item,
+.metric-card,
+.analytics-card {
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
 .host-card-head {
   display: flex;
   align-items: flex-start;
@@ -1031,6 +1140,10 @@ textarea {
   .operation-config {
     grid-template-columns: 1fr;
   }
+
+  .filter-panel {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 620px) {
@@ -1077,5 +1190,20 @@ textarea {
   .topbar-actions,
   .topbar-actions .button {
     width: 100%;
+  }
+
+  .toggle-field {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+    animation-duration: 0.001ms !important;
   }
 }

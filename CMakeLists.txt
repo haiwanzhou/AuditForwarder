@@ -75,6 +75,7 @@ set(AF_CORE_SOURCES
     shared/src/common/thread_pool.cpp
     shared/src/common/process.cpp
     shared/src/common/event.cpp
+    shared/src/database/database.cpp
 
     # 客户端核心模块
     client/src/core/agent.cpp
@@ -192,7 +193,7 @@ install(TARGETS auditforwarderd auditforwarder-client auditforwarder-server
 # -----------------------------------------------------------------------------
 # 测试
 # -----------------------------------------------------------------------------
-if(BUILD_TESTING AND GTest_FOUND)
+if(BUILD_TESTING)
     file(GLOB AF_TESTS CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/*.cpp"
     )
@@ -201,9 +202,14 @@ if(BUILD_TESTING AND GTest_FOUND)
         target_link_libraries(auditforwarder_tests
             PRIVATE
                 auditforwarder_core
-                GTest::gtest
-                GTest::gtest_main
         )
+        if(GTest_FOUND)
+            target_link_libraries(auditforwarder_tests
+                PRIVATE
+                    GTest::gtest
+                    GTest::gtest_main
+            )
+        endif()
         target_include_directories(auditforwarder_tests
             PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"

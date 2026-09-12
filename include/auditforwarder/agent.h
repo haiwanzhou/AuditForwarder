@@ -77,6 +77,8 @@ struct AgentConfig {
     bool        manager_tls_crl_check { false };
     std::string manager_enrollment_key;
     std::size_t manager_max_host_count { 1000 };
+    std::string manager_login_username { "admin" };
+    std::string manager_login_password_sha256;
 
     // 检测规则
     std::string rules_path;

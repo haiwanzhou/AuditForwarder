@@ -67,6 +67,7 @@ std::string status_text(int code) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 409: return "Conflict";
+        case 429: return "Too Many Requests";
         case 422: return "Unprocessable Entity";
         case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
@@ -81,6 +82,10 @@ bool starts_with(const std::string& s, const std::string& prefix) {
 bool is_ui_path(const std::string& path) {
     return path == "/" || path == "/ui" || path == "/ui/" ||
            path == "/index.html" || starts_with(path, "/assets/");
+}
+
+bool is_public_path(const std::string& path) {
+    return is_ui_path(path) || path == "/auth/login";
 }
 
 std::string content_type_for(const std::string& path) {
@@ -109,6 +114,21 @@ std::string ui_relative_path(const std::string& path) {
         return "server/web/" + rel;
     }
     return {};
+}
+
+std::string peer_ip(int fd) {
+    sockaddr_storage addr {};
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return "unknown";
+    char buf[INET6_ADDRSTRLEN] {};
+    if (addr.ss_family == AF_INET) {
+        auto* a = reinterpret_cast<sockaddr_in*>(&addr);
+        if (inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf))) return buf;
+    } else if (addr.ss_family == AF_INET6) {
+        auto* a = reinterpret_cast<sockaddr_in6*>(&addr);
+        if (inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof(buf))) return buf;
+    }
+    return "unknown";
 }
 
 Result<std::string> read_text_file(const std::string& path) {
@@ -809,6 +829,38 @@ Result<void> append_jsonl_retained(const std::string& dir,
     return Result<void>::ok();
 }
 
+bool constant_time_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+std::string effective_login_hash(const ManagerConfig& cfg) {
+    if (!cfg.login_password_sha256.empty()) return cfg.login_password_sha256;
+    if (!cfg.auth_token.empty()) return crypto::sha256_hex(cfg.auth_token);
+    return crypto::sha256_hex("admin123");
+}
+
+void append_login_audit(const ManagerConfig& cfg,
+                        const std::string& username,
+                        const std::string& client_ip,
+                        const std::string& result,
+                        const std::string& message) {
+    std::ostringstream line;
+    line << "{"
+         << "\"timestamp\":\"" << iso_time(epoch_seconds()) << "\","
+         << "\"username\":\"" << json_escape(username) << "\","
+         << "\"client_ip\":\"" << json_escape(client_ip) << "\","
+         << "\"event_type\":\"login\","
+         << "\"result\":\"" << json_escape(result) << "\","
+         << "\"message\":\"" << json_escape(message) << "\""
+         << "}";
+    (void)append_jsonl_retained(cfg.data_dir, "login_audit.jsonl", line.str(), 20000);
+}
+
 std::string alert_json(const std::string& host_id,
                        const std::string& source,
                        const std::string& severity,
@@ -1150,6 +1202,27 @@ Result<std::string> enqueue_host_command(const ManagerConfig& cfg,
 SimpleHttpManager::SimpleHttpManager(ManagerConfig cfg) : cfg_(std::move(cfg)) {}
 SimpleHttpManager::~SimpleHttpManager() { stop(); }
 
+bool SimpleHttpManager::is_session_token_valid(const std::string& token) {
+    if (token.empty()) return false;
+    auto now = epoch_seconds();
+    std::lock_guard<std::mutex> lk(auth_mutex_);
+    auto it = session_tokens_.find(token);
+    if (it == session_tokens_.end()) return false;
+    if (it->second.second <= now) {
+        session_tokens_.erase(it);
+        return false;
+    }
+    return true;
+}
+
+std::string SimpleHttpManager::create_session_token(const std::string& username, const std::string& client_ip) {
+    auto token = "af-" + crypto::random_hex(32);
+    auto expires = epoch_seconds() + 8 * 60 * 60;
+    std::lock_guard<std::mutex> lk(auth_mutex_);
+    session_tokens_[token] = { username + "@" + client_ip, expires };
+    return token;
+}
+
 Result<void> SimpleHttpManager::start(Agent& agent) {
     agent_ = &agent;
 #ifdef AF_PLATFORM_WINDOWS
@@ -1324,9 +1397,10 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
     std::string query;
     auto q = path.find('?');
     if (q != std::string::npos) { query = path.substr(q + 1); path = path.substr(0, q); }
+    auto client_ip = peer_ip(fd);
 
-    // 头部（认证检查）。前端静态页面允许直接访问，页面内的 API 请求仍按 Token 认证。
-    bool auth_ok = cfg_.auth_token.empty() || is_ui_path(path);
+    // 头部（认证检查）。前端静态页面和登录接口允许直接访问，页面内的 API 请求仍按 Token 认证。
+    bool auth_ok = cfg_.auth_token.empty() || is_public_path(path);
     {
         std::istringstream hl(req.substr(0, bp == std::string::npos ? req.size() : bp));
         std::string line;
@@ -1344,7 +1418,7 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
                     // 去除空格
                     while (!v.empty() && v.front() == ' ') v.erase(0, 1);
                     if (v.size() > 7 && v.substr(0, 7) == "Bearer ") v = v.substr(7);
-                    if (v == cfg_.auth_token) auth_ok = true;
+                    if (v == cfg_.auth_token || is_session_token_valid(v)) auth_ok = true;
                 }
             }
             if (line.empty()) break;
@@ -1358,7 +1432,7 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
         status = 401;
         resp_body = "{\"error\":\"unauthorized\"}";
     } else {
-        resp_body = route(method, path, query, body, content_type, status);
+        resp_body = route(method, path, query, body, content_type, status, client_ip);
     }
 
     std::ostringstream resp;
@@ -1367,6 +1441,13 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
          << "Content-Length: " << resp_body.size() << "\r\n"
          << "Connection: close\r\n"
          << "Server: AuditForwarder/1.0\r\n"
+         << "X-Content-Type-Options: nosniff\r\n"
+         << "X-Frame-Options: DENY\r\n"
+         << "Referrer-Policy: no-referrer\r\n"
+         << "Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'\r\n"
+         << "Cache-Control: " << (is_ui_path(path) && path.rfind("/assets/", 0) == 0
+                                  ? "public, max-age=300"
+                                  : "no-store") << "\r\n"
          << "\r\n"
          << resp_body;
     auto s = resp.str();
@@ -1375,7 +1456,8 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
 
 std::string SimpleHttpManager::route(const std::string& method, const std::string& path,
                                      const std::string& query, const std::string& body,
-                                     std::string& content_type, int& status) {
+                                     std::string& content_type, int& status,
+                                     const std::string& client_ip) {
     if (method == "GET" && is_ui_path(path)) {
         content_type = content_type_for(path);
         auto asset = read_ui_asset(path);
@@ -1385,6 +1467,73 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             return "{\n  \"error\": \"ui asset not found\"\n}";
         }
         return asset.value();
+    }
+    if (path == "/auth/login" && method == "POST") {
+        content_type = "application/json; charset=utf-8";
+        auto username = json_string_field(body, "username");
+        auto password_hash = json_string_field(body, "password_sha256");
+        auto key = username + "|" + client_ip;
+        auto now = epoch_seconds();
+        {
+            std::lock_guard<std::mutex> lk(auth_mutex_);
+            auto it = login_failures_.find(key);
+            if (it != login_failures_.end() && it->second.first >= 3 && it->second.second > now) {
+                status = 429;
+                append_login_audit(cfg_, username, client_ip, "locked", "连续登录失败次数过多，账号临时锁定");
+                std::ostringstream o;
+                o << "{\n"
+                  << "  \"error\": \"login_locked\",\n"
+                  << "  \"message\": \"登录失败次数过多，请 15 分钟后再试。\",\n"
+                  << "  \"locked_until\": \"" << iso_time(it->second.second) << "\"\n"
+                  << "}";
+                return o.str();
+            }
+        }
+
+        auto expected_user = cfg_.login_username.empty() ? std::string("admin") : cfg_.login_username;
+        bool user_ok = constant_time_equal(username, expected_user);
+        bool password_ok = constant_time_equal(password_hash, effective_login_hash(cfg_));
+        if (!user_ok || !password_ok) {
+            std::uint64_t locked_until = 0;
+            int attempts = 0;
+            {
+                std::lock_guard<std::mutex> lk(auth_mutex_);
+                auto& failure = login_failures_[key];
+                attempts = ++failure.first;
+                if (attempts >= 3) {
+                    failure.second = now + 15 * 60;
+                    locked_until = failure.second;
+                }
+            }
+            append_login_audit(cfg_, username, client_ip, "failure", "账号或密码验证失败");
+            status = attempts >= 3 ? 429 : 401;
+            std::ostringstream o;
+            o << "{\n"
+              << "  \"error\": \"" << (attempts >= 3 ? "login_locked" : "invalid_credentials") << "\",\n"
+              << "  \"message\": \"" << (attempts >= 3 ? "登录失败次数过多，请 15 分钟后再试。" : "账号或密码不正确。") << "\",\n"
+              << "  \"remaining_attempts\": " << (attempts >= 3 ? 0 : 3 - attempts);
+            if (locked_until > 0) {
+                o << ",\n  \"locked_until\": \"" << iso_time(locked_until) << "\"";
+            }
+            o << "\n}";
+            return o.str();
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(auth_mutex_);
+            login_failures_.erase(key);
+        }
+        auto token = create_session_token(username, client_ip);
+        append_login_audit(cfg_, username, client_ip, "success", "登录成功并签发会话 Token");
+        std::ostringstream o;
+        o << "{\n"
+          << "  \"token\": \"" << json_escape(token) << "\",\n"
+          << "  \"token_type\": \"Bearer\",\n"
+          << "  \"expires_in\": " << (8 * 60 * 60) << ",\n"
+          << "  \"username\": \"" << json_escape(username) << "\",\n"
+          << "  \"redirect\": \"/\"\n"
+          << "}";
+        return o.str();
     }
     if (path == "/health" || path == "/status") {
         if (!agent_) { status = 503; return "{\n}"; }

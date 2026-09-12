@@ -87,6 +87,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
             cfg_.manager_tls_crl_check = c.get_bool("manager.tls_crl_check", cfg_.manager_tls_crl_check);
             cfg_.manager_enrollment_key = c.get_string("manager.enrollment_key", cfg_.manager_enrollment_key);
             cfg_.manager_max_host_count = static_cast<std::size_t>(c.get_int("manager.max_host_count", static_cast<long long>(cfg_.manager_max_host_count)));
+            cfg_.manager_login_username = c.get_string("manager.login_username", cfg_.manager_login_username);
+            cfg_.manager_login_password_sha256 = c.get_string("manager.login_password_sha256", cfg_.manager_login_password_sha256);
             cfg_.chain_batch_size = static_cast<std::size_t>(c.get_int("chain.batch_size", static_cast<long long>(cfg_.chain_batch_size)));
             cfg_.chain_signing_key = c.get_string("chain.signing_key", cfg_.chain_signing_key);
             cfg_.chain_hmac_key = c.get_string("chain.hmac_key", cfg_.chain_hmac_key);
@@ -281,6 +283,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
         mc.tls_crl_check = cfg_.manager_tls_crl_check;
         mc.enrollment_key = cfg_.manager_enrollment_key;
         mc.max_host_count = cfg_.manager_max_host_count;
+        mc.login_username = cfg_.manager_login_username;
+        mc.login_password_sha256 = cfg_.manager_login_password_sha256;
         mc.data_dir   = cfg_.data_dir;
         manager_ = std::make_unique<SimpleHttpManager>(mc);
     }

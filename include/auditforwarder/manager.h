@@ -5,6 +5,7 @@
 #include "auditforwarder/agent.h"
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -22,6 +23,8 @@ struct ManagerConfig {
     std::string enrollment_key;
     std::size_t max_host_count { 1000 };
     std::string data_dir;
+    std::string login_username { "admin" };
+    std::string login_password_sha256;
 };
 
 class SimpleHttpManager : public ManagerServer {
@@ -38,7 +41,11 @@ private:
     void handle_client(int fd, void* tls = nullptr);
     std::string route(const std::string& method, const std::string& path,
                       const std::string& query, const std::string& body,
-                      std::string& content_type, int& status);
+                      std::string& content_type, int& status,
+                      const std::string& client_ip = {});
+
+    bool is_session_token_valid(const std::string& token);
+    std::string create_session_token(const std::string& username, const std::string& client_ip);
 
     ManagerConfig       cfg_;
     std::atomic<bool>   running_ { false };
@@ -46,6 +53,9 @@ private:
     Agent*              agent_  { nullptr };
     int                 listen_fd_ { -1 };
     void*               tls_ctx_ { nullptr };
+    std::mutex          auth_mutex_;
+    std::map<std::string, std::pair<int, std::uint64_t>> login_failures_;
+    std::map<std::string, std::pair<std::string, std::uint64_t>> session_tokens_;
 };
 
 }  // namespace af

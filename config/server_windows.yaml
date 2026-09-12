@@ -2,12 +2,12 @@
 
 agent:
   id: "auditforwarder-server"
-  data_dir: C:\Users\30952\Desktop\AuditForwarder\data\server
-  config_path: C:\Users\30952\Desktop\AuditForwarder\config\server_windows.yaml
+  data_dir: data/server
+  config_path: config/server_windows.yaml
 
 log:
   level: debug
-  file: C:\Users\30952\Desktop\AuditForwarder\data\server\server.log
+  file: data/server/server.log
   max_bytes: 52428800
   max_backups: 5
 
@@ -27,7 +27,7 @@ remote:
   servers: []
 
 detector:
-  rules_path: C:\Users\30952\Desktop\AuditForwarder\config\rules.yaml
+  rules_path: config/rules.yaml
   enable_behavior_baseline: false
 
 self_protect:
@@ -35,8 +35,10 @@ self_protect:
 
 manager:
   enabled: true
-  listen: 127.0.0.1:8443
+  listen: 0.0.0.0:8443
   auth_token: "test-token-12345"
+  login_username: "admin"
+  login_password_sha256: "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
   enrollment_key: "specific_key"
   max_host_count: 1000
   use_tls: false

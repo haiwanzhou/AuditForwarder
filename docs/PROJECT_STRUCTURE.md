@@ -13,6 +13,7 @@ AuditForwarder/
 ├── config/          # 运行配置和规则配置
 ├── docs/            # 项目文档
 ├── scripts/         # 安装和运维脚本
+│   └── database/    # 关系型数据库建表、初始化和备份恢复脚本
 ├── tests/           # 自动化测试
 └── CMakeLists.txt   # 统一构建入口
 ```
@@ -104,6 +105,28 @@ shared/src/detector/
 ## include
 
 `include/auditforwarder/` 是公共头文件接口层。客户端、服务器端和共享模块都通过这里声明类型、接口和配置结构。
+
+## 数据库脚本
+
+`scripts/database/postgresql/` 存放 PostgreSQL 数据库交付物。
+
+```text
+scripts/database/postgresql/001_schema.sql
+```
+
+创建服务端关系型数据库表、索引、约束、触发器和视图。
+
+```text
+scripts/database/postgresql/002_seed.sql
+```
+
+初始化默认角色、占位管理员账号和开发测试主机。
+
+```text
+scripts/database/postgresql/backup_restore.ps1
+```
+
+执行 PostgreSQL 逻辑备份、恢复和旧备份清理。
 
 ## 文件组织原则
 
