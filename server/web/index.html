@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AuditForwarder 管理控制台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <section id="loginView" class="login-view" aria-labelledby="loginTitle">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="brand-mark">AF</div>
+        <div>
+          <p class="eyebrow">安全登录</p>
+          <h1 id="loginTitle">AuditForwarder 管理控制台</h1>
+        </div>
+      </div>
+      <p class="muted">请输入管理员账号和密码。连续 3 次失败后，该账号与当前 IP 会临时锁定 15 分钟。</p>
+      <form id="loginForm" class="login-form" autocomplete="on">
+        <label class="field">
+          <span>账号</span>
+          <input id="loginUsername" name="username" autocomplete="username" required placeholder="请输入账号">
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required placeholder="请输入密码">
+        </label>
+        <div id="loginMessage" class="login-message hidden" role="alert"></div>
+        <div class="dialog-actions">
+          <button id="loginResetBtn" class="button ghost" type="reset">重置</button>
+          <button id="loginSubmitBtn" class="button primary" type="submit">登录</button>
+        </div>
+      </form>
+      <p class="login-note">登录账号与密码使用服务端配置中自行设置的值。生产环境请修改配置并启用 HTTPS/TLS。</p>
+    </div>
+  </section>
+
+  <div id="appShell" class="shell hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">AF</div>
+        <div>
+          <h1>AuditForwarder</h1>
+          <p>安全审计管理控制台</p>
+        </div>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <a href="#overview" class="nav-link active">运行概览</a>
+        <a href="#config" class="nav-link">配置中心</a>
+        <a href="#batches" class="nav-link">证据批次</a>
+        <a href="#hosts" class="nav-link">主机管理</a>
+        <a href="#security-monitor" class="nav-link">日志与告警</a>
+        <a href="#operation-records" class="nav-link">操作记录</a>
+        <a href="#actions" class="nav-link">运维操作</a>
+      </nav>
+      <div class="sidebar-card">
+        <span class="muted">管理地址</span>
+        <strong id="endpointText">本机服务</strong>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">实时控制台</p>
+          <h2>审计代理运行状态</h2>
+        </div>
+        <div class="topbar-actions">
+          <label class="toggle-field" title="开启后每 30 秒只刷新运行状态、主机和日志摘要，避免频繁拉取大体积配置与批次数据。">
+            <input id="autoRefreshToggle" type="checkbox" checked>
+            <span>自动刷新</span>
+          </label>
+          <button id="refreshBtn" class="button primary">刷新数据</button>
+          <button id="tokenBtn" class="button ghost">设置 Token</button>
+        </div>
+      </header>
+
+      <section id="notice" class="notice hidden" role="status"></section>
+
+      <section id="overview" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">系统概览</p>
+            <h3>运行概览</h3>
+          </div>
+          <span id="statusPill" class="pill unknown">未知</span>
+        </div>
+        <div class="cards">
+          <article class="metric-card">
+            <span>已采集事件</span>
+            <strong id="eventsCollected">--</strong>
+          </article>
+          <article class="metric-card">
+            <span>已上传事件</span>
+            <strong id="eventsUploaded">--</strong>
+          </article>
+          <article class="metric-card">
+            <span>失败事件</span>
+            <strong id="eventsFailed">--</strong>
+          </article>
+          <article class="metric-card">
+            <span>告警数量</span>
+            <strong id="alerts">--</strong>
+          </article>
+        </div>
+        <div class="panel grid-two">
+          <div>
+            <h4>运行细节</h4>
+            <dl class="detail-list">
+              <div><dt>运行时长</dt><dd id="uptime">--</dd></div>
+              <div><dt>已丢弃事件</dt><dd id="eventsDropped">--</dd></div>
+              <div><dt>上传字节数</dt><dd id="bytesUploaded">--</dd></div>
+              <div><dt>最后刷新</dt><dd id="lastUpdated">--</dd></div>
+            </dl>
+          </div>
+          <div class="help-card">
+            <h4>使用提示</h4>
+            <p>请优先使用登录页进入系统。Token 会由服务端登录接口签发，也可以在调试时手动设置。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="config" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">配置管理</p>
+            <h3>配置中心</h3>
+          </div>
+          <button id="reloadConfigBtn" class="button">重新加载配置</button>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">当前配置快照</span>
+            <button id="copyConfigBtn" class="button ghost small">复制配置</button>
+          </div>
+          <pre id="configView" class="code-block">正在加载配置...</pre>
+        </div>
+      </section>
+
+      <section id="batches" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Evidence</p>
+            <h3>证据批次</h3>
+          </div>
+          <div class="section-actions">
+            <span class="muted">批次内容保持原始 JSON，不做派生内容转换</span>
+            <span class="muted" id="batchCount">--</span>
+          </div>
+        </div>
+        <div id="batchList" class="batch-list"></div>
+      </section>
+
+      <section id="hosts" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Hosts</p>
+            <h3>主机管理与远程控制</h3>
+          </div>
+          <div class="section-actions">
+            <button id="saveHostBtn" class="button primary small">保存主机</button>
+            <span class="muted" id="hostCount">--</span>
+          </div>
+        </div>
+        <div class="panel filter-panel">
+          <label class="field">
+            <span>主机搜索</span>
+            <input id="hostSearch" type="search" placeholder="按主机名、ID、IP、系统版本或备注搜索">
+          </label>
+          <label class="field">
+            <span>在线状态</span>
+            <select id="hostStatusFilter">
+              <option value="all">全部主机</option>
+              <option value="online">仅在线</option>
+              <option value="offline">仅离线</option>
+            </select>
+          </label>
+        </div>
+        <div class="panel host-panel">
+          <div class="host-form">
+            <label class="field">
+              <span>主机 ID</span>
+              <input id="hostId" placeholder="留空时由后端按主机信息自动生成">
+            </label>
+            <label class="field">
+              <span>主机名称</span>
+              <input id="hostName" placeholder="例如：office-pc-01">
+            </label>
+            <label class="field">
+              <span>IP 地址</span>
+              <input id="hostIp" placeholder="例如：192.168.1.20">
+            </label>
+            <label class="field">
+              <span>硬件配置</span>
+              <input id="hostHardware" placeholder="例如：8C16G / Intel i7 / 512GB SSD">
+            </label>
+            <label class="field">
+              <span>操作系统版本</span>
+              <input id="hostOs" placeholder="例如：Windows 11 23H2">
+            </label>
+            <label class="field">
+              <span>远控权限</span>
+              <input id="hostPermissions" placeholder="逗号分隔，例如：remote_control,restart,upgrade">
+            </label>
+            <label class="field wide">
+              <span>备注</span>
+              <input id="hostNote" placeholder="主机用途、归属人或部署位置">
+            </label>
+            <div class="form-actions">
+              <button id="resetHostFormBtn" class="button ghost small">清空表单</button>
+            </div>
+          </div>
+          <div class="host-remote-box">
+            <h4>远程控制指令</h4>
+            <div class="host-form compact">
+              <label class="field">
+                <span>目标主机 ID</span>
+                <input id="remoteHostId" placeholder="从下方主机卡片选择">
+              </label>
+              <label class="field">
+                <span>指令类型</span>
+                <select id="remoteCommandType">
+                  <option value="collect_status">采集状态</option>
+                  <option value="echo">回显测试</option>
+                  <option value="restart">重启服务</option>
+                  <option value="upgrade">远程升级</option>
+                </select>
+              </label>
+              <label class="field wide">
+                <span>指令参数</span>
+                <input id="remotePayload" placeholder="例如：升级包 URL、操作说明或 JSON 参数">
+              </label>
+              <button id="sendRemoteCommandBtn" class="button danger small">发送到目标主机</button>
+            </div>
+            <p class="muted">后端会按 <code>host_id</code> 写入目标主机专属加密队列，避免多主机场景下指令发错对象。</p>
+          </div>
+        </div>
+        <div id="hostList" class="host-list"></div>
+        <div class="panel host-history-panel">
+          <div class="toolbar">
+            <span class="muted" id="hostHistoryTitle">请选择主机查看集中历史数据</span>
+          </div>
+          <pre id="hostHistoryOutput" class="text-output">可查看资源指标、审计摘要和命令执行结果。</pre>
+        </div>
+      </section>
+
+      <section id="security-monitor" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Security Monitor</p>
+            <h3>操作日志与违规告警</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshSecurityBtn" class="button ghost small">刷新日志与告警</button>
+            <span class="muted" id="securitySummary">等待加载</span>
+          </div>
+        </div>
+        <div class="panel analytics-panel">
+          <article class="analytics-card">
+            <span>日志总数</span>
+            <strong id="analyticsLogCount">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>告警总数</span>
+            <strong id="analyticsAlertCount">--</strong>
+          </article>
+          <article class="analytics-card wide">
+            <span>操作类型分布</span>
+            <div id="operationTypeBreakdown" class="breakdown-list">等待加载</div>
+          </article>
+          <article class="analytics-card wide">
+            <span>告警级别分布</span>
+            <div id="alertSeverityBreakdown" class="breakdown-list">等待加载</div>
+          </article>
+        </div>
+        <div class="panel security-panel">
+          <div>
+            <div class="toolbar">
+              <span class="muted">最新违规告警</span>
+            </div>
+            <div id="alertList" class="security-list"></div>
+          </div>
+          <div>
+            <div class="toolbar">
+              <span class="muted">最新结构化操作日志</span>
+            </div>
+            <div id="operationLogList" class="security-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="actions" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Operations</p>
+            <h3>运维操作</h3>
+          </div>
+        </div>
+        <div class="panel">
+          <label class="field">
+            <span>升级包 URL</span>
+            <input id="upgradeUrl" type="url" placeholder="例如：http://127.0.0.1:9000/auditforwarderd.exe">
+          </label>
+          <div class="action-row">
+            <button id="upgradeBtn" class="button danger">提交升级请求</button>
+            <p class="muted">该操作会调用现有 <code>/upgrade</code> 接口，后端当前只记录请求。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="operation-records" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Operation Records</p>
+            <h3>结构化操作记录</h3>
+          </div>
+          <div class="section-actions">
+            <button id="exportRecordsBtn" class="button ghost small">导出 JSON</button>
+            <button id="clearRecordsBtn" class="button ghost small">清空记录</button>
+          </div>
+        </div>
+        <div class="panel operation-panel">
+          <div class="operation-config">
+            <label class="field">
+              <span>执行者身份</span>
+              <input id="actorIdentity" type="text" placeholder="例如：管理员、审计员、运维人员">
+            </label>
+            <div class="help-card">
+              <h4>记录字段</h4>
+              <p>每条记录都会包含执行者、秒级时间戳、操作对象、操作类型、操作细节和成功/失败状态。</p>
+            </div>
+          </div>
+          <div class="toolbar">
+            <span class="muted" id="recordCount">0 条记录</span>
+            <button id="copyRecordsBtn" class="button ghost small">复制记录</button>
+          </div>
+          <div class="records-table-wrap">
+            <table class="records-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>执行者</th>
+                  <th>对象</th>
+                  <th>操作</th>
+                  <th>细节</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="operationRecordList"></tbody>
+            </table>
+          </div>
+          <pre id="operationRecordJson" class="code-block records-json">[]</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="tokenDialog" class="dialog-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="tokenTitle">
+    <div class="dialog">
+      <h3 id="tokenTitle">设置访问 Token</h3>
+      <p class="muted">Token 会保存在当前浏览器，用于访问需要认证的管理接口。</p>
+      <label class="field">
+        <span>Bearer Token</span>
+        <input id="tokenInput" type="password" placeholder="输入 manager.auth_token">
+      </label>
+      <div class="dialog-actions">
+        <button id="clearTokenBtn" class="button ghost">清除</button>
+        <button id="cancelTokenBtn" class="button">取消</button>
+        <button id="saveTokenBtn" class="button primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

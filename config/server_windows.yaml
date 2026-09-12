@@ -1,0 +1,54 @@
+# AuditForwarder - Windows 服务端测试配置
+
+agent:
+  id: "auditforwarder-server"
+  data_dir: data/server
+  config_path: config/server_windows.yaml
+
+log:
+  level: debug
+  file: data/server/server.log
+  max_bytes: 52428800
+  max_backups: 5
+
+chain:
+  batch_size: 10
+  sign_batches: false
+  auto_persist: true
+  hmac_key: ""                 # 如需 HMAC 签名请自行配置，禁止提交真实密钥
+
+transport:
+  servers: []
+  auth_token: ""
+  verify_tls: false
+
+remote:
+  enabled: false
+  servers: []
+
+detector:
+  rules_path: config/rules.yaml
+  enable_behavior_baseline: false
+
+self_protect:
+  enabled: false
+
+manager:
+  enabled: true
+  listen: 0.0.0.0:8443
+  auth_token: ""
+  login_username: "admin"
+  # 占位值：置空会回退到内置默认密码，切勿留空。请参照《本地测试环境配置说明.md》
+  # 生成新密码的 SHA-256 哈希后替换，禁止提交真实生产密码哈希。
+  login_password_sha256: "请替换为强密码的SHA-256哈希"
+  enrollment_key: ""           # 留空表示注册不校验密钥；生产环境必须自行配置
+  max_host_count: 1000
+  use_tls: false
+  require_client_cert: false
+  tls_crl_check: false
+
+collectors:
+  enabled: false
+
+processors:
+  - type: enricher
