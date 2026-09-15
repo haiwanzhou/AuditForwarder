@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿# AuditForwarder
+# AuditForwarder
 
 企业级跨平台安全审计代理系统。
 
@@ -39,19 +39,25 @@ powershell -ExecutionPolicy Bypass -File scripts\install_windows.ps1 -Start
 
 ### 本地服务端与客户端
 
-启动服务端：
+首次运行前预建数据目录（避免日志目录不存在的提示）：
 
 ```powershell
-$env:MSYS2_ROOT = "<MSYS2安装目录>"  # 示例：安装 MSYS2 后填写实际目录
-$env:PATH = "$env:MSYS2_ROOT\mingw64\bin;$env:MSYS2_ROOT\usr\bin;$env:PATH"
+New-Item -ItemType Directory -Force data\server, data\client | Out-Null
+```
+
+启动服务端（工作目录保持在项目根目录）：
+
+```powershell
+$env:MSYS2_ROOT = "<MSYS2安装目录>"  # 示例：C:\msys64
+$env:PATH = "$env:MSYS2_ROOT\ucrt64\bin;$env:MSYS2_ROOT\mingw64\bin;$env:MSYS2_ROOT\usr\bin;$env:PATH"
 .\build\auditforwarder-server.exe -c .\config\server_windows.yaml
 ```
 
 启动客户端：
 
 ```powershell
-$env:MSYS2_ROOT = "<MSYS2安装目录>"  # 示例：安装 MSYS2 后填写实际目录
-$env:PATH = "$env:MSYS2_ROOT\mingw64\bin;$env:MSYS2_ROOT\usr\bin;$env:PATH"
+$env:MSYS2_ROOT = "<MSYS2安装目录>"  # 示例：C:\msys64
+$env:PATH = "$env:MSYS2_ROOT\ucrt64\bin;$env:MSYS2_ROOT\mingw64\bin;$env:MSYS2_ROOT\usr\bin;$env:PATH"
 .\build\auditforwarder-client.exe -c .\config\client_windows.yaml
 ```
 
@@ -78,12 +84,11 @@ http://10.4.122.141:8443/
 
 ## 文档
 
-- [项目运行指南](项目运行指南.md)
-- [VS Code 编译运行指南](VSCode编译运行指南.md)
-- [本地测试环境配置说明](本地测试环境配置说明.md)
+- [项目操作手册](项目操作手册.md)（环境搭建、配置、构建、运行、验证与排错的完整步骤）
 - [项目规格说明](docs/PROJECT_SPEC.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [项目结构说明](docs/PROJECT_STRUCTURE.md)
+- [通信协议](docs/PROTOCOL.md)
 - [API 文档](docs/API_REFERENCE.md)
 - [数据库设计](docs/DATABASE_DESIGN.md)
 - [数据库 API 与示例](docs/DATABASE_API.md)

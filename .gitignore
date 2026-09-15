@@ -46,12 +46,8 @@ vcpkg_installed/
 
 # 环境与系统文件
 .env
-.DS_Store
-Thumbs.db
-
-.env
 .env.*
 !.env.example
+.DS_Store
+Thumbs.db
 *.zip
-
-$zlibInstall/
