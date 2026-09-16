@@ -22,6 +22,7 @@ struct ManagerConfig {
     bool        tls_crl_check { false };
     std::string enrollment_key;
     std::size_t max_host_count { 1000 };
+    u64         status_timeout_seconds { 30 };   // 心跳超时判定下线（≤该值视为在线）
     std::string data_dir;
     std::string login_username { "admin" };
     std::string login_password_sha256;
@@ -50,6 +51,8 @@ private:
     ManagerConfig       cfg_;
     std::atomic<bool>   running_ { false };
     std::thread         thr_;
+    std::thread         monitor_thr_;        // 主动扫描主机在线/离线状态
+    std::atomic<bool>   monitor_running_ { false };
     Agent*              agent_  { nullptr };
     int                 listen_fd_ { -1 };
     void*               tls_ctx_ { nullptr };

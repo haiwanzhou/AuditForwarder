@@ -52,9 +52,25 @@ public:
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
                 nullptr);
             if (h == INVALID_HANDLE_VALUE) continue;
-            handles_.push_back({h, p, {}});
+            Watcher w;
+            w.h = h;
+            w.path = p;
+            w.buf.resize(64 * 1024);           // 一次性分配，避免 poll 中反复 resize 造成 ReadDirectoryChangesW 写入旧地址
+            handles_.push_back(std::move(w));
         }
-        running_ = true;
+        // 为每个 handle 发出初始异步读取
+        for (auto& w : handles_) {
+            memset(&w.ov, 0, sizeof(w.ov));
+            ::ReadDirectoryChangesW(w.h, w.buf.data(), static_cast<DWORD>(w.buf.size()),
+                                    TRUE,
+                                    FILE_NOTIFY_CHANGE_FILE_NAME |
+                                    FILE_NOTIFY_CHANGE_SIZE |
+                                    FILE_NOTIFY_CHANGE_LAST_WRITE |
+                                    FILE_NOTIFY_CHANGE_ATTRIBUTES |
+                                    FILE_NOTIFY_CHANGE_SECURITY,
+                                    nullptr, &w.ov, nullptr);
+        }
+        running_ = !handles_.empty();
         return Result<void>::ok();
     }
     void close() override {
@@ -68,19 +84,10 @@ public:
         for (auto& w : handles_) {
             DWORD n = 0;
             if (!::GetOverlappedResult(w.h, &w.ov, &n, FALSE)) {
-                // Issue another read
-                memset(&w.ov, 0, sizeof(w.ov));
-                w.buf.resize(64 * 1024);
-                ::ReadDirectoryChangesW(w.h, w.buf.data(), static_cast<DWORD>(w.buf.size()),
-                                        TRUE,
-                                        FILE_NOTIFY_CHANGE_FILE_NAME |
-                                        FILE_NOTIFY_CHANGE_SIZE |
-                                        FILE_NOTIFY_CHANGE_LAST_WRITE |
-                                        FILE_NOTIFY_CHANGE_ATTRIBUTES |
-                                        FILE_NOTIFY_CHANGE_SECURITY,
-                                        nullptr, &w.ov, nullptr);
+                // 上一次 I/O 尚未完成，继续等待；轮询期间不重新发 Read
                 continue;
             }
+            if (n == 0 || w.buf.empty()) continue;
             auto* fni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(w.buf.data());
             while (true) {
                 char path[MAX_PATH];
@@ -106,9 +113,8 @@ public:
                 fni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
                     reinterpret_cast<char*>(fni) + fni->NextEntryOffset);
             }
-            // Issue next read
+            // 发出下一次异步读取（buf 空间已在 open() 预分配，不再 resize 避免指针失效）
             memset(&w.ov, 0, sizeof(w.ov));
-            w.buf.resize(64 * 1024);
             ::ReadDirectoryChangesW(w.h, w.buf.data(), static_cast<DWORD>(w.buf.size()),
                                     TRUE,
                                     FILE_NOTIFY_CHANGE_FILE_NAME |

@@ -77,6 +77,7 @@ struct AgentConfig {
     bool        manager_tls_crl_check { false };
     std::string manager_enrollment_key;
     std::size_t manager_max_host_count { 1000 };
+    u64         manager_status_timeout_seconds { 30 };
     std::string manager_login_username { "admin" };
     std::string manager_login_password_sha256;
 

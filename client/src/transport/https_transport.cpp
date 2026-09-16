@@ -242,62 +242,85 @@ void HttpsTransport::worker_loop() {
 }
 
 // ------------------------------------------------------------------
-// do_upload: perform a single HTTPS POST using OpenSSL BIO.
+// do_upload: perform a single HTTP/HTTPS POST.
+// 支持 http:// (明文) 和 https:// (TLS) 两种协议，便于本地开发不强制 TLS。
 // ------------------------------------------------------------------
 UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer& body, const std::string& batch_id) {
     UploadResult r;
-    if (url.size() < 8 || url.substr(0, 8) != "https://") {
+    // 解析协议
+    bool use_tls = false;
+    std::string rest;
+    if (url.size() >= 8 && url.substr(0, 8) == "https://") {
+        use_tls = true;
+        rest = url.substr(8);
+    } else if (url.size() >= 7 && url.substr(0, 7) == "http://") {
+        use_tls = false;
+        rest = url.substr(7);
+    } else {
         r.error = "unsupported scheme: " + url;
         return r;
     }
-    // Parse URL: https://host[:port]/path
-    std::string rest = url.substr(8);
     auto slash = rest.find('/');
     std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
     std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
 
-    std::string host; int port = 443;
+    std::string host; int port = use_tls ? 443 : 80;
     auto colon = authority.find(':');
     if (colon == std::string::npos) { host = authority; }
     else { host = authority.substr(0, colon); port = std::stoi(authority.substr(colon + 1)); }
 
-    OpenSSL_add_all_algorithms();
-    const SSL_METHOD* method = TLS_client_method();
-    SSL_CTX* ctx = SSL_CTX_new(method);
-    if (!ctx) { r.error = "ctx"; return r; }
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+    BIO* bio = nullptr;
 
-    if (cfg_.verify_tls) {
-        if (!cfg_.ca_cert.empty()) {
-            if (SSL_CTX_load_verify_locations(ctx, cfg_.ca_cert.c_str(), nullptr) != 1) {
-                r.error = "load ca"; SSL_CTX_free(ctx); return r;
+    if (use_tls) {
+        OpenSSL_add_all_algorithms();
+        const SSL_METHOD* method = TLS_client_method();
+        ctx = SSL_CTX_new(method);
+        if (!ctx) { r.error = "ctx"; return r; }
+
+        if (cfg_.verify_tls) {
+            if (!cfg_.ca_cert.empty()) {
+                if (SSL_CTX_load_verify_locations(ctx, cfg_.ca_cert.c_str(), nullptr) != 1) {
+                    r.error = "load ca"; SSL_CTX_free(ctx); return r;
+                }
+            } else {
+                SSL_CTX_set_default_verify_paths(ctx);
             }
         } else {
-            SSL_CTX_set_default_verify_paths(ctx);
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+        }
+        if (!cfg_.client_cert.empty() && !cfg_.client_key.empty()) {
+            if (SSL_CTX_use_certificate_file(ctx, cfg_.client_cert.c_str(), SSL_FILETYPE_PEM) != 1 ||
+                SSL_CTX_use_PrivateKey_file(ctx, cfg_.client_key.c_str(), SSL_FILETYPE_PEM) != 1) {
+                r.error = "client key/cert"; SSL_CTX_free(ctx); return r;
+            }
+        }
+
+        bio = BIO_new_ssl_connect(ctx);
+        if (!bio) { r.error = "bio"; SSL_CTX_free(ctx); return r; }
+        std::string hostport = host + ":" + std::to_string(port);
+        BIO_set_conn_hostname(bio, hostport.c_str());
+
+        if (BIO_do_connect(bio) <= 0) {
+            r.error = "connect failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r;
+        }
+        BIO_get_ssl(bio, &ssl);
+        if (!ssl) { r.error = "ssl null"; BIO_free_all(bio); SSL_CTX_free(ctx); return r; }
+        if (cfg_.verify_tls && SSL_get_verify_result(ssl) != X509_V_OK) {
+            r.error = "tls verify failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r;
         }
     } else {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-    }
-    if (!cfg_.client_cert.empty() && !cfg_.client_key.empty()) {
-        if (SSL_CTX_use_certificate_file(ctx, cfg_.client_cert.c_str(), SSL_FILETYPE_PEM) != 1 ||
-            SSL_CTX_use_PrivateKey_file(ctx, cfg_.client_key.c_str(), SSL_FILETYPE_PEM) != 1) {
-            r.error = "client key/cert"; SSL_CTX_free(ctx); return r;
+        // HTTP 明文：使用 BIO_connect + BIO_socket
+        bio = BIO_new(BIO_s_connect());
+        if (!bio) { r.error = "bio connect"; return r; }
+        std::string hostport = host + ":" + std::to_string(port);
+        BIO_set_conn_hostname(bio, hostport.c_str());
+        BIO_set_conn_port(bio, std::to_string(port).c_str());
+        BIO_set_nbio(bio, 0);
+        if (BIO_do_connect(bio) <= 0) {
+            r.error = "connect failed: " + hostport; BIO_free_all(bio); return r;
         }
-    }
-
-    // 连接 TCP
-    BIO* bio = BIO_new_ssl_connect(ctx);
-    if (!bio) { r.error = "bio"; SSL_CTX_free(ctx); return r; }
-    std::string hostport = host + ":" + std::to_string(port);
-    BIO_set_conn_hostname(bio, hostport.c_str());
-
-    if (BIO_do_connect(bio) <= 0) {
-        r.error = "connect failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r;
-    }
-    SSL* ssl = nullptr;
-    BIO_get_ssl(bio, &ssl);
-    if (!ssl) { r.error = "ssl null"; BIO_free_all(bio); SSL_CTX_free(ctx); return r; }
-    if (cfg_.verify_tls && SSL_get_verify_result(ssl) != X509_V_OK) {
-        r.error = "tls verify failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r;
     }
 
     // 构造 HTTP/1.1 请求。
@@ -315,13 +338,13 @@ UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer&
 
     std::string hdr = req.str();
     if (BIO_write(bio, hdr.data(), static_cast<int>(hdr.size())) <= 0) {
-        r.error = "write header failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r;
+        r.error = "write header failed"; BIO_free_all(bio); if (ctx) SSL_CTX_free(ctx); return r;
     }
     if (!body.empty()) {
         int sent = 0;
         while (sent < static_cast<int>(body.size())) {
             int n = BIO_write(bio, body.data() + sent, static_cast<int>(body.size() - sent));
-            if (n <= 0) { r.error = "write body failed"; BIO_free_all(bio); SSL_CTX_free(ctx); return r; }
+            if (n <= 0) { r.error = "write body failed"; BIO_free_all(bio); if (ctx) SSL_CTX_free(ctx); return r; }
             sent += n;
         }
     }
@@ -334,7 +357,7 @@ UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer&
         response.append(buf, n);
     }
     BIO_free_all(bio);
-    SSL_CTX_free(ctx);
+    if (ctx) SSL_CTX_free(ctx);
 
     r.bytes_sent = body.size();
     // Parse status line

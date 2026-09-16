@@ -41,6 +41,7 @@ manager:
   login_password_sha256: "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
   enrollment_key: "specific_key"
   max_host_count: 1000
+  status_timeout_seconds: 30       # 心跳超过此值判定下线（客户端默认 5s 心跳，留 6 次窗口）
   use_tls: false
   require_client_cert: false
   tls_crl_check: false

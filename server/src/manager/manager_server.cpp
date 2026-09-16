@@ -15,6 +15,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -603,9 +604,9 @@ bool has_permission(const HostRecord& h, const std::string& permission) {
     return false;
 }
 
-bool host_online(const HostRecord& h, u64 now) {
+bool host_online(const HostRecord& h, u64 now, u64 timeout_sec) {
     return h.last_seen_epoch > 0 && now >= h.last_seen_epoch &&
-           now - h.last_seen_epoch <= 90 && h.network_status != "offline";
+           now - h.last_seen_epoch <= timeout_sec && h.network_status != "offline";
 }
 
 std::string default_host_id(const HostRecord& h) {
@@ -673,9 +674,9 @@ HostRecord host_from_json(const std::string& json) {
     return h;
 }
 
-std::string host_to_json(const HostRecord& h, bool comma, u64 now) {
+std::string host_to_json(const HostRecord& h, bool comma, u64 now, u64 timeout_sec) {
     std::ostringstream o;
-    bool online = host_online(h, now);
+    bool online = host_online(h, now, timeout_sec);
     o << "    {\n"
       << "      \"id\": \"" << json_escape(h.id) << "\",\n"
       << "      \"name\": \"" << json_escape(h.name) << "\",\n"
@@ -882,6 +883,12 @@ std::string alert_json(const std::string& host_id,
     return o.str();
 }
 
+// ---- 远端客户端上报聚合计数器（进程内原子计数 + 落盘持久化） ----
+std::atomic<u64> g_remote_events_collected{0};
+std::atomic<u64> g_remote_events_uploaded{0};
+std::atomic<u64> g_remote_bytes_uploaded{0};
+std::atomic<u64> g_remote_alerts{0};
+
 Result<void> append_alert(const ManagerConfig& cfg,
                           const std::string& host_id,
                           const std::string& source,
@@ -890,7 +897,45 @@ Result<void> append_alert(const ManagerConfig& cfg,
                           const std::string& message,
                           const std::string& evidence) {
     auto line = alert_json(host_id, source, severity, rule_id, message, evidence);
-    return append_jsonl_retained(alert_dir(cfg), host_id + ".jsonl", line, 20000);
+    auto r = append_jsonl_retained(alert_dir(cfg), host_id + ".jsonl", line, 20000);
+    if (r.is_ok()) g_remote_alerts.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+
+std::string counters_path(const ManagerConfig& cfg) {
+    return fs::join(cfg.data_dir.empty() ? "data" : cfg.data_dir, "manager_counters.json");
+}
+
+void load_remote_counters(const ManagerConfig& cfg) {
+    auto c = read_text_file(counters_path(cfg));
+    if (c.is_err() || c.value().empty()) return;
+    const auto& j = c.value();
+    auto load_u64 = [&](const std::string& key) -> u64 {
+        auto pos = j.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0;
+        auto colon = j.find(':', pos);
+        if (colon == std::string::npos) return 0;
+        std::size_t i = colon + 1;
+        while (i < j.size() && (j[i] == ' ' || j[i] == '\t')) ++i;
+        u64 v = 0;
+        while (i < j.size() && j[i] >= '0' && j[i] <= '9') { v = v * 10 + static_cast<u64>(j[i] - '0'); ++i; }
+        return v;
+    };
+    g_remote_events_collected.store(load_u64("events_collected"), std::memory_order_relaxed);
+    g_remote_events_uploaded.store(load_u64("events_uploaded"), std::memory_order_relaxed);
+    g_remote_bytes_uploaded.store(load_u64("bytes_uploaded"), std::memory_order_relaxed);
+    g_remote_alerts.store(load_u64("alerts"), std::memory_order_relaxed);
+}
+
+void save_remote_counters(const ManagerConfig& cfg) {
+    std::ostringstream o;
+    o << "{\n"
+      << "  \"events_collected\": " << g_remote_events_collected.load(std::memory_order_relaxed) << ",\n"
+      << "  \"events_uploaded\": " << g_remote_events_uploaded.load(std::memory_order_relaxed) << ",\n"
+      << "  \"bytes_uploaded\": " << g_remote_bytes_uploaded.load(std::memory_order_relaxed) << ",\n"
+      << "  \"alerts\": " << g_remote_alerts.load(std::memory_order_relaxed) << "\n"
+      << "}\n";
+    (void)write_text_file(counters_path(cfg), o.str());
 }
 
 std::string threshold_severity(double value, double warning, double critical) {
@@ -1021,7 +1066,9 @@ std::vector<std::string> read_jsonl_dir_filtered(const std::string& dir,
     if (listed.is_err()) return lines;
     for (const auto& item : listed.value()) {
         if (fs::extension(item) != ".jsonl") continue;
-        auto path_to_read = fs::is_absolute(item) ? item : fs::join(dir, item);
+        // list_directory 返回的已是完整路径，直接读取（is_absolute 兼容相对/绝对两种返回）
+        auto path_to_read = fs::is_absolute(item) || item.find('/') != std::string::npos || item.find('\\') != std::string::npos
+                            ? item : fs::join(dir, item);
         auto part = read_jsonl_filtered(path_to_read, "", operation_type, from, to, limit);
         lines.insert(lines.end(), part.begin(), part.end());
         if (limit > 0 && lines.size() > limit) {
@@ -1125,7 +1172,7 @@ Result<void> save_hosts(const ManagerConfig& cfg, const std::vector<HostRecord>&
         << "  \"updated_at\": \"" << iso_time(now) << "\",\n"
         << "  \"hosts\": [\n";
     for (std::size_t i = 0; i < hosts.size(); ++i) {
-        out << host_to_json(hosts[i], i + 1 < hosts.size(), now);
+        out << host_to_json(hosts[i], i + 1 < hosts.size(), now, cfg.status_timeout_seconds);
     }
     out << "  ]\n"
         << "}\n";
@@ -1138,7 +1185,7 @@ std::string hosts_response_json(const std::vector<HostRecord>& hosts, const Mana
     o << "{\n"
       << "  \"storage_path\": \"" << json_escape(hosts_path(cfg)) << "\",\n"
       << "  \"unique_id_strategy\": \"host_id = SHA-256(host_name + ip + hardware + os_version) prefix\",\n"
-      << "  \"status_timeout_seconds\": 90,\n"
+      << "  \"status_timeout_seconds\": " << cfg.status_timeout_seconds << ",\n"
       << "  \"transport_security\": {\n"
       << "    \"authenticated\": " << (!cfg.auth_token.empty() ? "true" : "false") << ",\n"
       << "    \"tls_configured\": " << (cfg.use_tls ? "true" : "false") << ",\n"
@@ -1146,7 +1193,7 @@ std::string hosts_response_json(const std::vector<HostRecord>& hosts, const Mana
       << "  },\n"
       << "  \"hosts\": [\n";
     for (std::size_t i = 0; i < hosts.size(); ++i) {
-        o << host_to_json(hosts[i], i + 1 < hosts.size(), now);
+        o << host_to_json(hosts[i], i + 1 < hosts.size(), now, cfg.status_timeout_seconds);
     }
     o << "  ]\n"
       << "}";
@@ -1292,18 +1339,63 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
         return Result<void>(Error::Code::IoError, std::string("listen: ") + strerror(errno));
     }
     running_.store(true);
+    load_remote_counters(cfg_);
     thr_ = std::thread([this] { accept_loop(); });
-    AF_LOG_INFO("manager: listening on " << cfg_.listen);
+
+    // 启动后台 monitor：周期性扫描主机心跳，主动记录 online↔offline 状态迁移
+    monitor_running_.store(true);
+    monitor_thr_ = std::thread([this] {
+        std::map<std::string, bool> prev_online;   // host_id → 上轮判定
+        while (monitor_running_.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (!monitor_running_.load()) break;
+            auto hosts_r = load_hosts(cfg_);
+            if (hosts_r.is_err()) continue;
+            auto hosts = hosts_r.value();
+            auto now   = epoch_seconds();
+            for (const auto& h : hosts) {
+                bool online = host_online(h, now, cfg_.status_timeout_seconds);
+                auto it = prev_online.find(h.id);
+                if (it != prev_online.end()) {
+                    if (it->second && !online) {
+                        u64 gap = now - h.last_seen_epoch;
+                        AF_LOG_WARN("monitor: host OFFLINE  id=" << h.id
+                                    << " name=" << h.name
+                                    << " last_seen=" << iso_time(h.last_seen_epoch)
+                                    << " gap=" << gap << "s (timeout=" << cfg_.status_timeout_seconds << "s)");
+                    } else if (!it->second && online) {
+                        AF_LOG_INFO("monitor: host ONLINE   id=" << h.id
+                                   << " name=" << h.name);
+                    }
+                }
+                prev_online[h.id] = online;
+            }
+            // 清理已从 hosts.json 移除的旧记录
+            std::set<std::string> live_ids;
+            for (const auto& h : hosts) live_ids.insert(h.id);
+            for (auto it = prev_online.begin(); it != prev_online.end(); ) {
+                if (!live_ids.count(it->first)) it = prev_online.erase(it);
+                else ++it;
+            }
+            // 周期持久化聚合计数器
+            save_remote_counters(cfg_);
+        }
+    });
+
+    AF_LOG_INFO("manager: listening on " << cfg_.listen
+                << "  (status_timeout=" << cfg_.status_timeout_seconds << "s)");
     return Result<void>::ok();
 }
 
 void SimpleHttpManager::stop() {
     if (!running_.exchange(false)) return;
+    monitor_running_.store(false);
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, 2);
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
+    if (monitor_thr_.joinable()) monitor_thr_.join();
     if (thr_.joinable()) thr_.join();
     if (tls_ctx_) {
         SSL_CTX_free(static_cast<SSL_CTX*>(tls_ctx_));
@@ -1538,15 +1630,20 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
     if (path == "/health" || path == "/status") {
         if (!agent_) { status = 503; return "{\n}"; }
         auto s = agent_->stats();
+        // 叠加远端客户端上报的聚合计数
+        u64 remote_collected = g_remote_events_collected.load(std::memory_order_relaxed);
+        u64 remote_uploaded  = g_remote_events_uploaded.load(std::memory_order_relaxed);
+        u64 remote_bytes     = g_remote_bytes_uploaded.load(std::memory_order_relaxed);
+        u64 remote_alerts    = g_remote_alerts.load(std::memory_order_relaxed);
         std::ostringstream o;
         o << "{\n"
           << "  \"running\": " << (agent_->is_running() ? "true" : "false") << ",\n"
-          << "  \"events_collected\": " << s.events_collected << ",\n"
-          << "  \"events_uploaded\": " << s.events_uploaded << ",\n"
+          << "  \"events_collected\": " << (s.events_collected + remote_collected) << ",\n"
+          << "  \"events_uploaded\": " << (s.events_uploaded + remote_uploaded) << ",\n"
           << "  \"events_failed\": " << s.events_failed << ",\n"
           << "  \"events_dropped\": " << s.events_dropped << ",\n"
-          << "  \"alerts\": " << s.alerts << ",\n"
-          << "  \"bytes_uploaded\": " << s.bytes_uploaded << ",\n"
+          << "  \"alerts\": " << (s.alerts + remote_alerts) << ",\n"
+          << "  \"bytes_uploaded\": " << (s.bytes_uploaded + remote_bytes) << ",\n"
           << "  \"uptime_seconds\": " << s.uptime_seconds << "\n"
           << "}";
         return o.str();
@@ -1898,6 +1995,40 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
           << "}";
         return o.str();
     }
+    // POST /ingest — 接收 transport 层上传的审计事件批次（原始字节流）
+    if (path == "/ingest" && method == "POST") {
+        content_type = "application/json; charset=utf-8";
+        auto agent_id = query_param(query, "agent");
+        if (agent_id.empty()) agent_id = "unknown";
+        // 用 body 的 SHA-256 前 16 字符做 batch_id，保证唯一
+        auto batch_id = crypto::sha256_hex(body).substr(0, 16);
+        // 保存原始批次到 data/ingested_batches/<agent_id>/<batch_id>.bin
+        auto dir = fs::join(cfg_.data_dir.empty() ? "data" : cfg_.data_dir, "ingested_batches");
+        fs::create_directories(dir);
+        auto agent_dir = fs::join(dir, agent_id);
+        fs::create_directories(agent_dir);
+        auto file_path = fs::join(agent_dir, batch_id + ".bin");
+        std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            status = 500;
+            return "{\n  \"error\": \"cannot write batch file\"\n}";
+        }
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        out.flush();
+        g_remote_bytes_uploaded.fetch_add(body.size(), std::memory_order_relaxed);
+        AF_LOG_INFO("ingest: received batch id=" << batch_id
+                    << " agent=" << agent_id
+                    << " bytes=" << body.size());
+        std::ostringstream o;
+        o << "{\n"
+          << "  \"accepted\": true,\n"
+          << "  \"batch_id\": \"" << json_escape(batch_id) << "\",\n"
+          << "  \"agent_id\": \"" << json_escape(agent_id) << "\",\n"
+          << "  \"bytes_received\": " << body.size() << ",\n"
+          << "  \"storage\": \"" << json_escape(file_path) << "\"\n"
+          << "}";
+        return o.str();
+    }
     if (path == "/agent/metrics" && method == "POST") {
         content_type = "application/json; charset=utf-8";
         auto host_id = json_string_field(body, "host_id");
@@ -1966,6 +2097,15 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         if (saved.is_err()) {
             status = 500;
             return "{\n  \"error\": \"cannot save audit summaries\"\n}";
+        }
+        // 汇总本批事件数，累计到全局计数器（已采集 = 已上传，摘要到达即视为上传成功）
+        u64 batch_events = 0;
+        for (const auto& summary : json_object_array_field(body, "summaries")) {
+            batch_events += static_cast<u64>(json_size_field(summary, "event_count", 0));
+        }
+        if (batch_events > 0) {
+            g_remote_events_collected.fetch_add(batch_events, std::memory_order_relaxed);
+            g_remote_events_uploaded.fetch_add(batch_events, std::memory_order_relaxed);
         }
         std::ostringstream o;
         o << "{\n"

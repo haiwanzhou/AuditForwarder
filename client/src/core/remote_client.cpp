@@ -533,14 +533,48 @@ void RemoteAgentClient::send_audit_summaries() {
     }
     body << "]}";
 
-    bool sent = false;
-    for (const auto& base : cfg_.server_urls) {
-        auto r = http_request("POST", endpoint(base, "/agent/audit-summaries"), body.str(), "application/json");
-        if (r.ok) {
-            sent = true;
-            break;
+    // 同时把批次内的每条事件展开为操作日志，供服务端「操作日志/安全监控」展示与规则匹配
+    std::ostringstream logs_body;
+    logs_body << "{\"host_id\":\"" << json_escape(cfg_.host_id) << "\",\"logs\":[";
+    std::size_t log_count = 0;
+    for (const auto& batch : pending) {
+        auto batch_sec = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::seconds>(batch.created_at.time_since_epoch()).count());
+        std::string ts = iso_time(batch_sec);
+        for (const auto& ev : batch.events) {
+            if (log_count) logs_body << ",";
+            logs_body << "{"
+                      << "\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
+                      << "\"timestamp\":\"" << ts << "\","
+                      << "\"batch_id\":\"" << json_escape(batch.id) << "\","
+                      << "\"seq\":" << ev.seq << ","
+                      << "\"operation_type\":\"" << to_string(ev.category) << "\","
+                      << "\"event_type\":\"" << to_string(ev.action) << "\","
+                      << "\"outcome\":\"" << to_string(ev.outcome) << "\","
+                      << "\"severity\":\"" << to_string(ev.severity) << "\","
+                      << "\"actor\":\"" << json_escape(ev.actor.name) << "\","
+                      << "\"target\":\"" << json_escape(ev.target.path.empty() ? ev.target.address : ev.target.path) << "\","
+                      << "\"message\":\"" << json_escape(ev.message) << "\""
+                      << "}";
+            ++log_count;
         }
-        AF_LOG_WARN("remote_client: audit summary upload failed: " << r.error);
+    }
+    logs_body << "]}";
+
+    bool sent = false;
+    bool logs_sent = false;
+    for (const auto& base : cfg_.server_urls) {
+        if (!sent) {
+            auto r = http_request("POST", endpoint(base, "/agent/audit-summaries"), body.str(), "application/json");
+            if (r.ok) sent = true;
+            else AF_LOG_WARN("remote_client: audit summary upload failed: " << r.error);
+        }
+        if (!logs_sent && log_count > 0) {
+            auto r2 = http_request("POST", endpoint(base, "/agent/operation-logs"), logs_body.str(), "application/json");
+            if (r2.ok) logs_sent = true;
+            else AF_LOG_WARN("remote_client: operation logs upload failed: " << r2.error);
+        }
+        if (sent && (logs_sent || log_count == 0)) break;
     }
     if (!sent) {
         std::lock_guard<std::mutex> lk(mtx_);

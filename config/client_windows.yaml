@@ -18,10 +18,11 @@ chain:
   hmac_key: "client-test-hmac-key"
 
 transport:
-  servers: []
-  mode: batch
-  interval_sec: 60
-  compress: false
+  servers:
+    - "http://127.0.0.1:8443/ingest?agent=test-agent-001"
+  mode: realtime
+  interval_sec: 5
+  compress: true
   encrypt_payload: false
   auth_token: "test-token-12345"
   verify_tls: false
@@ -33,7 +34,7 @@ remote:
   host_id: "test-agent-001"
   heartbeat_interval_sec: 5
   command_poll_interval_sec: 3
-  audit_summary_interval_sec: 10
+  audit_summary_interval_sec: 5
   production_mode: false
   require_tls: false
   crl_check: false
