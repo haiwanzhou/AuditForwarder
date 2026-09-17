@@ -57,6 +57,17 @@ manager:
 collectors:
   enabled: true
 
+# 高权限操作检测：Windows 识别 UAC 提权令牌与 SYSTEM(S-1-5-18)，Linux 识别 uid=0；
+# 命中的事件打 priority=high 并走传输紧急通道。
+privilege_detect:
+  enabled: true
+
+# 测试注入（仅测试环境，生产必须保持 false）：
+# 周期性合成 etw_win 富字段事件与 SYSTEM/elevated 高权限事件，走完整采集链路。
+test_injection:
+  enabled: false
+  interval_ms: 1000
+
 processors:
   - type: enricher
   - type: pii_masker

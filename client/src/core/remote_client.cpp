@@ -3,6 +3,7 @@
 #include "auditforwarder/agent.h"
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/fs.h"
+#include "auditforwarder/log_meta.h"
 #include "auditforwarder/logger.h"
 #include "auditforwarder/process.h"
 
@@ -378,6 +379,7 @@ Result<void> RemoteAgentClient::start(Agent& agent) {
 void RemoteAgentClient::stop() {
     if (stopping_.exchange(true)) return;
     running_.store(false);
+    cv_.notify_all();
     if (worker_.joinable()) worker_.join();
 #ifdef AF_PLATFORM_WINDOWS
     WSACleanup();
@@ -386,9 +388,20 @@ void RemoteAgentClient::stop() {
 
 void RemoteAgentClient::enqueue_batch_summary(const chain::EventBatch& batch) {
     if (!running_.load()) return;
-    std::lock_guard<std::mutex> lk(mtx_);
-    audit_queue_.push_back(batch);
-    if (audit_queue_.size() > 1000) audit_queue_.erase(audit_queue_.begin());
+    // 拷贝补盖客户端时间戳（用于服务端传输延迟统计），并按内容分流
+    chain::EventBatch b = batch;
+    for (auto& ev : b.events) {
+        if (ev.attrs.find(logmeta::attr::kClientTs) == ev.attrs.end())
+            logmeta::stamp_client_ts(ev);
+    }
+    const bool high = logmeta::batch_is_high_priority(b);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& q = high ? hi_audit_queue_ : audit_queue_;
+        q.push_back(std::move(b));
+        if (q.size() > 1000) q.erase(q.begin());
+    }
+    if (high) cv_.notify_one();  // 唤醒紧急发送
 }
 
 void RemoteAgentClient::worker_loop() {
@@ -406,11 +419,31 @@ void RemoteAgentClient::worker_loop() {
             last_command_poll = now;
         }
         if (now - last_audit >= std::chrono::seconds(cfg_.audit_summary_interval_sec)) {
-            send_audit_summaries();
-            last_audit = now;
+            send_audit_summaries();  // 定时通道：先高后普通
+            last_audit = Clock::now();
         }
         send_pending_results();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // 等待 500ms 周期；若期间有高优先级批次入队，100ms 节流合并后立即走紧急通道
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait_for(lk, std::chrono::milliseconds(500), [this] {
+                return !running_.load() || !hi_audit_queue_.empty();
+            });
+        }
+        if (running_.load()) {
+            bool has_high = false;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                has_high = !hi_audit_queue_.empty();
+            }
+            if (has_high) {
+                // 合并 100ms 内到达的其他高优先级批次，再一次性发出
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_.wait_for(lk, std::chrono::milliseconds(100));
+                lk.unlock();
+                send_audit_summaries(true);
+            }
+        }
     }
 }
 
@@ -473,12 +506,14 @@ std::string RemoteAgentClient::build_heartbeat_json() {
 std::string RemoteAgentClient::build_batch_summary_json(const chain::EventBatch& batch) {
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
         batch.created_at.time_since_epoch()).count();
+    const bool high = logmeta::batch_is_high_priority(batch);
     std::ostringstream o;
     o << "{"
       << "\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
       << "\"timestamp\":\"" << iso_time(epoch_seconds()) << "\","
       << "\"batch_id\":\"" << json_escape(batch.id) << "\","
       << "\"event_count\":" << batch.events.size() << ","
+      << "\"priority\":\"" << (high ? logmeta::priority::kHigh : logmeta::priority::kNormal) << "\","
       << "\"created_at_us\":" << us << ","
       << "\"merkle_root\":\"" << json_escape(batch.merkle_root) << "\","
       << "\"signature_present\":" << (!batch.signature.empty() ? "true" : "false") << ","
@@ -515,16 +550,27 @@ void RemoteAgentClient::send_heartbeat() {
     }
 }
 
-void RemoteAgentClient::send_audit_summaries() {
+void RemoteAgentClient::send_audit_summaries(bool high_only) {
     std::vector<chain::EventBatch> pending;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        pending.swap(audit_queue_);
+        if (high_only) {
+            pending.swap(hi_audit_queue_);
+        } else {
+            // 定时通道：高优先级排在前面
+            pending.reserve(hi_audit_queue_.size() + audit_queue_.size());
+            for (auto& b : hi_audit_queue_) pending.push_back(std::move(b));
+            for (auto& b : audit_queue_)    pending.push_back(std::move(b));
+            hi_audit_queue_.clear();
+            audit_queue_.clear();
+        }
     }
     if (pending.empty()) return;
+    const char* channel_priority = high_only ? "high" : "normal";
     std::ostringstream body;
     body << "{"
          << "\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
+         << "\"priority\":\"" << channel_priority << "\","
          << "\"timestamp\":\"" << iso_time(epoch_seconds()) << "\","
          << "\"summaries\":[";
     for (std::size_t i = 0; i < pending.size(); ++i) {
@@ -534,8 +580,13 @@ void RemoteAgentClient::send_audit_summaries() {
     body << "]}";
 
     // 同时把批次内的每条事件展开为操作日志，供服务端「操作日志/安全监控」展示与规则匹配
+    auto attr_str = [](const AuditEvent& ev, const std::string& key, const std::string& dflt) -> std::string {
+        auto it = ev.attrs.find(key);
+        return it == ev.attrs.end() ? dflt : it->second;
+    };
     std::ostringstream logs_body;
-    logs_body << "{\"host_id\":\"" << json_escape(cfg_.host_id) << "\",\"logs\":[";
+    logs_body << "{\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
+              << "\"priority\":\"" << channel_priority << "\",\"logs\":[";
     std::size_t log_count = 0;
     for (const auto& batch : pending) {
         auto batch_sec = static_cast<u64>(
@@ -554,7 +605,26 @@ void RemoteAgentClient::send_audit_summaries() {
                       << "\"severity\":\"" << to_string(ev.severity) << "\","
                       << "\"actor\":\"" << json_escape(ev.actor.name) << "\","
                       << "\"target\":\"" << json_escape(ev.target.path.empty() ? ev.target.address : ev.target.path) << "\","
-                      << "\"message\":\"" << json_escape(ev.message) << "\""
+                      // —— 日志分类与优先级元数据（采集器类型/来源/优先级/权限标注/客户端时间戳）——
+                      << "\"collector\":\"" << json_escape(attr_str(ev, logmeta::attr::kCollector, logmeta::collector::kUnknown)) << "\","
+                      << "\"source\":\"" << json_escape(attr_str(ev, logmeta::attr::kSource, "")) << "\","
+                      << "\"priority\":\"" << json_escape(attr_str(ev, logmeta::attr::kPriority, logmeta::priority::kNormal)) << "\","
+                      << "\"priv_level\":\"" << json_escape(attr_str(ev, logmeta::attr::kPrivLevel, "")) << "\","
+                      << "\"priv_operation\":\"" << json_escape(attr_str(ev, logmeta::attr::kPrivOperation, "")) << "\","
+                      << "\"priv_ts\":\"" << json_escape(attr_str(ev, logmeta::attr::kPrivTs, "")) << "\","
+                      << "\"client_ts\":" << attr_str(ev, logmeta::attr::kClientTs, "0") << ","
+                      << "\"message\":\"" << json_escape(ev.message) << "\","
+                      // 完整 attrs 原样上送（含 ETW raw_xml/event_id 等富字段），
+                      // 服务端按采集器过滤策略（strict/lenient）决定保留范围
+                      << "\"attrs\":{";
+            bool first_attr = true;
+            for (const auto& kv : ev.attrs) {
+                if (!first_attr) logs_body << ",";
+                first_attr = false;
+                logs_body << "\"" << json_escape(kv.first) << "\":\""
+                          << json_escape(kv.second) << "\"";
+            }
+            logs_body << "}"
                       << "}";
             ++log_count;
         }
@@ -577,8 +647,12 @@ void RemoteAgentClient::send_audit_summaries() {
         if (sent && (logs_sent || log_count == 0)) break;
     }
     if (!sent) {
+        // 失败批次塞回各自优先级队列头部，高优先级不降级
         std::lock_guard<std::mutex> lk(mtx_);
-        audit_queue_.insert(audit_queue_.begin(), pending.begin(), pending.end());
+        for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+            auto& q = logmeta::batch_is_high_priority(*it) ? hi_audit_queue_ : audit_queue_;
+            q.insert(q.begin(), std::move(*it));
+        }
     }
 }
 

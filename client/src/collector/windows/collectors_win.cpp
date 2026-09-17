@@ -4,6 +4,7 @@
 #include "auditforwarder/collector_base.h"
 #include "auditforwarder/event.h"
 #include "auditforwarder/fs.h"
+#include "auditforwarder/log_meta.h"
 #include "auditforwarder/logger.h"
 #include "auditforwarder/process.h"
 
@@ -33,6 +34,39 @@
 #pragma comment(lib, "psapi.lib")
 
 namespace af::collector {
+
+namespace {
+
+// ETW 渲染出的安全事件 XML 形如：
+//   <Data Name="SubjectUserName">Administrator</Data>
+// 做最小依赖的字符串提取；找不到返回空串。
+std::string etw_data_field(const std::string& xml, const std::string& name) {
+    std::string needle = "Name=\"" + name + "\"";
+    auto p = xml.find(needle);
+    if (p == std::string::npos) return {};
+    p = xml.find('>', p);
+    if (p == std::string::npos) return {};
+    ++p;
+    auto e = xml.find("</Data>", p);
+    if (e == std::string::npos) return {};
+    return xml.substr(p, e - p);
+}
+
+// 提取 <EventID>4688</EventID>。
+std::string etw_event_id(const std::string& xml) {
+    const std::string tag = "<EventID>";
+    auto p = xml.find(tag);
+    if (p == std::string::npos) return {};
+    p += tag.size();
+    auto e = xml.find("</EventID>", p);
+    if (e == std::string::npos) return {};
+    return xml.substr(p, e - p);
+}
+
+// ETW 原始 XML 保留上限（比普通日志宽松；服务端 etw_win 策略默认 8192）。
+constexpr std::size_t kEtwRawMaxLen = 4096;
+
+}  // namespace
 
 // =========================================================================
 // WindowsFileCollector - ReadDirectoryChangesW based
@@ -171,6 +205,7 @@ private:
                 ev.target.kind  = "file";
                 ev.message = "file " + op + " " + p;
                 ev.ts_micros = ts;
+                logmeta::tag_collector(ev, logmeta::collector::kFileWin);
                 if (agent_) agent_->submit(ev);
                 return true;
             });
@@ -233,6 +268,12 @@ private:
             ev.actor.path = info.value().exe;
         }
         ev.message = std::string(to_string(act)) + " pid=" + std::to_string(pid);
+        logmeta::tag_collector(ev, logmeta::collector::kProcessWin);
+        // 仅对「新启动」进程做提权令牌检测（退出事件无意义），Agent 内带 TTL 缓存
+        if (agent_ && act == EventAction::Spawn) {
+            auto lvl = agent_->privilege_level_for_pid(pid);
+            if (!lvl.empty() && lvl != logmeta::priv::kNone) logmeta::mark_privileged(ev, lvl);
+        }
         if (agent_) agent_->submit(ev);
     }
     void loop() {
@@ -290,6 +331,7 @@ private:
                     ev.message = "tcp " + fmt_ip(r.dwLocalAddr) + ":" + std::to_string(r.dwLocalPort)
                                  + " -> " + fmt_ip(r.dwRemoteAddr) + ":" + std::to_string(r.dwRemotePort)
                                  + " state=" + std::to_string(r.dwState);
+                    logmeta::tag_collector(ev, logmeta::collector::kNetworkWin);
                     if (agent_) agent_->submit(ev);
                 }
             }
@@ -341,6 +383,11 @@ private:
                             ev.actor.pid = pe.th32ProcessID;
                             ev.actor.name = name;
                             ev.message = "process start: " + name;
+                            logmeta::tag_collector(ev, logmeta::collector::kCommandWin);
+                            if (agent_) {
+                                auto lvl = agent_->privilege_level_for_pid(pe.th32ProcessID);
+                                if (!lvl.empty() && lvl != logmeta::priv::kNone) logmeta::mark_privileged(ev, lvl);
+                            }
                             if (agent_) agent_->submit(ev);
                         }
                     } while (::Process32Next(snap, &pe));
@@ -402,6 +449,7 @@ private:
                     ev.target.path = w.path;
                     ev.target.kind  = "registry";
                     ev.message = "registry change: " + w.path;
+                    logmeta::tag_collector(ev, logmeta::collector::kRegistryWin);
                     if (agent_) agent_->submit(ev);
                     ::RegNotifyChangeKeyValue(w.h, TRUE,
                         REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
@@ -450,21 +498,70 @@ private:
             BOOL ok = ::EvtNext(sub_, 16, events, 1000, FALSE, &n);
             if (!ok || n == 0) continue;
             for (DWORD i = 0; i < n; ++i) {
-                char buf[4096]; DWORD used = 0; DWORD needed = 0;
-                if (::EvtRender(nullptr, events[i], EvtRenderEventXml,
-                                 sizeof(buf), buf, &used, &needed)) {
-                    std::string xml(buf, used);
+                // EvtRenderEventXml 输出 UTF-16LE，先取所需长度再转 UTF-8。
+                DWORD used = 0, needed = 0;
+                ::EvtRender(nullptr, events[i], EvtRenderEventXml, 0, nullptr, &used, &needed);
+                std::string xml;
+                if (used >= sizeof(wchar_t)) {
+                    std::vector<wchar_t> wbuf(used / sizeof(wchar_t) + 1);
+                    used = static_cast<DWORD>(wbuf.size() * sizeof(wchar_t));
+                    if (::EvtRender(nullptr, events[i], EvtRenderEventXml, used,
+                                    wbuf.data(), &used, &needed)) {
+                        int cap = static_cast<int>(used + 8);
+                        std::vector<char> utf8(cap);
+                        int len = ::WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1,
+                                                        utf8.data(), cap, nullptr, nullptr);
+                        if (len > 0) xml.assign(utf8.data(), static_cast<std::size_t>(len) - 1);
+                    }
+                }
+                if (!xml.empty()) {
                     AuditEvent ev;
                     ev.category = EventCategory::Auth;
                     ev.action   = EventAction::Login;
-                    if (xml.find("EventID>4688<") != std::string::npos) {
+                    const std::string eid = etw_event_id(xml);
+                    if (eid == "4688") {
                         ev.category = EventCategory::Process; ev.action = EventAction::Spawn;
-                    } else if (xml.find("EventID>4689<") != std::string::npos) {
+                    } else if (eid == "4689") {
                         ev.category = EventCategory::Process; ev.action = EventAction::Exit;
-                    } else if (xml.find("EventID>4625<") != std::string::npos) {
+                    } else if (eid == "4625") {
                         ev.category = EventCategory::Auth;    ev.action = EventAction::AuthFail;
                     }
-                    ev.message = xml.substr(0, 256);
+
+                    // 来源标识：etw_win 采集器 + etw_security 唯一来源
+                    logmeta::tag_collector(ev, logmeta::collector::kEtwWin);
+                    ev.attrs[logmeta::attr::kSource   ] = logmeta::source::kEtwSecurity;
+                    ev.attrs[logmeta::attr::kEventId  ] = eid;
+
+                    // 结构化详情（宽松保留：不做 256 字符截断）
+                    auto subject_user   = etw_data_field(xml, "SubjectUserName");
+                    auto subject_domain = etw_data_field(xml, "SubjectDomainName");
+                    auto logon_id       = etw_data_field(xml, "SubjectLogonId");
+                    auto new_process    = etw_data_field(xml, "NewProcessName");
+                    if (!subject_user.empty())   { ev.attrs[logmeta::attr::kSubjectUser]   = subject_user;   ev.actor.user = subject_user; }
+                    if (!subject_domain.empty())   ev.attrs[logmeta::attr::kSubjectDomain] = subject_domain;
+                    if (!logon_id.empty())         ev.attrs[logmeta::attr::kLogonId]       = logon_id;
+                    if (!new_process.empty()) {
+                        ev.attrs[logmeta::attr::kProcessName] = new_process;
+                        ev.actor.path = new_process;
+                        auto slash = new_process.find_last_of("\\/");
+                        ev.actor.name = slash == std::string::npos ? new_process : new_process.substr(slash + 1);
+                    }
+                    // 高权限标注：SubjectUserSid=S-1-5-18 为 SYSTEM；
+                    // 4688 的 TokenElevationType=%%1842（Full）为 UAC 完全提权。
+                    if (agent_ && agent_->privilege_detect_enabled()) {
+                        const auto sid = etw_data_field(xml, "SubjectUserSid");
+                        const auto elev_type = etw_data_field(xml, "TokenElevationType");
+                        if (sid == "S-1-5-18") {
+                            logmeta::mark_privileged(ev, logmeta::priv::kSystem);
+                        } else if ((eid == "4688" || eid == "4624") && elev_type == "%%1842") {
+                            logmeta::mark_privileged(ev, logmeta::priv::kElevated);
+                        }
+                    }
+                    ev.attrs[logmeta::attr::kRawXml] = xml.substr(0, kEtwRawMaxLen);
+
+                    ev.message = "etw event_id=" + eid
+                               + (subject_user.empty() ? "" : " user=" + subject_domain + "\\" + subject_user)
+                               + (new_process.empty()  ? "" : " proc=" + ev.actor.name);
                     if (agent_) agent_->submit(ev);
                 }
                 ::EvtClose(events[i]);

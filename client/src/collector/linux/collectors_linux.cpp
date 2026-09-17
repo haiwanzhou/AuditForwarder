@@ -4,6 +4,7 @@
 #include "auditforwarder/collector_base.h"
 #include "auditforwarder/event.h"
 #include "auditforwarder/fs.h"
+#include "auditforwarder/log_meta.h"
 #include "auditforwarder/logger.h"
 #include "auditforwarder/process.h"
 
@@ -143,6 +144,7 @@ private:
                 ev.target.kind  = "file";
                 ev.message = "file " + op + " " + p;
                 ev.ts_micros = ts;
+                logmeta::tag_collector(ev, logmeta::collector::kFileLinux);
                 if (agent_) agent_->submit(ev);
                 return true;
             });
@@ -212,6 +214,11 @@ private:
         }
         ev.message = to_string(act);
         ev.message += " pid=" + std::to_string(pid);
+        logmeta::tag_collector(ev, logmeta::collector::kProcessLinux);
+        if (agent_ && act == EventAction::Spawn) {
+            auto lvl = agent_->privilege_level_for_pid(pid);
+            if (!lvl.empty() && lvl != logmeta::priv::kNone) logmeta::mark_privileged(ev, lvl);
+        }
         if (agent_) agent_->submit(ev);
     }
 
@@ -301,6 +308,7 @@ private:
         ev.message = "tcp " + c.local + ":" + std::to_string(c.lport)
                    + " -> " + c.remote + ":" + std::to_string(c.rport)
                    + " state=" + std::to_string(c.state);
+        logmeta::tag_collector(ev, logmeta::collector::kNetworkLinux);
         if (agent_) agent_->submit(ev);
     }
     void loop() {
@@ -379,6 +387,7 @@ private:
                 ev.actor.name = comm;
                 ev.command    = cmdline;
                 ev.message    = "shell exec: " + cmdline;
+                logmeta::tag_collector(ev, logmeta::collector::kCommandLinux);
                 if (agent_) agent_->submit(ev);
             }
             closedir(d);
@@ -438,6 +447,7 @@ private:
             ev.category = EventCategory::Auth;
             ev.action   = EventAction::Login;
         }
+        logmeta::tag_collector(ev, logmeta::collector::kAuditLinux);
         if (agent_) agent_->submit(ev);
     }
     void loop() {

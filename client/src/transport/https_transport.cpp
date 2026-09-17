@@ -3,6 +3,7 @@
 #include "auditforwarder/agent.h"
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/fs.h"
+#include "auditforwarder/log_meta.h"
 #include "auditforwarder/logger.h"
 
 #include <openssl/bio.h>
@@ -128,13 +129,26 @@ Result<void> HttpsTransport::start(Agent& agent) {
 void HttpsTransport::stop() {
     if (stopping_.exchange(true)) return;
     running_.store(false);
+    cv_.notify_all();
     if (worker_.joinable()) worker_.join();
     persist_index();
 }
 
-Result<void> HttpsTransport::send_batch(const chain::EventBatch& b) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    queue_.push_back(b);
+Result<void> HttpsTransport::send_batch(const chain::EventBatch& bin) {
+    // 拷贝一份以便补盖客户端时间戳；批次内含任一高优先级事件即整批走高优先通道
+    chain::EventBatch b = bin;
+    for (auto& ev : b.events) {
+        if (ev.attrs.find(logmeta::attr::kClientTs) == ev.attrs.end())
+            logmeta::stamp_client_ts(ev);
+    }
+    const bool high = logmeta::batch_is_high_priority(b);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& q = high ? hi_queue_ : queue_;
+        // 与旧实现一致保持无界，极端内存压力下由上层丢弃策略兜底
+        q.push_back(std::move(b));
+    }
+    if (high) cv_.notify_one();  // 立即唤醒发送，不再等轮询周期
     return Result<void>::ok();
 }
 
@@ -185,18 +199,27 @@ void HttpsTransport::worker_loop() {
     int backoff = 1;
     while (running_.load()) {
         chain::EventBatch batch;
+        bool high = false;
         {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (queue_.empty()) {
+            std::unique_lock<std::mutex> lk(mtx_);
+            if (hi_queue_.empty() && queue_.empty()) {
+                // 高优先级入队会 notify 即时唤醒；普通队列按原周期轮询
                 if (cfg_.mode == "batch") {
-                    std::this_thread::sleep_for(std::chrono::seconds(cfg_.interval_sec));
+                    cv_.wait_for(lk, std::chrono::seconds(cfg_.interval_sec));
                 } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    cv_.wait_for(lk, std::chrono::milliseconds(200));
                 }
                 continue;
             }
-            batch = std::move(queue_.front());
-            queue_.erase(queue_.begin());
+            // 高优先级队列永远先出队，保证提权操作日志不被普通日志阻塞
+            if (!hi_queue_.empty()) {
+                batch = std::move(hi_queue_.front());
+                hi_queue_.erase(hi_queue_.begin());
+                high = true;
+            } else {
+                batch = std::move(queue_.front());
+                queue_.erase(queue_.begin());
+            }
         }
         if (cfg_.server_urls.empty()) {
             AF_LOG_WARN("transport: no server configured, dropping batch " << batch.id);
@@ -205,9 +228,10 @@ void HttpsTransport::worker_loop() {
         bool uploaded = false;
         for (const auto& url : cfg_.server_urls) {
             ByteBuffer body = encode_batch(batch);
-            auto r = do_upload(url, body, batch.id);
+            auto r = do_upload(url, body, batch.id, high);
             if (r.success) {
                 AF_LOG_INFO("transport: uploaded batch " << batch.id
+                              << " priority=" << (high ? "high" : "normal")
                               << " bytes=" << r.bytes_sent << " status=" << r.http_status);
                 if (agent_) {
                     agent_->record_uploaded(batch.events.size(), r.bytes_sent);
@@ -225,18 +249,23 @@ void HttpsTransport::worker_loop() {
             }
         }
         if (!uploaded) {
-            // 放回队列头部并进行限流
+            // 放回同优先级队列头部并进行限流；高优先级失败不降级到普通队列
             {
                 std::lock_guard<std::mutex> lk(mtx_);
-                resume_index_[batch.id] = "failed";
-                queue_.insert(queue_.begin(), std::move(batch));
+                resume_index_[batch.id] = high ? "failed:high" : "failed";
+                auto& q = high ? hi_queue_ : queue_;
+                q.insert(q.begin(), std::move(batch));
             }
             int sleep_s = std::min(backoff, cfg_.max_backoff_sec);
             std::this_thread::sleep_for(std::chrono::seconds(sleep_s));
             backoff = std::min(backoff * 2, cfg_.max_backoff_sec);
         }
-        if (cfg_.mode == "batch") {
-            std::this_thread::sleep_for(std::chrono::seconds(cfg_.interval_sec));
+        // batch 模式下普通发送仍受 interval 约束；高优先级不等间隔
+        if (!high && cfg_.mode == "batch") {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait_for(lk, std::chrono::seconds(cfg_.interval_sec), [this] {
+                return !running_.load() || !hi_queue_.empty();
+            });
         }
     }
 }
@@ -245,7 +274,8 @@ void HttpsTransport::worker_loop() {
 // do_upload: perform a single HTTP/HTTPS POST.
 // 支持 http:// (明文) 和 https:// (TLS) 两种协议，便于本地开发不强制 TLS。
 // ------------------------------------------------------------------
-UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer& body, const std::string& batch_id) {
+UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer& body, const std::string& batch_id,
+                                       bool high_priority) {
     UploadResult r;
     // 解析协议
     bool use_tls = false;
@@ -332,6 +362,7 @@ UploadResult HttpsTransport::do_upload(const std::string& url, const ByteBuffer&
         << "Content-Length: " << body.size() << "\r\n"
         << "X-AuditForwarder-Batch: " << batch_id << "\r\n"
         << "X-AuditForwarder-Agent: " << cfg_.agent_id << "\r\n"
+        << "X-AF-Priority: " << (high_priority ? "high" : "normal") << "\r\n"
         << "Connection: close\r\n";
     if (!cfg_.auth_token.empty()) req << "Authorization: Bearer " << cfg_.auth_token << "\r\n";
     req << "\r\n";

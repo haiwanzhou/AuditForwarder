@@ -3,6 +3,8 @@
 #include "auditforwarder/config.h"
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/fs.h"
+#include "auditforwarder/log_meta.h"
+#include "log_policy_util.h"
 #include "auditforwarder/logger.h"
 #include "auditforwarder/process.h"
 
@@ -1078,6 +1080,203 @@ std::vector<std::string> read_jsonl_dir_filtered(const std::string& dir,
     return lines;
 }
 
+// ================= 两级存储：operation_logs/<host_id>/<collector>.jsonl =================
+
+std::string host_operation_log_dir(const ManagerConfig& cfg, const std::string& host_id) {
+    return fs::join(operation_log_dir(cfg), host_id);
+}
+
+// 在 JSON 对象的起始 '{' 之后注入一个字段（numeric=true 时值不加引号）。
+std::string json_inject_field(const std::string& obj,
+                              const std::string& key,
+                              const std::string& value,
+                              bool numeric = false) {
+    auto p = obj.find('{');
+    if (p == std::string::npos) return obj;
+    std::string frag = "\"" + json_escape(key) + "\":";
+    frag += numeric ? value : ("\"" + json_escape(value) + "\"");
+    frag += ",";
+    return obj.substr(0, p + 1) + frag + obj.substr(p + 1);
+}
+
+// 读取未加引号的数值字段原始 token（如 "client_ts":1735689600000），失败返回空串。
+std::string json_numeric_token(const std::string& json, const std::string& key) {
+    const std::string marker = "\"" + key + "\"";
+    auto p = json.find(marker);
+    if (p == std::string::npos) return {};
+    p = json.find(':', p + marker.size());
+    if (p == std::string::npos) return {};
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
+    std::size_t end = p;
+    while (end < json.size() && std::isdigit(static_cast<unsigned char>(json[end]))) ++end;
+    return json.substr(p, end - p);
+}
+
+// 旧扁平结构 data/operation_logs/<host>.jsonl → <host>/legacy.jsonl（启动时一次性、幂等）。
+void migrate_flat_operation_logs(const ManagerConfig& cfg) {
+    const std::string root = operation_log_dir(cfg);
+    if (!fs::exists(root)) return;
+    auto listed = fs::list_directory(root);
+    if (listed.is_err()) return;
+    for (const auto& entry : listed.value()) {
+        if (!fs::is_regular(entry)) continue;
+        if (fs::extension(entry) != ".jsonl") continue;
+        std::string host = fs::basename(entry);
+        host.resize(host.size() - 6);  // 去掉 ".jsonl"
+        if (!is_valid_host_id(host)) continue;  // 只迁移合法主机名扁平文件
+        const std::string dest_dir = fs::join(root, host);
+        const std::string dest = fs::join(dest_dir, "legacy.jsonl");
+        auto cr = fs::create_directories(dest_dir);
+        if (cr.is_err()) {
+            AF_LOG_ERROR("operation_logs migrate: cannot create " << dest_dir);
+            continue;
+        }
+        if (!fs::exists(dest)) {
+            bool copied = false;
+            std::size_t n = 0;
+            {
+                std::ifstream in(entry, std::ios::binary);
+                std::ofstream out(dest, std::ios::binary | std::ios::trunc);
+                if (!in || !out) {
+                    AF_LOG_ERROR("operation_logs migrate: cannot open " << entry << " / " << dest);
+                    continue;
+                }
+                std::string line;
+                while (std::getline(in, line)) {
+                    if (!line.empty()) { out << line << "\n"; ++n; }
+                }
+                out.flush();
+                copied = true;
+            }  // 此处析构关闭文件句柄（不能显式 .close()，Windows 头文件把 close 定义为 closesocket）
+            if (copied) {
+                AF_LOG_INFO("operation_logs migrate: " << host << ".jsonl -> " << host
+                            << "/legacy.jsonl (" << n << " lines)");
+            }
+        } else {
+            AF_LOG_INFO("operation_logs migrate: legacy.jsonl exists for host " << host
+                        << ", drop flat source only");
+        }
+        auto rm = fs::remove(entry);
+        if (rm.is_err()) AF_LOG_WARN("operation_logs migrate: cannot remove " << entry);
+    }
+}
+
+// 分层操作日志读取：host_id 目录 → 按 collector 文件 → priority/operation/时间窗过滤。
+std::vector<std::string> read_operation_logs_filtered(const ManagerConfig& cfg,
+                                                      const std::string& host_id,
+                                                      const std::string& collector,
+                                                      const std::string& priority,
+                                                      const std::string& operation_type,
+                                                      const std::string& from,
+                                                      const std::string& to,
+                                                      std::size_t limit) {
+    std::vector<std::string> result;
+    const std::string root = operation_log_dir(cfg);
+
+    // 收集要扫描的主机目录
+    std::vector<std::string> host_dirs;
+    if (!host_id.empty()) {
+        host_dirs.push_back(fs::join(root, host_id));
+    } else if (fs::exists(root)) {
+        auto hosts = fs::list_directory(root);
+        if (hosts.is_ok()) {
+            for (const auto& h : hosts.value()) {
+                if (fs::is_directory(h)) host_dirs.push_back(h);
+            }
+        }
+    }
+
+    const std::string want_collector = logmeta::sanitize_collector_id(collector);
+
+    for (const auto& hdir : host_dirs) {
+        if (!fs::exists(hdir)) continue;
+        const std::string dir_host = fs::basename(hdir);
+        auto files = fs::list_directory(hdir);
+        if (files.is_err()) continue;
+        for (const auto& f : files.value()) {
+            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
+            std::string base = fs::basename(f);
+            base.resize(base.size() - 6);  // 去掉 ".jsonl"
+            // 高优先级过滤只查 privileged.jsonl 镜像；否则排除镜像避免重复
+            if (priority == logmeta::priority::kHigh) {
+                if (base != "privileged") continue;
+            } else {
+                if (base == "privileged") continue;
+                if (!collector.empty() && base != want_collector) continue;
+            }
+            auto content = read_text_file(f);
+            if (content.is_err()) continue;
+            std::istringstream in(content.value());
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty()) continue;
+                if (host_id.empty()) {
+                    if (json_string_field(line, "host_id") != dir_host) continue;
+                } else if (json_string_field(line, "host_id") != host_id) {
+                    continue;
+                }
+                if (!collector.empty() && priority != logmeta::priority::kHigh &&
+                    json_string_field(line, "collector") != collector
+                    && !(base == "legacy")) {
+                    continue;
+                }
+                if (!priority.empty() && priority != logmeta::priority::kHigh &&
+                    json_string_field(line, "priority") != priority) {
+                    continue;
+                }
+                if (!operation_type.empty()) {
+                    auto op = json_string_field(line, "operation_type");
+                    auto ev = json_string_field(line, "event_type");
+                    if (op != operation_type && ev != operation_type) continue;
+                }
+                auto ts = json_string_field(line, "timestamp");
+                if (!from.empty() && !ts.empty() && ts < from) continue;
+                if (!to.empty() && !ts.empty() && ts > to) continue;
+                result.push_back(line);
+            }
+        }
+    }
+
+    // 跨采集器文件合并后按 (timestamp, client_ts) 排序，再截断 limit
+    std::sort(result.begin(), result.end(), [](const std::string& a, const std::string& b) {
+        auto ta = json_string_field(a, "timestamp");
+        auto tb = json_string_field(b, "timestamp");
+        if (ta != tb) return ta < tb;
+        auto ca = std::strtoull(json_numeric_token(a, "client_ts").c_str(), nullptr, 10);
+        auto cb = std::strtoull(json_numeric_token(b, "client_ts").c_str(), nullptr, 10);
+        return ca < cb;
+    });
+    if (limit > 0 && result.size() > limit) {
+        result.erase(result.begin(),
+                     result.begin() + static_cast<std::ptrdiff_t>(result.size() - limit));
+    }
+    return result;
+}
+
+// ================= 日志过滤策略档（strict / lenient，按采集器配置）=================
+
+using LogFilterProfile = logpolicy::Profile;
+
+std::string log_filter_profiles_path(const ManagerConfig& cfg) {
+    return fs::join(policy_dir(cfg), "log_filter_profiles.json");
+}
+
+std::string default_log_filter_profiles_json() {
+    return logpolicy::default_profiles_json();
+}
+
+LogFilterProfile resolve_log_filter_profile(const ManagerConfig& cfg, const std::string& collector) {
+    auto raw = load_or_create_text(log_filter_profiles_path(cfg),
+                                   logpolicy::default_profiles_json());
+    if (raw.is_err()) return logpolicy::resolve_profile_json(std::string{}, collector);
+    return logpolicy::resolve_profile_json(raw.value(), collector);
+}
+
+std::string apply_log_filter_profile(const std::string& item, const LogFilterProfile& prof) {
+    return logpolicy::apply_profile(item, prof);
+}
+
 std::string count_map_json(const std::map<std::string, std::size_t>& counts) {
     std::ostringstream o;
     o << "{";
@@ -1095,7 +1294,7 @@ std::string logs_analytics_json(const ManagerConfig& cfg,
                                 const std::string& from,
                                 const std::string& to,
                                 std::size_t limit) {
-    auto logs = read_jsonl_dir_filtered(operation_log_dir(cfg), host_id, "", from, to, limit);
+    auto logs = read_operation_logs_filtered(cfg, host_id, "", "", "", from, to, limit);
     auto alerts = read_jsonl_dir_filtered(alert_dir(cfg), host_id, "", from, to, limit);
     std::map<std::string, std::size_t> operation_types;
     std::map<std::string, std::size_t> alert_severities;
@@ -1123,6 +1322,103 @@ std::string logs_analytics_json(const ManagerConfig& cfg,
       << "  \"operation_types\": " << count_map_json(operation_types) << ",\n"
       << "  \"alert_severities\": " << count_map_json(alert_severities) << ",\n"
       << "  \"host_counts\": " << count_map_json(host_counts) << "\n"
+      << "}";
+    return o.str();
+}
+
+// 按主机/采集器统计日志行数（直接以 <host>/<collector>.jsonl 为粒度）。
+std::string collector_counts_json(const ManagerConfig& cfg, const std::string& host_filter) {
+    std::map<std::string, std::map<std::string, std::size_t>> per_host;
+    std::map<std::string, std::size_t> totals;
+    std::size_t grand = 0;
+    const std::string root = operation_log_dir(cfg);
+    std::vector<std::string> host_dirs;
+    if (!host_filter.empty()) {
+        host_dirs.push_back(fs::join(root, host_filter));
+    } else if (fs::exists(root)) {
+        auto hosts = fs::list_directory(root);
+        if (hosts.is_ok())
+            for (const auto& h : hosts.value())
+                if (fs::is_directory(h)) host_dirs.push_back(h);
+    }
+    for (const auto& hdir : host_dirs) {
+        if (!fs::exists(hdir)) continue;
+        const std::string host = fs::basename(hdir);
+        auto files = fs::list_directory(hdir);
+        if (files.is_err()) continue;
+        for (const auto& f : files.value()) {
+            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
+            std::string collector = fs::basename(f);
+            collector.resize(collector.size() - 6);  // 去掉 ".jsonl"
+            if (collector == "privileged") continue;  // 镜像不重复计数
+            auto content = read_text_file(f);
+            if (content.is_err()) continue;
+            std::size_t n = 0;
+            std::istringstream in(content.value());
+            std::string line;
+            while (std::getline(in, line)) if (!line.empty()) ++n;
+            per_host[host][collector] += n;
+            totals[collector] += n;
+            grand += n;
+        }
+    }
+    std::ostringstream o;
+    o << "{\n  \"host_id\": \"" << json_escape(host_filter) << "\",\n"
+      << "  \"total\": " << grand << ",\n"
+      << "  \"collector_totals\": " << count_map_json(totals) << ",\n"
+      << "  \"hosts\": {";
+    std::size_t hi = 0;
+    for (const auto& host_kv : per_host) {
+        if (hi++) o << ", ";
+        o << "\"" << json_escape(host_kv.first) << "\": " << count_map_json(host_kv.second);
+    }
+    o << "}\n}";
+    return o.str();
+}
+
+// 用 client_ts/server_ts 计算 high / normal 两级传输延迟（毫秒）的均值与 P95。
+std::string transfer_latency_json(const ManagerConfig& cfg,
+                                  const std::string& host_id,
+                                  std::size_t scan_limit) {
+    auto lines = read_operation_logs_filtered(cfg, host_id, "", "", "", "", "", scan_limit);
+    std::vector<double> hi_ms, nm_ms;
+    for (const auto& line : lines) {
+        auto ct = json_numeric_token(line, logmeta::attr::kClientTs);
+        auto st = json_numeric_token(line, logmeta::attr::kServerTs);
+        if (ct.empty() || st.empty() || ct == "0") continue;
+        long long c = std::strtoll(ct.c_str(), nullptr, 10);
+        long long s = std::strtoll(st.c_str(), nullptr, 10);
+        if (s < c) continue;  // 时钟异常数据剔除
+        double ms = static_cast<double>(s - c);
+        if (json_string_field(line, "priority") == logmeta::priority::kHigh) hi_ms.push_back(ms);
+        else nm_ms.push_back(ms);
+    }
+    auto stats = [](std::vector<double>& v) {
+        double avg = 0, p95 = 0;
+        if (!v.empty()) {
+            std::sort(v.begin(), v.end());
+            double sum = 0;
+            for (double x : v) sum += x;
+            avg = sum / static_cast<double>(v.size());
+            std::size_t idx = static_cast<std::size_t>(0.95 * static_cast<double>(v.size() - 1));
+            p95 = v[idx];
+        }
+        return std::make_pair(avg, p95);
+    };
+    auto hs = stats(hi_ms);
+    auto ns = stats(nm_ms);
+    double ratio = (ns.first > 0.0) ? (hs.first / ns.first) : 0.0;
+    std::ostringstream o;
+    o << std::fixed;
+    o.precision(2);
+    o << "{\n  \"host_id\": \"" << json_escape(host_id) << "\",\n"
+      << "  \"high\":   { \"count\": " << hi_ms.size() << ", \"avg_ms\": " << hs.first
+      << ", \"p95_ms\": " << hs.second << " },\n"
+      << "  \"normal\": { \"count\": " << nm_ms.size() << ", \"avg_ms\": " << ns.first
+      << ", \"p95_ms\": " << ns.second << " },\n"
+      << "  \"avg_latency_ratio\": " << ratio << ",\n"
+      << "  \"target_ratio_le\": 0.5,\n"
+      << "  \"target_met\": " << (ratio > 0.0 && ratio <= 0.5 ? "true" : "false") << "\n"
       << "}";
     return o.str();
 }
@@ -1339,6 +1635,10 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
         return Result<void>(Error::Code::IoError, std::string("listen: ") + strerror(errno));
     }
     running_.store(true);
+    // 旧扁平 operation_logs/<host>.jsonl → <host>/legacy.jsonl（幂等）
+    migrate_flat_operation_logs(cfg_);
+    // 确保过滤策略文件存在（首次启动写入默认 strict/lenient 档）
+    (void)load_or_create_text(log_filter_profiles_path(cfg_), default_log_filter_profiles_json());
     load_remote_counters(cfg_);
     thr_ = std::thread([this] { accept_loop(); });
 
@@ -1712,6 +2012,29 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         }
         return "{\n  \"saved\": true,\n  \"policy\": \"violation_rules\"\n}";
     }
+    if (path == "/log-filter/profiles" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        auto profiles = load_or_create_text(log_filter_profiles_path(cfg_),
+                                            default_log_filter_profiles_json());
+        if (profiles.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"cannot load log filter profiles\"\n}";
+        }
+        return profiles.value();
+    }
+    if (path == "/log-filter/profiles" && method == "PUT") {
+        content_type = "application/json; charset=utf-8";
+        if (body.find("\"profiles\"") == std::string::npos) {
+            status = 422;
+            return validation_error_json({{"profiles", "format", "过滤策略必须包含 profiles 数组"}});
+        }
+        auto saved = write_text_file(log_filter_profiles_path(cfg_), body);
+        if (saved.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"cannot save log filter profiles\"\n}";
+        }
+        return "{\n  \"saved\": true,\n  \"policy\": \"log_filter_profiles\"\n}";
+    }
     if (path == "/rbac/policy" && method == "GET") {
         content_type = "application/json; charset=utf-8";
         auto policy = load_or_create_text(rbac_policy_path(cfg_), default_rbac_policy_json());
@@ -2059,18 +2382,40 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         std::size_t accepted = 0;
         std::string first_host;
         std::lock_guard<std::mutex> lk(host_store_mutex());
-        for (const auto& item : objects) {
-            auto host_id = json_string_field(item, "host_id");
+        for (const auto& raw_item : objects) {
+            auto host_id = json_string_field(raw_item, "host_id");
             if (host_id.empty()) host_id = json_string_field(body, "host_id");
             if (host_id.empty() || !is_valid_host_id(host_id)) {
                 status = 422;
                 return validation_error_json({{"host_id", "format", "操作日志必须包含合法主机 ID"}});
             }
             if (first_host.empty()) first_host = host_id;
-            auto saved = append_jsonl_retained(operation_log_dir(cfg_), host_id + ".jsonl", item, 50000);
+            // 补全 host_id（旧客户端只在外层信封携带）+ 服务端接收时间戳
+            std::string item = raw_item;
+            if (json_string_field(item, "host_id").empty())
+                item = json_inject_field(item, "host_id", host_id);
+            item = json_inject_field(item, logmeta::attr::kServerTs,
+                                     logmeta::now_millis(), true);
+            // 按采集器类型应用过滤策略（strict/lenient），见 log_filter_profiles
+            const std::string collector =
+                logmeta::sanitize_collector_id(json_string_field(item, "collector"));
+            const LogFilterProfile prof = resolve_log_filter_profile(cfg_, collector);
+            item = apply_log_filter_profile(item, prof);
+            const std::string prio = json_string_field(item, "priority");
+            const std::string dir = host_operation_log_dir(cfg_, host_id);
+            // 主存储：<host>/<collector>.jsonl
+            auto saved = append_jsonl_retained(dir, collector + ".jsonl", item, prof.retention_lines);
             if (saved.is_err()) {
                 status = 500;
                 return "{\n  \"error\": \"cannot save operation logs\"\n}";
+            }
+            // 高权限镜像：<host>/privileged.jsonl，便于优先查询与延迟统计
+            if (prio == logmeta::priority::kHigh) {
+                auto mirror = append_jsonl_retained(dir, "privileged.jsonl", item, 20000);
+                if (mirror.is_err()) {
+                    status = 500;
+                    return "{\n  \"error\": \"cannot save privileged logs\"\n}";
+                }
             }
             evaluate_operation_log_rules(cfg_, host_id, item);
             ++accepted;
@@ -2081,7 +2426,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
           << "  \"accepted_count\": " << accepted << ",\n"
           << "  \"host_id\": \"" << json_escape(first_host) << "\",\n"
           << "  \"storage_dir\": \"" << json_escape(operation_log_dir(cfg_)) << "\",\n"
-          << "  \"indexed_fields\": [\"host_id\", \"operation_type\", \"event_type\", \"timestamp\"]\n"
+          << "  \"layout\": \"operation_logs/<host_id>/<collector>.jsonl (+privileged.jsonl)\",\n"
+          << "  \"indexed_fields\": [\"host_id\", \"collector\", \"priority\", \"operation_type\", \"event_type\", \"timestamp\"]\n"
           << "}";
         return o.str();
     }
@@ -2159,8 +2505,15 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             status = 422;
             return validation_error_json({{"host_id", "format", "主机 ID 格式不正确"}});
         }
-        std::string dir = path == "/alerts" ? alert_dir(cfg_) : operation_log_dir(cfg_);
-        auto lines = read_jsonl_dir_filtered(dir, host_id, operation_type, from, to, limit);
+        std::vector<std::string> lines;
+        if (path == "/alerts") {
+            lines = read_jsonl_dir_filtered(alert_dir(cfg_), host_id, operation_type, from, to, limit);
+        } else {
+            auto collector = query_param(query, "collector");
+            auto priority  = query_param(query, "priority");
+            lines = read_operation_logs_filtered(cfg_, host_id, collector, priority,
+                                                 operation_type, from, to, limit);
+        }
         std::ostringstream o;
         o << "{\n"
           << "  \"kind\": \"" << (path == "/alerts" ? "alerts" : "operation_logs") << "\",\n"
@@ -2184,6 +2537,25 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         }
         return logs_analytics_json(cfg_, host_id, from, to, limit);
     }
+    if (path == "/logs/collector-counts" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        auto host_id = query_param(query, "host_id");
+        if (!host_id.empty() && !is_valid_host_id(host_id)) {
+            status = 422;
+            return validation_error_json({{"host_id", "format", "主机 ID 格式不正确"}});
+        }
+        return collector_counts_json(cfg_, host_id);
+    }
+    if (path == "/stats/transfer-latency" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        auto host_id = query_param(query, "host_id");
+        auto limit = json_size_field("{\"limit\":" + query_param(query, "limit") + "}", "limit", 5000);
+        if (!host_id.empty() && !is_valid_host_id(host_id)) {
+            status = 422;
+            return validation_error_json({{"host_id", "format", "主机 ID 格式不正确"}});
+        }
+        return transfer_latency_json(cfg_, host_id, limit);
+    }
     if (path == "/hosts/history" && method == "GET") {
         content_type = "application/json; charset=utf-8";
         auto host_id = query_param(query, "host_id");
@@ -2193,21 +2565,30 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             return validation_error_json({{"host_id", "format", "主机 ID 格式不正确"}});
         }
         std::string dir;
+        bool hierarchical_logs = false;
         if (kind == "metrics" || kind.empty()) dir = host_metrics_dir(cfg_);
         else if (kind == "audit") dir = audit_summary_dir(cfg_);
         else if (kind == "commands") dir = command_result_dir(cfg_);
-        else if (kind == "logs") dir = operation_log_dir(cfg_);
+        else if (kind == "logs") { dir = operation_log_dir(cfg_); hierarchical_logs = true; }
         else if (kind == "alerts") dir = alert_dir(cfg_);
         else {
             status = 422;
             return validation_error_json({{"kind", "format", "历史类型只能是 metrics、audit、commands、logs 或 alerts"}});
         }
-        auto content = read_text_file(fs::join(dir, host_id + ".jsonl"));
+        std::string content;
+        if (hierarchical_logs) {
+            // 两级存储：聚合 <host>/ 下全部采集器 jsonl
+            auto lines = read_operation_logs_filtered(cfg_, host_id, "", "", "", "", "", 50000);
+            for (const auto& l : lines) content += l + "\n";
+        } else {
+            auto r = read_text_file(fs::join(dir, host_id + ".jsonl"));
+            if (r.is_ok()) content = r.value();
+        }
         std::ostringstream o;
         o << "{\n"
           << "  \"host_id\": \"" << json_escape(host_id) << "\",\n"
           << "  \"kind\": \"" << json_escape(kind.empty() ? "metrics" : kind) << "\",\n"
-          << "  \"jsonl\": \"" << json_escape(content.is_ok() ? content.value() : "") << "\"\n"
+          << "  \"jsonl\": \"" << json_escape(content) << "\"\n"
           << "}";
         return o.str();
     }

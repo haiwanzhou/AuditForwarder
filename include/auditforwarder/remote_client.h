@@ -5,6 +5,7 @@
 #include "auditforwarder/types.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
@@ -59,7 +60,8 @@ private:
 
     void worker_loop();
     void send_heartbeat();
-    void send_audit_summaries();
+    // high_only=true 时只发送高优先级队列（提权操作紧急通道，失败不降级）
+    void send_audit_summaries(bool high_only = false);
     void poll_commands();
     void send_pending_results();
 
@@ -83,7 +85,9 @@ private:
     std::atomic<bool> stopping_ { false };
     std::thread worker_;
     std::mutex mtx_;
-    std::vector<chain::EventBatch> audit_queue_;
+    std::condition_variable cv_;
+    std::vector<chain::EventBatch> audit_queue_;       // 普通优先级
+    std::vector<chain::EventBatch> hi_audit_queue_;    // 高优先级（提权操作），先于 audit_queue_ 发送
     std::vector<std::string> pending_results_;
     std::set<std::string> executed_commands_;
 };

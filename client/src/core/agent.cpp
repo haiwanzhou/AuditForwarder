@@ -7,6 +7,7 @@
 #include "auditforwarder/manager.h"
 #include "auditforwarder/processor.h"
 #include "auditforwarder/process.h"
+#include "auditforwarder/log_meta.h"
 #include "auditforwarder/remote_client.h"
 #include "auditforwarder/self_protect.h"
 #include "auditforwarder/transport.h"
@@ -131,6 +132,10 @@ Result<void> Agent::init(const AgentConfig& cfg) {
             cfg_.self_protect_enabled = c.get_bool("self_protect.enabled", cfg_.self_protect_enabled);
             cfg_.rules_path = c.get_string("detector.rules_path", cfg_.rules_path);
             cfg_.collectors_enabled = c.get_bool("collectors.enabled", cfg_.collectors_enabled);
+            cfg_.privilege_detect_enabled = c.get_bool("privilege_detect.enabled", cfg_.privilege_detect_enabled);
+            cfg_.test_injection_enabled = c.get_bool("test_injection.enabled", cfg_.test_injection_enabled);
+            cfg_.test_injection_interval_ms = static_cast<int>(
+                c.get_int("test_injection.interval_ms", cfg_.test_injection_interval_ms));
             const auto& allowed = c.root().at("remote").at("allowed_commands").as_list();
             if (!allowed.empty()) {
                 cfg_.remote_allowed_commands.clear();
@@ -342,6 +347,13 @@ Result<void> Agent::start() {
         AF_LOG_INFO("remote_client: disabled, no server configured");
     }
 
+    if (cfg_.test_injection_enabled) {
+        injecting_.store(true);
+        injector_ = std::thread([this] { injector_loop(); });
+        AF_LOG_WARN("test_injection: ENABLED, interval_ms=" << cfg_.test_injection_interval_ms
+                    << " — synthetic etw_win/privileged events will be emitted");
+    }
+
     install_signal_handlers();
     g_agent = this;
 
@@ -352,6 +364,7 @@ Result<void> Agent::start() {
 void Agent::stop() {
     if (!running_.exchange(false)) return;
     AF_LOG_INFO("agent: stopping");
+    if (injecting_.exchange(false) && injector_.joinable()) injector_.join();
     if (remote_client_) remote_client_->stop();
     if (transport_) transport_->stop();
     if (manager_)   manager_->stop();
@@ -406,6 +419,101 @@ void Agent::record_uploaded(u64 event_count, u64 bytes) {
     std::lock_guard<std::mutex> lk(stats_mtx_);
     stats_.events_uploaded += event_count;
     stats_.bytes_uploaded  += bytes;
+}
+
+std::string Agent::privilege_level_for_pid(u32 pid) {
+    if (!cfg_.privilege_detect_enabled || pid == 0) return "";
+    constexpr auto kTtl = std::chrono::seconds(5);
+    auto now = Clock::now();
+    {
+        std::lock_guard<std::mutex> lk(priv_cache_mtx_);
+        auto it = priv_cache_.find(pid);
+        if (it != priv_cache_.end() && now - it->second.second < kTtl) {
+            return it->second.first;
+        }
+    }
+    std::string level = proc::privilege_level(pid);
+    {
+        std::lock_guard<std::mutex> lk(priv_cache_mtx_);
+        priv_cache_[pid] = {level, now};
+        // 简单兜底，防止缓存无限增长
+        if (priv_cache_.size() > 4096) priv_cache_.erase(priv_cache_.begin());
+    }
+    return level;
+}
+
+// 测试注入：合成 ① ETW 安全日志富字段事件 ② 高权限进程事件，全部走正常 Agent::submit 链路。
+// 所有事件带 injected="1"，生产配置 test_injection.enabled 必须为 false。
+void Agent::injector_loop() {
+    namespace lm = logmeta;
+    u64 seq = 0;
+    auto interruptible_sleep = [this](int ms) {
+        const int step = 50;
+        for (int waited = 0; waited < ms && injecting_.load(); waited += step) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min(step, ms - waited)));
+        }
+    };
+    while (injecting_.load()) {
+        // ① ETW 4688 富字段事件（含完整 raw_xml，验证服务端宽松过滤保留率）
+        {
+            AuditEvent ev;
+            ev.category = EventCategory::Process;
+            ev.action   = EventAction::Spawn;
+            ev.severity = Severity::Info;
+            ev.actor.user = "INJECTED-PC\\Administrator";
+            ev.actor.name = "cmd.exe";
+            ev.actor.path = "C:\\Windows\\System32\\cmd.exe";
+            ev.message = "etw event_id=4688 user=INJECTED-PC\\Administrator proc=cmd.exe [injected]";
+            lm::tag_collector(ev, lm::collector::kEtwWin);
+            ev.attrs[lm::attr::kSource]        = lm::source::kEtwSecurity;
+            ev.attrs[lm::attr::kEventId]       = "4688";
+            ev.attrs[lm::attr::kSubjectUser]   = "Administrator";
+            ev.attrs[lm::attr::kSubjectDomain] = "INJECTED-PC";
+            ev.attrs[lm::attr::kLogonId]       = "0x3e7";
+            ev.attrs[lm::attr::kProcessName]   = "C:\\Windows\\System32\\cmd.exe";
+            ev.attrs[lm::attr::kInjected]      = "1";
+            // 模拟真实 ETW 渲染 XML（约 1.5KB，验证 lenient 策略不截断）
+            std::string xml =
+                "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\">"
+                "<System><Provider Name=\"Microsoft-Windows-Security-Auditing\" Guid=\"{54849625-5478-4994-a5ba-3e3b0328c30d}\"/>"
+                "<EventID>4688</EventID><Version>2</Version><Level>0</Level><Task>13312</Task><Opcode>0</Opcode>"
+                "<Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2025-01-01T00:00:00.0000000Z\"/>"
+                "<RecordID>" + std::to_string(100000 + seq) + "</RecordID><Correlation/><Execution ProcessID=\"4\" ThreadID=\"88\"/>"
+                "<Channel>Security</Channel><Computer>INJECTED-PC</Computer><Security/></System><EventData>"
+                "<Data Name=\"SubjectUserSid\">S-1-5-21-0000-500</Data>"
+                "<Data Name=\"SubjectUserName\">Administrator</Data>"
+                "<Data Name=\"SubjectDomainName\">INJECTED-PC</Data>"
+                "<Data Name=\"SubjectLogonId\">0x3e7</Data>"
+                "<Data Name=\"NewProcessId\">0x" + std::to_string(seq + 1000) + "</Data>"
+                "<Data Name=\"NewProcessName\">C:\\Windows\\System32\\cmd.exe</Data>"
+                "<Data Name=\"TokenElevationType\">%%1843</Data>"
+                "<Data Name=\"ProcessCommandLine\">cmd.exe /c echo injected-test-" + std::to_string(seq) + "</Data>"
+                "<Data Name=\"TargetUserSid\">S-1-0-0</Data><Data Name=\"TargetUserName\">-</Data>"
+                "<Data Name=\"TargetDomainName\">-</Data><Data Name=\"TargetLogonId\">0x0</Data>"
+                "<Data Name=\"ParentProcessName\">C:\\Windows\\System32\\svchost.exe</Data>"
+                "</EventData></Event>";
+            ev.attrs[lm::attr::kRawXml] = std::move(xml);
+            submit(ev);
+        }
+        // ② 高权限进程事件（system / elevated 交替，验证优先级通道与延迟）
+        {
+            AuditEvent ev;
+            ev.category = EventCategory::Process;
+            ev.action   = EventAction::Spawn;
+            ev.severity = Severity::Info;
+            ev.actor.pid  = static_cast<u32>(0x4000 + (seq & 0xFFFF));
+            ev.actor.name = "inject-priv.exe";
+            ev.actor.path = "C:\\Tools\\inject-priv.exe";
+            ev.command    = "inject-priv.exe --case " + std::to_string(seq);
+            ev.message    = "Spawn pid=" + std::to_string(ev.actor.pid) + " [injected privileged]";
+            lm::tag_collector(ev, lm::collector::kProcessWin);
+            lm::mark_privileged(ev, (seq % 2 == 0) ? lm::priv::kSystem : lm::priv::kElevated);
+            ev.attrs[lm::attr::kInjected] = "1";
+            submit(ev);
+        }
+        ++seq;
+        interruptible_sleep(cfg_.test_injection_interval_ms > 0 ? cfg_.test_injection_interval_ms : 1000);
+    }
 }
 
 void Agent::record_failed(u64 event_count) {

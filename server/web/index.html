@@ -51,6 +51,7 @@
         <a href="#batches" class="nav-link">证据批次</a>
         <a href="#hosts" class="nav-link">主机管理</a>
         <a href="#security-monitor" class="nav-link">日志与告警</a>
+        <a href="#log-policy" class="nav-link">日志策略</a>
         <a href="#operation-records" class="nav-link">操作记录</a>
         <a href="#actions" class="nav-link">运维操作</a>
       </nav>
@@ -256,6 +257,29 @@
             <span class="muted" id="securitySummary">等待加载</span>
           </div>
         </div>
+        <div class="panel filter-panel">
+          <label class="field">
+            <span>采集器类型</span>
+            <select id="logCollectorFilter">
+              <option value="">全部采集器</option>
+              <option value="etw_win">etw_win（ETW 安全日志）</option>
+              <option value="file_win">file_win</option>
+              <option value="process_win">process_win</option>
+              <option value="network_win">network_win</option>
+              <option value="command_win">command_win</option>
+              <option value="registry_win">registry_win</option>
+              <option value="legacy">legacy（迁移旧日志）</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>优先级</span>
+            <select id="logPriorityFilter">
+              <option value="">全部优先级</option>
+              <option value="high">high（提权操作）</option>
+              <option value="normal">normal</option>
+            </select>
+          </label>
+        </div>
         <div class="panel analytics-panel">
           <article class="analytics-card">
             <span>日志总数</span>
@@ -286,6 +310,86 @@
               <span class="muted">最新结构化操作日志</span>
             </div>
             <div id="operationLogList" class="security-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="log-policy" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Log Policy</p>
+            <h3>日志分类、优先级与过滤策略</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshLogPolicyBtn" class="button ghost small">刷新统计</button>
+            <span class="muted" id="logPolicySummary">等待加载</span>
+          </div>
+        </div>
+
+        <div class="panel filter-panel">
+          <label class="field">
+            <span>统计主机范围</span>
+            <input id="logPolicyHost" type="text" placeholder="留空统计全部主机，或填写 host_id">
+          </label>
+          <button id="logPolicyQueryBtn" class="button primary small">查询</button>
+        </div>
+
+        <h4 class="subsection-title">采集器日志数量统计</h4>
+        <div class="panel">
+          <div id="collectorCounts" class="breakdown-list">等待加载</div>
+          <pre id="collectorCountsDetail" class="code-block records-json">暂无按主机明细</pre>
+        </div>
+
+        <h4 class="subsection-title">高优先级传输延迟（目标：高/普通均延迟比 ≤ 0.5）</h4>
+        <div class="cards">
+          <article class="metric-card">
+            <span>高优先级平均延迟</span>
+            <strong id="latencyHighAvg">--</strong>
+            <small class="muted" id="latencyHighCount">0 条样本</small>
+          </article>
+          <article class="metric-card">
+            <span>普通优先级平均延迟</span>
+            <strong id="latencyNormalAvg">--</strong>
+            <small class="muted" id="latencyNormalCount">0 条样本</small>
+          </article>
+          <article class="metric-card">
+            <span>高/普通延迟比</span>
+            <strong id="latencyRatio">--</strong>
+            <small class="muted" id="latencyTarget">目标 ≤ 0.5</small>
+          </article>
+          <article class="metric-card">
+            <span>P95（高 / 普通）</span>
+            <strong id="latencyP95">--</strong>
+            <small class="muted">毫秒</small>
+          </article>
+        </div>
+
+        <h4 class="subsection-title">按采集器过滤策略（strict 严格 / lenient 宽松）</h4>
+        <div class="panel">
+          <p class="muted">
+            <code>etw_win</code> 默认 lenient：保留全部富字段（含 raw_xml），消息上限 8192；
+            其他采集器默认 strict：丢弃 raw_xml 等原始载荷字段，消息截断到 512。
+            <code>default</code> 是未单独配置采集器的兜底策略。
+          </p>
+          <div class="records-table-wrap">
+            <table class="records-table">
+              <thead>
+                <tr>
+                  <th>采集器 ID</th>
+                  <th>模式</th>
+                  <th>消息最大长度</th>
+                  <th>保留行数</th>
+                  <th>丢弃字段（逗号分隔）</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="filterProfileRows"></tbody>
+            </table>
+          </div>
+          <div class="action-row">
+            <button id="addFilterProfileBtn" class="button small">新增策略行</button>
+            <button id="saveFilterProfilesBtn" class="button primary small">保存过滤策略</button>
+            <span class="muted" id="filterProfileMsg"></span>
           </div>
         </div>
       </section>

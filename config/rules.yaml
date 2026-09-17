@@ -63,7 +63,7 @@ rules:
     categories: [network]
     actions: [connect]
     path_match:
-      - .*\. (ru|cn|tk|xyz|top)$   # 匹配 .ru/.cn/.tk/.xyz/.top 域名
+      - .*\.(ru|cn|tk|xyz|top)$   # 匹配 .ru/.cn/.tk/.xyz/.top 域名
     responses: [alert]
 
   # 规则 R-NET-002：异常端口出站连接

@@ -8,6 +8,9 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace af {
@@ -87,6 +90,13 @@ struct AgentConfig {
     // 是否启动本机采集器。服务端单独运行时应关闭采集器，只保留管理接口。
     bool collectors_enabled { true };
 
+    // 高权限操作检测（Windows 提权令牌/SYSTEM，Linux uid=0）
+    bool privilege_detect_enabled { true };
+
+    // 测试注入开关（仅测试环境，生产必须关闭）
+    bool test_injection_enabled { false };
+    int  test_injection_interval_ms { 1000 };
+
     // 隐藏安装 / 系统级操作
     bool elevate_required { false };
 };
@@ -124,6 +134,13 @@ public:
     // 记录失败批量上传
     void record_failed(u64 event_count);
 
+    // 高权限检测开关（采集器据此决定是否标注提权事件）
+    bool        privilege_detect_enabled() const { return cfg_.privilege_detect_enabled; }
+
+    // 查询某 PID 的高权限级别（带 5 秒 TTL 缓存，避免重复令牌查询）。
+    // 返回 "" 表示检测关闭；否则为 logmeta::priv 中的 system/elevated/root/none。
+    std::string privilege_level_for_pid(u32 pid);
+
     // 获取运行时统计信息
     AgentStats stats() const;
 
@@ -153,6 +170,15 @@ private:
     std::unique_ptr<Detector>               detector_;
     std::unique_ptr<ManagerServer>          manager_;
     std::unique_ptr<SelfProtect>            self_protect_;
+
+    // 高权限级别查询缓存：pid -> {级别, 缓存时刻}
+    mutable std::mutex                              priv_cache_mtx_;
+    std::unordered_map<u32, std::pair<std::string, TimePoint>> priv_cache_;
+
+    // 测试注入线程（cfg_.test_injection_enabled 时启动）
+    std::thread       injector_;
+    std::atomic<bool> injecting_ { false };
+    void injector_loop();
 };
 
 // ---- 采集器基类 ----

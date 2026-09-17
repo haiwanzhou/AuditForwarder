@@ -28,9 +28,11 @@
 #  include <windows.h>
 #  include <lmcons.h>
 #  include <psapi.h>
+#  include <sddl.h>
 #  include <tlhelp32.h>
 #  include <winver.h>
 #  pragma comment(lib, "version.lib")
+#  pragma comment(lib, "advapi32.lib")
 #endif
 
 namespace af::proc {
@@ -133,6 +135,66 @@ bool is_elevated() {
     return ::getuid() == 0;
 #else
     return false;
+#endif
+}
+
+std::string priv_level_from_status_uid_line(const std::string& line) {
+    // 形如 "Uid:\t0\t0\t0\t0"（real/effective/saved/fs uid），首个数字即 real uid。
+    auto p = line.find("Uid:");
+    if (p == std::string::npos) return "none";
+    p += 4;
+    while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+    std::size_t end = p;
+    while (end < line.size() && std::isdigit(static_cast<unsigned char>(line[end]))) ++end;
+    if (end == p) return "none";
+    return std::strtoul(line.c_str() + p, nullptr, 10) == 0 ? "root" : "none";
+}
+
+std::string privilege_level(u32 pid) {
+#ifdef AF_PLATFORM_WINDOWS
+    HANDLE hp = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!hp) hp = ::OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!hp) return "none";
+    HANDLE tok = nullptr;
+    std::string level = "none";
+    if (::OpenProcessToken(hp, TOKEN_QUERY, &tok) && tok) {
+        // 1) SYSTEM 账户（S-1-5-18）优先
+        DWORD need = 0;
+        ::GetTokenInformation(tok, TokenUser, nullptr, 0, &need);
+        if (need > 0) {
+            std::vector<char> buf(need);
+            if (::GetTokenInformation(tok, TokenUser, buf.data(), need, &need)) {
+                auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+                char* sid_str = nullptr;
+                if (::ConvertSidToStringSidA(tu->User.Sid, &sid_str) && sid_str) {
+                    if (std::strcmp(sid_str, "S-1-5-18") == 0) level = "system";
+                    ::LocalFree(sid_str);
+                }
+            }
+        }
+        // 2) UAC 提权令牌（高完整性）
+        if (level == "none") {
+            TOKEN_ELEVATION elev{};
+            DWORD ret = 0;
+            if (::GetTokenInformation(tok, TokenElevation, &elev, sizeof(elev), &ret) && elev.TokenIsElevated) {
+                level = "elevated";
+            }
+        }
+        ::CloseHandle(tok);
+    }
+    ::CloseHandle(hp);
+    return level;
+#elif defined(AF_PLATFORM_LINUX)
+    std::ifstream f("/proc/" + std::to_string(pid) + "/status");
+    if (!f) return "none";
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 4, "Uid:") == 0) return priv_level_from_status_uid_line(line);
+    }
+    return "none";
+#else
+    (void)pid;
+    return "none";
 #endif
 }
 

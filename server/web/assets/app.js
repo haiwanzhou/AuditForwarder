@@ -55,6 +55,25 @@ const els = {
   analyticsAlertCount: $("analyticsAlertCount"),
   operationTypeBreakdown: $("operationTypeBreakdown"),
   alertSeverityBreakdown: $("alertSeverityBreakdown"),
+  logCollectorFilter: $("logCollectorFilter"),
+  logPriorityFilter: $("logPriorityFilter"),
+  refreshLogPolicyBtn: $("refreshLogPolicyBtn"),
+  logPolicySummary: $("logPolicySummary"),
+  logPolicyHost: $("logPolicyHost"),
+  logPolicyQueryBtn: $("logPolicyQueryBtn"),
+  collectorCounts: $("collectorCounts"),
+  collectorCountsDetail: $("collectorCountsDetail"),
+  latencyHighAvg: $("latencyHighAvg"),
+  latencyHighCount: $("latencyHighCount"),
+  latencyNormalAvg: $("latencyNormalAvg"),
+  latencyNormalCount: $("latencyNormalCount"),
+  latencyRatio: $("latencyRatio"),
+  latencyTarget: $("latencyTarget"),
+  latencyP95: $("latencyP95"),
+  filterProfileRows: $("filterProfileRows"),
+  addFilterProfileBtn: $("addFilterProfileBtn"),
+  saveFilterProfilesBtn: $("saveFilterProfilesBtn"),
+  filterProfileMsg: $("filterProfileMsg"),
   hostId: $("hostId"),
   hostName: $("hostName"),
   hostIp: $("hostIp"),
@@ -698,12 +717,21 @@ function renderSecurityAnalytics(data) {
   renderBreakdown(els.alertSeverityBreakdown, data.alert_severities, "暂无告警级别统计");
 }
 
+function logQueryParams(limit = 20) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const collector = els.logCollectorFilter ? els.logCollectorFilter.value : "";
+  const priority = els.logPriorityFilter ? els.logPriorityFilter.value : "";
+  if (collector) params.set("collector", collector);
+  if (priority) params.set("priority", priority);
+  return params.toString();
+}
+
 async function loadSecurityMonitor(options = {}) {
   if (!els.alertList || !els.operationLogList) return;
   try {
     const [alertsText, logsText, analyticsText] = await Promise.all([
       request("/alerts?limit=20"),
-      request("/logs/query?limit=20"),
+      request(`/logs/query?${logQueryParams(20)}`),
       request("/logs/analytics?limit=1000"),
     ]);
     const alerts = parseJson(alertsText, {});
@@ -720,6 +748,170 @@ async function loadSecurityMonitor(options = {}) {
     renderSecurityItems(els.alertList, [], "告警加载失败", "alert");
     renderSecurityItems(els.operationLogList, [], "日志加载失败", "log");
     if (!options.silent) showNotice(err.message, "error");
+  }
+}
+
+function renderCollectorCounts(data) {
+  const totals = data.collector_totals || {};
+  const entries = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) {
+    els.collectorCounts.innerHTML = `<span class="muted">暂无已存储日志</span>`;
+  } else {
+    const grandTotal = entries.reduce((sum, [, n]) => sum + n, 0);
+    els.collectorCounts.innerHTML = entries.map(([collector, n]) => {
+      const pct = grandTotal > 0 ? Math.round((n / grandTotal) * 1000) / 10 : 0;
+      const tag = collector === "etw_win"
+        ? '<span class="severity warning">ETW 安全日志</span>'
+        : collector === "legacy"
+          ? '<span class="severity info">旧日志迁移</span>'
+          : "";
+      return `<span><code>${escapeHtml(collector)}</code> ${tag}<em>${formatNumber(n)} 条 · ${pct}%</em></span>`;
+    }).join("");
+  }
+  const hosts = data.hosts || {};
+  const hostNames = Object.keys(hosts);
+  els.collectorCountsDetail.textContent = hostNames.length === 0
+    ? "暂无按主机明细"
+    : JSON.stringify({ total: data.total || 0, hosts }, null, 2);
+}
+
+function formatLatencyMs(value) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return "--";
+  return `${Number(value).toFixed(0)} ms`;
+}
+
+function renderTransferLatency(data) {
+  const hi = data.high || {};
+  const nm = data.normal || {};
+  els.latencyHighAvg.textContent = formatLatencyMs(hi.avg_ms);
+  els.latencyNormalAvg.textContent = formatLatencyMs(nm.avg_ms);
+  els.latencyHighCount.textContent = `${formatNumber(hi.count || 0)} 条样本`;
+  els.latencyNormalCount.textContent = `${formatNumber(nm.count || 0)} 条样本`;
+  els.latencyP95.textContent = `${formatLatencyMs(hi.p95_ms)} / ${formatLatencyMs(nm.p95_ms)}`;
+  const ratio = Number(data.avg_latency_ratio);
+  if (!ratio || Number.isNaN(ratio)) {
+    els.latencyRatio.textContent = "--";
+    els.latencyTarget.textContent = "样本不足";
+  } else {
+    els.latencyRatio.textContent = ratio.toFixed(2);
+    const met = Boolean(data.target_met);
+    els.latencyTarget.textContent = met ? "达标（≤ 0.5）" : `未达标（目标 ≤ ${data.target_ratio_le || 0.5}）`;
+    els.latencyTarget.className = met ? "latency-ok" : "latency-bad";
+  }
+}
+
+function filterProfileRow(profile = {}) {
+  const collector = profile.collector || "";
+  const mode = profile.mode === "lenient" ? "lenient" : "strict";
+  const maxLen = Number.isFinite(Number(profile.message_max_len)) ? Number(profile.message_max_len) : 512;
+  const retention = Number.isFinite(Number(profile.retention_lines)) ? Number(profile.retention_lines) : 50000;
+  const drops = Array.isArray(profile.drop_fields) ? profile.drop_fields.join(", ") : "";
+  const note = profile.note ? escapeHtml(profile.note) : "";
+  return `
+    <tr class="filter-profile-row">
+      <td><input class="profile-collector" type="text" value="${escapeHtml(collector)}" placeholder="如 process_win / default" style="width:11rem"></td>
+      <td>
+        <select class="profile-mode">
+          <option value="strict"${mode === "strict" ? " selected" : ""}>strict 严格</option>
+          <option value="lenient"${mode === "lenient" ? " selected" : ""}>lenient 宽松</option>
+        </select>
+      </td>
+      <td><input class="profile-maxlen" type="number" min="64" max="1048576" value="${maxLen}" style="width:7rem"></td>
+      <td><input class="profile-retention" type="number" min="100" max="5000000" value="${retention}" style="width:8rem"></td>
+      <td><input class="profile-dropfields" type="text" value="${escapeHtml(drops)}" placeholder="raw_xml, raw_payload" style="width:13rem"></td>
+      <td><button type="button" class="button danger small profile-remove">删除</button></td>
+    </tr>
+    ${note ? `<tr><td colspan="6" class="muted profile-note-row">${note}</td></tr>` : ""}`;
+}
+
+function renderFilterProfiles(profiles) {
+  const rows = Array.isArray(profiles) ? profiles : [];
+  els.filterProfileRows.innerHTML = rows.map(filterProfileRow).join("") || filterProfileRow({ mode: "strict" });
+}
+
+function collectFilterProfiles() {
+  const profiles = [];
+  const seen = new Set();
+  const blocks = els.filterProfileRows.querySelectorAll(".filter-profile-row");
+  blocks.forEach((row) => {
+    const collector = row.querySelector(".profile-collector").value.trim();
+    const mode = row.querySelector(".profile-mode").value;
+    const messageMaxLen = Number(row.querySelector(".profile-maxlen").value);
+    const retentionLines = Number(row.querySelector(".profile-retention").value);
+    const dropFields = row.querySelector(".profile-dropfields").value
+      .split(",").map((s) => s.trim()).filter(Boolean);
+    if (!collector) return;
+    if (!/^[a-z0-9_]{2,32}$/.test(collector)) {
+      throw new Error(`采集器 ID 不合法：${collector}（仅允许小写字母、数字、下划线，2-32 位）`);
+    }
+    if (seen.has(collector)) throw new Error(`采集器 ID 重复：${collector}`);
+    seen.add(collector);
+    if (!Number.isFinite(messageMaxLen) || messageMaxLen < 64) {
+      throw new Error(`${collector} 的消息最大长度必须 ≥ 64`);
+    }
+    if (!Number.isFinite(retentionLines) || retentionLines < 100) {
+      throw new Error(`${collector} 的保留行数必须 ≥ 100`);
+    }
+    profiles.push({
+      collector,
+      mode,
+      message_max_len: Math.round(messageMaxLen),
+      drop_fields: dropFields,
+      retention_lines: Math.round(retentionLines),
+    });
+  });
+  if (profiles.length === 0) throw new Error("至少保留一条过滤策略");
+  if (!seen.has("default")) throw new Error("必须保留 collector=default 的兜底策略");
+  return profiles;
+}
+
+async function saveFilterProfiles() {
+  let profiles;
+  try {
+    profiles = collectFilterProfiles();
+  } catch (err) {
+    els.filterProfileMsg.textContent = err.message;
+    showNotice(err.message, "error");
+    return;
+  }
+  const done = setLoading(els.saveFilterProfilesBtn, "保存中...");
+  try {
+    const text = await request("/log-filter/profiles", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ profiles }),
+    });
+    const result = parseJson(text, {});
+    els.filterProfileMsg.textContent = result.saved ? "已保存，新日志立即按新策略过滤" : "已提交";
+    showNotice("日志过滤策略已保存。");
+  } catch (err) {
+    els.filterProfileMsg.textContent = err.message;
+    showNotice(err.message, "error");
+  } finally {
+    done();
+  }
+}
+
+async function loadLogPolicy(options = {}) {
+  if (!els.filterProfileRows) return;
+  const silent = Boolean(options && options.silent);
+  const skipProfiles = Boolean(options && options.skipProfiles);
+  const host = els.logPolicyHost.value.trim();
+  const qs = host ? `?host_id=${encodeURIComponent(host)}` : "";
+  try {
+    const tasks = [
+      request(`/logs/collector-counts${qs}`),
+      request(`/stats/transfer-latency${qs}${qs ? "&" : "?"}limit=5000`),
+    ];
+    if (!skipProfiles) tasks.push(request("/log-filter/profiles"));
+    const [countsText, latencyText, profilesText] = await Promise.all(tasks);
+    renderCollectorCounts(parseJson(countsText, { collector_totals: {}, hosts: {} }));
+    renderTransferLatency(parseJson(latencyText, {}));
+    if (!skipProfiles) renderFilterProfiles(parseJson(profilesText, { profiles: [] }).profiles);
+    els.logPolicySummary.textContent = host ? `主机 ${host} 的统计` : "全部主机汇总";
+  } catch (err) {
+    els.logPolicySummary.textContent = "加载失败";
+    if (!silent) showNotice(err.message, "error");
   }
 }
 
@@ -951,6 +1143,7 @@ async function refreshAll(options = {}) {
     renderBatches(parseJson(batchesText, { batches: [] }));
     renderHosts(parseJson(hostsText, { hosts: [] }));
     await loadSecurityMonitor({ silent });
+    await loadLogPolicy({ silent });
     if (!silent) showNotice("数据已刷新。");
     if (record) {
       recordOperation({
@@ -990,6 +1183,7 @@ async function refreshLiveData() {
     renderStatus(parseJson(statusText, {}));
     renderHosts(parseJson(hostsText, { hosts: [] }));
     await loadSecurityMonitor({ silent: true });
+    await loadLogPolicy({ silent: true, skipProfiles: true });
   } catch (err) {
     els.statusPill.textContent = "连接异常";
     els.statusPill.className = "pill error";
@@ -1185,7 +1379,25 @@ function init() {
     });
   }
   els.refreshBtn.addEventListener("click", () => refreshAll());
-  if (els.refreshSecurityBtn) els.refreshSecurityBtn.addEventListener("click", loadSecurityMonitor);
+  if (els.refreshSecurityBtn) els.refreshSecurityBtn.addEventListener("click", () => loadSecurityMonitor());
+  if (els.logCollectorFilter) els.logCollectorFilter.addEventListener("change", () => loadSecurityMonitor({ silent: true }));
+  if (els.logPriorityFilter) els.logPriorityFilter.addEventListener("change", () => loadSecurityMonitor({ silent: true }));
+  if (els.refreshLogPolicyBtn) els.refreshLogPolicyBtn.addEventListener("click", () => loadLogPolicy());
+  if (els.logPolicyQueryBtn) els.logPolicyQueryBtn.addEventListener("click", () => loadLogPolicy());
+  if (els.logPolicyHost) els.logPolicyHost.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") loadLogPolicy();
+  });
+  if (els.addFilterProfileBtn) els.addFilterProfileBtn.addEventListener("click", () => {
+    els.filterProfileRows.insertAdjacentHTML("beforeend", filterProfileRow({ mode: "strict" }));
+  });
+  if (els.filterProfileRows) els.filterProfileRows.addEventListener("click", (event) => {
+    if (!event.target.classList.contains("profile-remove")) return;
+    const block = event.target.closest(".filter-profile-row");
+    const noteRow = block ? block.nextElementSibling : null;
+    if (block) block.remove();
+    if (noteRow && noteRow.classList.contains("profile-note-row")) noteRow.remove();
+  });
+  if (els.saveFilterProfilesBtn) els.saveFilterProfilesBtn.addEventListener("click", saveFilterProfiles);
   els.reloadConfigBtn.addEventListener("click", reloadConfig);
   els.copyConfigBtn.addEventListener("click", copyConfig);
   els.saveHostBtn.addEventListener("click", saveHost);

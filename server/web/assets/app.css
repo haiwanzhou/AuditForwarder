@@ -853,6 +853,25 @@ a:focus-visible {
   background: rgba(220, 38, 38, 0.12);
 }
 
+.severity.info {
+  color: #0f766e;
+  background: rgba(13, 148, 136, 0.12);
+}
+
+.subsection-title {
+  margin: 22px 0 10px;
+}
+
+.latency-ok {
+  color: #15803d;
+  font-weight: 800;
+}
+
+.latency-bad {
+  color: var(--danger);
+  font-weight: 800;
+}
+
 .operation-panel {
   display: grid;
   gap: 18px;

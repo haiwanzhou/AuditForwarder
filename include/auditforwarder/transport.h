@@ -5,6 +5,7 @@
 #include "auditforwarder/event.h"
 #include "auditforwarder/chain.h"
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
@@ -56,7 +57,8 @@ public:
 
 private:
     void worker_loop();
-    UploadResult do_upload(const std::string& url, const ByteBuffer& body, const std::string& batch_id);
+    UploadResult do_upload(const std::string& url, const ByteBuffer& body, const std::string& batch_id,
+                           bool high_priority = false);
     void persist_index();
     void load_index();
 
@@ -66,7 +68,9 @@ private:
     std::thread           worker_;
     Agent*                agent_ { nullptr };
     std::mutex            mtx_;
-    std::vector<chain::EventBatch> queue_;
+    std::condition_variable cv_;
+    std::vector<chain::EventBatch> queue_;       // 普通优先级 FIFO
+    std::vector<chain::EventBatch> hi_queue_;    // 高优先级 FIFO（含提权操作事件），先于 queue_ 出队
     std::map<std::string, std::string> resume_index_;  // batch_id -> last_error/url
 
     std::string           sym_key_;   // 用于载荷加密的对称密钥
