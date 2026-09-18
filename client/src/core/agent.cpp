@@ -171,13 +171,13 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     cc.batch_size    = cfg_.chain_batch_size;
     cc.auto_persist  = true;
     chain_ = std::make_unique<chain::Chain>(cc);
-    chain_->start();
     if (!cfg_.chain_signing_key.empty()) {
         auto kp = crypto::KeyPair::load_pem(cfg_.chain_signing_key);
         if (kp.is_ok()) chain_->set_signer(std::move(kp).value());
     } else if (!cfg_.chain_hmac_key.empty()) {
         chain_->set_hmac_key(cfg_.chain_hmac_key);
     }
+    chain_->start();
     // Register batch callback to forward to the transport once it is set.
     chain_->on_batch([this](const chain::EventBatch& b) {
         if (transport_) transport_->send_batch(b);
@@ -293,6 +293,7 @@ Result<void> Agent::init(const AgentConfig& cfg) {
         mc.login_username = cfg_.manager_login_username;
         mc.login_password_sha256 = cfg_.manager_login_password_sha256;
         mc.data_dir   = cfg_.data_dir;
+        mc.chain_hmac_key = cfg_.chain_hmac_key;  // 与客户端批次签名使用同一 HMAC 密钥验签
         manager_ = std::make_unique<SimpleHttpManager>(mc);
     }
 
@@ -305,15 +306,15 @@ Result<void> Agent::start() {
     if (running_.exchange(true)) return Result<void>::ok();
     start_tp_ = Clock::now();
 
-    // 构建平台特定的采集器
-    std::vector<std::unique_ptr<Collector>> created;
-    if (cfg_.collectors_enabled && collectors_.empty()) {
+    // 构建平台特定的采集器。
+    // 注意：无论 collectors_enabled 取值如何都要创建实例，仅启动与否受配置控制——
+    // 这样服务端下发 set_collector 指令时，才能把初始关闭的采集器动态拉起。
+    if (collectors_.empty()) {
 #ifdef AF_PLATFORM_LINUX
-        create_linux_collectors(created, *this);
+        create_linux_collectors(collectors_, *this);
 #elif defined(AF_PLATFORM_WINDOWS)
-        create_windows_collectors(created, *this);
+        create_windows_collectors(collectors_, *this);
 #endif
-        collectors_ = std::move(created);
     }
     if (cfg_.collectors_enabled) {
         for (auto& c : collectors_) {
@@ -322,7 +323,7 @@ Result<void> Agent::start() {
             else AF_LOG_INFO("collector: " << c->name() << " started");
         }
     } else {
-        AF_LOG_INFO("collectors: disabled by configuration");
+        AF_LOG_INFO("collectors: created but disabled by config (can be enabled remotely)");
     }
 
     if (self_protect_) {
@@ -538,6 +539,53 @@ AgentStats Agent::stats() const {
 Result<void> Agent::reload_config() {
     if (cfg_.config_path.empty()) return Result<void>(Error::Code::InvalidArgument, "no config path");
     return Config::instance().load_from_file(cfg_.config_path);
+}
+
+// 动态启停单个采集器，供服务端远程开关使用。
+bool Agent::set_collector_enabled(const std::string& name, bool enabled) {
+    bool found = false;
+    for (auto& c : collectors_) {
+        if (c->name() != name) continue;
+        found = true;
+        const bool running = c->is_running();
+        if (enabled && !running) {
+            auto r = c->start(*this);
+            if (r.is_err()) {
+                AF_LOG_ERROR("collector: 远程开启 " << name << " 失败: " << r.error().message());
+                return false;
+            }
+            AF_LOG_INFO("collector: " << name << "已由服务端远程开启");
+        } else if (!enabled && running) {
+            c->stop();
+            AF_LOG_INFO("collector: " << name << "已由服务端远程关闭");
+        }
+        break;
+    }
+    if (!found) AF_LOG_WARN("collector: 服务端要求开关的采集器不存在: " << name);
+    return found;
+}
+
+// 汇总全部采集器运行状态，供心跳上报与 collect_status 指令返回。
+std::string Agent::collector_states_json() const {
+    std::ostringstream os;
+    os << "[";
+    bool first = true;
+    for (const auto& c : collectors_) {
+        if (!first) os << ",";
+        first = false;
+        os << "{\"name\":\"" << c->name() << "\",\"running\":" << (c->is_running() ? "true" : "false") << "}";
+    }
+    os << "]";
+    return os.str();
+}
+
+// 热加载服务端下发的检测规则 JSON。
+Result<void> Agent::load_remote_rules(const std::string& rules_json) {
+    auto* engine = dynamic_cast<detector::RuleEngine*>(detector_.get());
+    if (!engine) {
+        return Result<void>(Error::Code::NotSupported, "规则引擎未初始化，无法热加载规则");
+    }
+    return engine->load_rules_string(rules_json);
 }
 
 void Agent::install_signal_handlers() {

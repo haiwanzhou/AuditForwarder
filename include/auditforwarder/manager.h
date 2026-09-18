@@ -26,6 +26,10 @@ struct ManagerConfig {
     std::string data_dir;
     std::string login_username { "admin" };
     std::string login_password_sha256;
+    // 防篡改验签密钥：必须与客户端 chain.hmac_key 一致。
+    // 非空时，服务端对 /agent/audit-summaries 上报的批次签名逐条验签，失败即告警；
+    // 为空时跳过验签（仅建议用于无签名的纯测试环境）。
+    std::string chain_hmac_key;
 };
 
 class SimpleHttpManager : public ManagerServer {

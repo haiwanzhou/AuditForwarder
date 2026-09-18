@@ -19,6 +19,7 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #ifdef AF_PLATFORM_WINDOWS
 #  include <winsock2.h>
@@ -118,6 +119,24 @@ std::string json_string_field(const std::string& json, const std::string& key) {
         raw.push_back(c);
     }
     return json_unescape(raw);
+}
+
+// 从 [{"name":"a","enabled":true}, ...] 形式的 JSON 数组中粗解析采集器开关对。
+// 前端生成的字段固定；不做完整 JSON 解析，避免引入额外依赖。
+std::vector<std::pair<std::string, bool>> parse_collector_toggles(const std::string& json) {
+    std::vector<std::pair<std::string, bool>> out;
+    std::size_t pos = 0;
+    while (pos < json.size()) {
+        auto kn = json.find("\"name\"", pos);
+        if (kn == std::string::npos) break;
+        std::string tail = json.substr(kn);
+        std::string name = json_string_field(tail, "name");
+        auto en = tail.find("\"enabled\"");
+        bool on = en != std::string::npos && json_string_field(tail.substr(en), "enabled") == "true";
+        if (!name.empty()) out.emplace_back(std::string(name), on);
+        pos = kn + 6;
+    }
+    return out;
 }
 
 std::uint64_t epoch_seconds() {
@@ -493,6 +512,8 @@ std::string RemoteAgentClient::build_heartbeat_json() {
       << "\"cpu_usage_percent\":" << static_cast<unsigned>(metrics.cpu_percent + 0.5) << ","
       << "\"memory_usage_percent\":" << static_cast<unsigned>(metrics.memory_percent + 0.5) << ","
       << "\"metrics\":" << build_metrics_json() << ","
+      // 各采集器名称与运行状态，供服务端 Web 界面渲染开关面板。
+      << "\"collectors\":" << (agent_ ? agent_->collector_states_json() : "[]") << ","
       << "\"permissions\":[";
     for (std::size_t i = 0; i < cfg_.allowed_commands.size(); ++i) {
         if (i) o << ",";
@@ -517,6 +538,8 @@ std::string RemoteAgentClient::build_batch_summary_json(const chain::EventBatch&
       << "\"created_at_us\":" << us << ","
       << "\"merkle_root\":\"" << json_escape(batch.merkle_root) << "\","
       << "\"signature_present\":" << (!batch.signature.empty() ? "true" : "false") << ","
+      // 批次签名（HMAC-SHA256 或非对称签名字节），服务端据此验签，构成防篡改闭环。
+      << "\"signature\":\"" << json_escape(batch.signature) << "\","
       << "\"activities\":[";
     for (std::size_t i = 0; i < batch.events.size() && i < 20; ++i) {
         const auto& ev = batch.events[i];
@@ -667,11 +690,58 @@ std::string RemoteAgentClient::execute_command(const std::string& command_id,
     if (!command_allowed(command_type)) {
         error = "command type is not allowed by this Agent";
     } else if (command_type == "collect_status") {
+        // 返回运行指标 + 各采集器开关状态，供 Web 面板渲染。
         success = true;
-        output = build_metrics_json();
+        output = std::string("{\"metrics\":") + build_metrics_json()
+               + ",\"collectors\":" + (agent_ ? agent_->collector_states_json() : "[]") + "}";
     } else if (command_type == "echo") {
         success = true;
         output = payload;
+    } else if (command_type == "set_collector") {
+        // payload: {"name":"file_win","enabled":true}
+        std::string name = json_string_field(payload, "name");
+        bool on = json_string_field(payload, "enabled") == "true";
+        if (name.empty()) {
+            error = "set_collector: missing 'name' in payload";
+        } else if (!agent_) {
+            error = "set_collector: agent not running";
+        } else {
+            success = agent_->set_collector_enabled(name, on);
+            if (!success) error = "set_collector: collector not found or failed: " + name;
+            else output = agent_->collector_states_json();
+        }
+    } else if (command_type == "set_collectors") {
+        // payload: [{"name":"...","enabled":...}, ...]
+        if (!agent_) {
+            error = "set_collectors: agent not running";
+        } else {
+            auto toggles = parse_collector_toggles(payload);
+            int applied = 0;
+            for (const auto& [name, on] : toggles) {
+                if (agent_->set_collector_enabled(name, on)) ++applied;
+            }
+            success = applied > 0;
+            if (success) {
+                std::ostringstream os;
+                os << "applied " << applied << " of " << toggles.size() << " collectors";
+                output = os.str() + ";" + agent_->collector_states_json();
+            } else {
+                error = "set_collectors: no matching collector on this host";
+            }
+        }
+    } else if (command_type == "load_rules") {
+        // payload payload 为服务端下发的完整规则 JSON 文本。
+        if (!agent_) {
+            error = "load_rules: agent not running";
+        } else {
+            auto r2 = agent_->load_remote_rules(payload);
+            if (r2.is_err()) {
+                error = "load_rules: " + r2.error().message();
+            } else {
+                success = true;
+                output = "rules hot-loaded";
+            }
+        }
     } else {
         error = "command type is recognized by permission list but has no local executor";
     }

@@ -147,6 +147,16 @@ public:
     // 从磁盘重新加载配置
     Result<void> reload_config();
 
+    // 动态启停指定名称的采集器（由服务端远程开关，名称见 Collector::name()）。
+    // 返回 false 表示不存在该名称的采集器。
+    bool set_collector_enabled(const std::string& name, bool enabled);
+
+    // 返回全部采集器的名称与运行状态，JSON 数组格式：[{"name":"...","running":true}]。
+    std::string collector_states_json() const;
+
+    // 用服务端下发的规则 JSON 热加载检测器规则（无需重启、无需本地规则文件）。
+    Result<void> load_remote_rules(const std::string& rules_json);
+
     // 访问子系统
     chain::Chain&          chain_module()   { return *chain_; }
     ThreadPool&            pool()           { return pool_; }

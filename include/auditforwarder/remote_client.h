@@ -36,7 +36,12 @@ struct RemoteClientConfig {
     std::string client_cert;
     std::string client_key;
     std::string enrollment_key;
-    std::vector<std::string> allowed_commands { "collect_status", "echo" };
+    std::vector<std::string> allowed_commands {
+        "collect_status", "echo",
+        "set_collector",   // 单个采集器开关，payload: {"name":"file_win","enabled":true}
+        "set_collectors",  // 批量采集器开关，payload: [{"name":"...","enabled":...}]
+        "load_rules",      // 热加载检测规则，payload 为规则 JSON 文本
+    };
 };
 
 class RemoteAgentClient {
