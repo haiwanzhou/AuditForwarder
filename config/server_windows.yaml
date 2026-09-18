@@ -15,7 +15,7 @@ chain:
   batch_size: 10
   sign_batches: false
   auto_persist: true
-  hmac_key: "server-test-hmac-key"
+  hmac_key: "test-hmac-key-12345"   # 客户端 chain.hmac_key 必须与此一致，服务端据此验签
 
 transport:
   servers: []

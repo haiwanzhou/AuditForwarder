@@ -15,7 +15,7 @@ chain:
   batch_size: 10
   sign_batches: false
   auto_persist: true
-  hmac_key: "client-test-hmac-key"
+  hmac_key: "test-hmac-key-12345"   # 必须与服务端 manager 验签密钥一致
 
 transport:
   servers:
@@ -42,6 +42,9 @@ remote:
   allowed_commands:
     - collect_status
     - echo
+    - set_collector
+    - set_collectors
+    - load_rules
 
 detector:
   rules_path: config/rules.yaml

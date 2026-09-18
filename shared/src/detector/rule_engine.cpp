@@ -11,6 +11,7 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <unordered_map>
 
 namespace af::detector {
 
@@ -190,6 +191,90 @@ bool RuleEngine::inspect(AuditEvent& ev) {
     return keep;
 }
 
+// 将服务端简化规则里的操作类型（execute/file/permission/...）映射为
+// 客户端事件类别字符串（command/file/privilege/...，见 to_string(EventCategory)）。
+std::string server_op_to_category(const std::string& op) {
+    static const std::unordered_map<std::string, std::string> kMap = {
+        {"execute", "command"}, {"process", "process"}, {"file", "file"},
+        {"network", "network"}, {"registry", "registry"}, {"command_line", "command"},
+        {"auth", "auth"}, {"login", "auth"}, {"permission", "privilege"},
+        {"driver", "driver"}, {"config", "config"}, {"update", "update"},
+    };
+    auto it = kMap.find(op);
+    return it == kMap.end() ? it->second : op;
+}
+
+// 转义正则表达式元字符，用于把服务端的“关键字包含”语义包装成正则。
+std::string regex_escape_literal(const std::string& s) {
+    static const char kSpecial[] = "\\.^$|()[]{}*+?";
+    std::string out;
+    out.reserve(s.size() + 32);
+    for (char c : s) {
+        if (std::strchr(kSpecial, static_cast<unsigned char>(c)) != nullptr) out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+Result<void> RuleEngine::load_rules_string(const std::string& content) {
+    ConfigValue v;
+    // 空格式触发 parse_minimal 按内容自动识别（{ 或 [ 开头 → JSON）
+    auto pr = parse_minimal(content, "", v);
+    if (pr.is_err()) return pr;
+    if (v.type() != ConfigValue::Type::Map)
+        return Result<void>(Error::Code::Parse, "rules must be a map");
+    if (!v.has("rules"))
+        return Result<void>(Error::Code::Parse, "expected rules: [...]");
+    const auto& arr = v.at("rules").as_list();
+
+    std::vector<Rule> parsed;
+    parsed.reserve(1024);
+    for (const auto& rv : arr) {
+        Rule r;
+        r.id          = rv.at("id").as_string();
+        r.name        = rv.at("name").as_string();
+        r.description = rv.at("description").as_string();
+        r.severity    = severity_from_string(rv.at("severity").as_string("warning"));
+        r.enabled     = rv.at("enabled").as_bool(true);
+        for (const auto& c : rv.at("categories").as_list()) r.categories.push_back(c.as_string());
+        for (const auto& c : rv.at("actions").as_list())    r.actions.push_back(c.as_string());
+        for (const auto& c : rv.at("actor_match").as_list()) r.actor_match.push_back(c.as_string());
+        for (const auto& c : rv.at("path_match").as_list())  r.path_match.push_back(c.as_string());
+        for (const auto& c : rv.at("cmd_match").as_list())   r.cmd_match.push_back(c.as_string());
+        for (const auto& c : rv.at("responses").as_list())   r.responses.push_back(c.as_string());
+        if (rv.has("match"))
+            for (const auto& [k, val] : rv.at("match").as_map()) r.match[k] = val.as_string();
+        r.threshold   = static_cast<int>(rv.at("threshold").as_int(1));
+        r.window      = std::chrono::seconds(rv.at("window_sec").as_int(10));
+
+        // ---- 兼容服务端简化格式：operation_type/keyword/message ----
+        std::string op_type = rv.at("operation_type").as_string();
+        if (!op_type.empty()) {
+            std::string cat = server_op_to_category(op_type);
+            if (!cat.empty() && !in_list(r.categories, cat)) r.categories.push_back(cat);
+        }
+        std::string keyword = rv.at("keyword").as_string();
+        if (!keyword.empty()) {
+            // 服务端语义为“关键字包含”：命令行与文件路径都要匹配。
+            std::string pat = ".*" + regex_escape_literal(keyword) + ".*";
+            r.cmd_match.push_back(pat);
+            r.path_match.push_back(pat);
+        }
+        // 服务端格式没有 responses 字段，默认告警，不阻断业务。
+        if (r.responses.empty()) r.responses.push_back("alert");
+        if (r.id.empty()) r.id = "remote-rule-" + std::to_string(parsed.size());
+        parsed.push_back(std::move(r));
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+    rules_.swap(parsed);
+    hits_.clear();
+    }
+    AF_LOG_INFO("detector: hot-loaded " << parsed.size() << " remote rules");
+    return Result<void>::ok();
+}
+
 Result<void> RuleEngine::load_rules(const std::string& path) {
     std::ifstream in(path);
     if (!in.is_open())
@@ -200,13 +285,12 @@ Result<void> RuleEngine::load_rules(const std::string& path) {
     if (r.is_err()) return r;
     if (v.type() != ConfigValue::Type::Map)
         return Result<void>(Error::Code::Parse, "rules must be a map");
-    auto& rules = v.at("rules");
-    if (rules.type() != ConfigValue::Type::List)
+    if (!v.has("rules"))
         return Result<void>(Error::Code::Parse, "expected rules: [...]");
-    std::lock_guard<std::mutex> lk(mtx_);
-    rules_.clear();
-    hits_.clear();
-    for (const auto& rv : rules.as_list()) {
+    const auto& arr = v.at("rules").as_list();
+    std::vector<Rule> parsed;
+    parsed.reserve(1024);
+    for (const auto& rv : arr) {
         Rule r;
         r.id          = rv.at("id").as_string();
         r.name        = rv.at("name").as_string();
@@ -222,7 +306,13 @@ Result<void> RuleEngine::load_rules(const std::string& path) {
         for (const auto& [k, val] : rv.at("match").as_map()) r.match[k] = val.as_string();
         r.threshold   = static_cast<int>(rv.at("threshold").as_int(1));
         r.window      = std::chrono::seconds(rv.at("window_sec").as_int(10));
-        rules_.push_back(std::move(r));
+        if (r.id.empty()) r.id = "rule-" + std::to_string(parsed.size());
+        parsed.push_back(std::move(r));
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        rules_ = std::move(parsed);
+        hits_.clear();
     }
     AF_LOG_INFO("detector: loaded " << rules_.size() << " rules from " << path);
     return Result<void>::ok();

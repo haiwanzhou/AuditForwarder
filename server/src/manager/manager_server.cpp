@@ -248,6 +248,37 @@ bool json_bool_field(const std::string& json, const std::string& key, bool def) 
     return def;
 }
 
+// 提取 JSON 中某个数组字段的原文（含方括号），如 "collectors":[...]。
+// 仅用于原样透传采集器状态，不做完整解析。
+std::string json_array_text(const std::string& json, const std::string& key) {
+    auto marker = "\"" + key + "\"";
+    auto p = json.find(marker);
+    if (p == std::string::npos) return {};
+    p = json.find(':', p + marker.size());
+    if (p == std::string::npos) return {};
+    p = json.find('[', p + 1);
+    if (p == std::string::npos) return {};
+    int depth = 0;
+    bool in_str = false;
+    bool esc = false;
+    for (std::size_t i = p; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '[') ++depth;
+        else if (c == ']') {
+            --depth;
+            if (depth == 0) return json.substr(p, i - p + 1);
+        }
+    }
+    return {};
+}
+
 std::size_t json_size_field(const std::string& json, const std::string& key, std::size_t def) {
     auto marker = "\"" + key + "\"";
     auto p = json.find(marker);
@@ -434,6 +465,8 @@ struct HostRecord {
     u64 last_seen_epoch { 0 };
     u64 cpu_usage_percent { 0 };
     u64 memory_usage_percent { 0 };
+    // 最近一次心跳上报的采集器状态，JSON 数组原文：[{"name":"file_win","running":true}]
+    std::string collectors_state;
 };
 
 struct ValidationIssue {
@@ -667,6 +700,8 @@ HostRecord host_from_json(const std::string& json) {
     h.network_status = json_string_field(json, "network_status");
     h.note = json_string_field(json, "note");
     h.permissions = json_string_array_field(json, "permissions");
+    h.collectors_state = json_array_text(json, "collectors");
+    if (h.collectors_state.empty()) h.collectors_state = "[]";
     h.last_seen_epoch = json_u64_field(json, "last_seen_epoch", 0);
     h.cpu_usage_percent = json_u64_field(json, "cpu_usage_percent", 0);
     h.memory_usage_percent = json_u64_field(json, "memory_usage_percent", 0);
@@ -697,7 +732,8 @@ std::string host_to_json(const HostRecord& h, bool comma, u64 now, u64 timeout_s
         if (i) o << ", ";
         o << "\"" << json_escape(h.permissions[i]) << "\"";
     }
-    o << "]\n"
+    o << "],\n"
+      << "      \"collectors\": " << (h.collectors_state.empty() ? "[]" : h.collectors_state) << "\n"
       << "    }";
     if (comma) o << ",";
     o << "\n";
@@ -1282,7 +1318,7 @@ std::string count_map_json(const std::map<std::string, std::size_t>& counts) {
     o << "{";
     std::size_t i = 0;
     for (const auto& kv : counts) {
-        if (i++) o << ", ";
+        if (i) o << ", ";
         o << "\"" << json_escape(kv.first) << "\": " << kv.second;
     }
     o << "}";
@@ -2012,6 +2048,80 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         }
         return "{\n  \"saved\": true,\n  \"policy\": \"violation_rules\"\n}";
     }
+    // 违规规则统一下发：把当前 violation_rules.json 通过远程命令通道（load_rules）
+    // 热加载到指定主机或全部已注册主机，消除“双份规则双份维护”。
+    if (path == "/violation/rules/push" && method == "POST") {
+        content_type = "application/json; charset=utf-8";
+        auto target_host = json_string_field(body, "host_id");
+        if (!target_host.empty() && !is_valid_host_id(target_host)) {
+            status = 422;
+            return validation_error_json({{"host_id", "format", "目标主机 ID 格式不正确"}});
+        }
+        auto rules = read_text_file(violation_rules_path(cfg_));
+        if (rules.is_err() || rules.value().empty()) {
+            status = 500;
+            return "{\n  \"error\": \"cannot load violation rules for push\"\n}";
+        }
+        // 规则 JSON 作为命令 payload，需要大于普通指令的长度配额（约 60KB 上限）。
+        if (rules.value().size() > 60000) {
+            status = 413;
+            return "{\n  \"error\": \"violation rules too large for remote push (limit 60KB)\"\n}";
+        }
+
+        std::vector<HostRecord> targets;
+        if (target_host.empty()) {
+            auto hosts = load_hosts(cfg_);
+            if (hosts.is_err()) {
+                status = 500;
+                return "{\n  \"error\": \"cannot load hosts\"\n}";
+            }
+            targets = hosts.value();
+        } else {
+            auto hosts = load_hosts(cfg_);
+            if (hosts.is_err()) {
+                status = 500;
+                return "{\n  \"error\": \"cannot load hosts\"\n}";
+            }
+            bool found = false;
+            for (const auto& h : hosts.value()) {
+                if (h.id == target_host) { targets.push_back(h); found = true; break; }
+            }
+            if (!found) {
+                status = 404;
+                return "{\n  \"error\": \"target host not registered\"\n}";
+            }
+        }
+
+        std::vector<std::string> command_ids;
+        int queued_count = 0;
+        {
+            std::lock_guard<std::mutex> lk(host_store_mutex());
+            for (const auto& h : targets) {
+                auto qid = enqueue_host_command(cfg_, h, "load_rules", rules.value());
+                if (qid.is_err()) {
+                    AF_LOG_WARN("规则下发: 主机 " << h.id << " 入队失败: " << qid.error().message());
+                    continue;
+                }
+                command_ids.push_back(qid.value());
+                ++queued_count;
+            }
+        }
+        AF_LOG_INFO("violation rules pushed to " << queued_count << " host(s)"
+                    << (target_host.empty() ? "（全部主机）" : "（指定主机）"));
+        std::ostringstream o;
+        o << "{\n"
+          << "  \"accepted\": true,\n"
+          << "  \"command_type\": \"load_rules\",\n"
+          << "  \"target\": \"" << json_escape(target_host.empty() ? "*" : target_host) << "\",\n"
+          << "  \"queued_count\": " << queued_count << ",\n"
+          << "  \"command_ids\": [";
+        for (std::size_t i = 0; i < command_ids.size(); ++i) {
+            if (i) o << ",";
+            o << "\"" << json_escape(command_ids[i]) << "\"";
+        }
+        o << "]\n}";
+        return o.str();
+    }
     if (path == "/log-filter/profiles" && method == "GET") {
         content_type = "application/json; charset=utf-8";
         auto profiles = load_or_create_text(log_filter_profiles_path(cfg_),
@@ -2231,6 +2341,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                 h.cpu_usage_percent = incoming.cpu_usage_percent;
                 h.memory_usage_percent = incoming.memory_usage_percent;
                 if (!incoming.permissions.empty()) h.permissions = incoming.permissions;
+                // 透传采集器运行状态（心跳携带），供 Web 面板开关展示。
+                if (!incoming.collectors_state.empty()) h.collectors_state = incoming.collectors_state;
                 updated = true;
                 break;
             }
@@ -2444,10 +2556,45 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             status = 500;
             return "{\n  \"error\": \"cannot save audit summaries\"\n}";
         }
-        // 汇总本批事件数，累计到全局计数器（已采集 = 已上传，摘要到达即视为上传成功）
+        // 防篡改闭环：服务端配置了 chain_hmac_key 时，对每条摘要携带的批次签名
+        // 逐条验签（payload = batch_id|created_at_us|merkle_root，与客户端 Chain::build_batch 一致）。
+        // 验签失败的批次：原始记录仍留盘取证，但事件数不计入统计，并产生 critical 告警。
         u64 batch_events = 0;
-        for (const auto& summary : json_object_array_field(body, "summaries")) {
-            batch_events += static_cast<u64>(json_size_field(summary, "event_count", 0));
+        int signature_failures = 0;
+        std::string first_bad_batch;
+        if (!cfg_.chain_hmac_key.empty()) {
+            for (const auto& summary : json_object_array_field(body, "summaries")) {
+                const std::string bid   = json_string_field(summary, "batch_id");
+                const std::string mroot = json_string_field(summary, "merkle_root");
+                const std::string sig   = json_string_field(summary, "signature");
+                const std::string created = std::to_string(json_size_field(summary, "created_at_us", 0));
+                const std::string payload = bid + "|" + created + "|" + mroot;
+                const std::string expect = crypto::hmac_sha256_hex(cfg_.chain_hmac_key, payload);
+                // 常量时间、十六进制不区分大小写比较
+                bool valid = sig.size() == expect.size();
+                for (std::size_t i = 0; valid && i < sig.size(); ++i) {
+                    if (std::tolower(static_cast<unsigned char>(sig[i])) !=
+                        std::tolower(static_cast<unsigned char>(expect[i]))) valid = false;
+                }
+                if (!valid) {
+                    ++signature_failures;
+                    if (first_bad_batch.empty()) first_bad_batch = bid;
+                    AF_LOG_ERROR("验签失败: host=" << host_id << " batch=" << bid
+                                       << " signature_present=" << (!sig.empty()));
+                    (void)append_alert(cfg_, host_id, "auditforwarder", "critical",
+                                        "signature_invalid",
+                                        "批次签名校验失败 batch=" + bid,
+                                        summary);
+                    continue;
+                }
+                batch_events += static_cast<u64>(json_size_field(summary, "event_count", 0));
+            }
+        } else {
+            // 未配置验签密钥：无法建立防篡改闭环，仅在纯测试/无签名部署允许，明确提示。
+            AF_LOG_WARN("manager: chain_hmac_key 未配置，跳过 audit-summaries 验签（host=" << host_id << "）");
+            for (const auto& summary : json_object_array_field(body, "summaries")) {
+                batch_events += static_cast<u64>(json_size_field(summary, "event_count", 0));
+            }
         }
         if (batch_events > 0) {
             g_remote_events_collected.fetch_add(batch_events, std::memory_order_relaxed);
@@ -2457,6 +2604,9 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         o << "{\n"
           << "  \"accepted\": true,\n"
           << "  \"host_id\": \"" << json_escape(host_id) << "\",\n"
+          << "  \"signature_verified\": " << (cfg_.chain_hmac_key.empty() ? "false" : "true") << ",\n"
+          << "  \"signature_failures\": " << signature_failures << ",\n"
+          << "  \"first_invalid_batch\": \"" << json_escape(first_bad_batch) << "\",\n"
           << "  \"storage\": \"" << json_escape(fs::join(audit_summary_dir(cfg_), host_id + ".jsonl")) << "\",\n"
           << "  \"retention\": \"last 5000 summary records per host\"\n"
           << "}";

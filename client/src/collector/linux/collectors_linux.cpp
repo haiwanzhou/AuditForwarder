@@ -10,6 +10,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
@@ -464,13 +465,204 @@ private:
     bool running_ { false };
 };
 #else
+// =========================================================================
+// LinuxAuditCollector（无 libaudit 兜底实现）
+//
+// 编译环境缺少 audit 用户态库（audit_open/audit_get_reply）时，退化为
+// “tail -F /var/log/audit/audit.log”：直接尾随 auditd 守护进程写出的文本日志。
+// 语义、事件分类与 libaudit 版保持一致，采集器名称同为 audit_linux，
+// Web 开关与后续规则无需区分两种实现。文件轮转（rename/rotate）也能跟踪。
+// =========================================================================
 class LinuxAuditCollector : public Collector {
 public:
-    Result<void> start(Agent&) override { return Result<void>::ok(); }
-    void stop() override {}
+    Result<void> start(Agent& agent) override {
+        agent_ = &agent;
+        running_ = true;
+        // 允许用环境变量覆盖日志位置（测试或定制发行版）。
+        if (const char* env_path = std::getenv("AF_AUDIT_LOG_FILE")) {
+            if (env_path[0] != '\0') log_path_override_ = env_path;
+        }
+        thr_ = std::thread([this] { loop(); });
+        AF_LOG_INFO("audit: libaudit 不可用，使用 audit.log 尾随兜底采集器");
+        return Result<void>::ok();
+    }
+    void stop() override {
+        running_ = false;
+        if (thr_.joinable()) thr_.join();
+    }
     std::string  name()   const override { return "audit_linux"; }
     EventCategory category() const override { return EventCategory::Syscall; }
-    bool         is_running() const override { return false; }
+    bool         is_running() const override { return running_; }
+
+private:
+    static std::string audit_log_path() {
+        const char* candidates[] = {
+            "/var/log/audit/audit.log",
+            "/var/log/audit.log",
+        };
+        struct stat st {};
+        for (const char* p : candidates) {
+            if (::stat(p, &st) == 0 && S_ISREG(st.st_mode)) return p;
+        }
+        return candidates[0];  // 即使不存在也返回首选路径，循环中会等待文件出现
+    }
+
+    // 解析 audit 文本日志中的 key=value（含引号包裹值）。
+    static std::map<std::string, std::string> parse_fields(const std::string& line) {
+        std::map<std::string, std::string> kv;
+        std::size_t i = line.find(": ");  // 跳过 "type=X msg=audit(...) : " 头部
+        if (i == std::string::npos) i = 0;
+        while (i < line.size()) {
+            while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+            std::size_t ks = i;
+            while (i < line.size() && line[i] != '=' && line[i] != ' ') ++i;
+            if (i >= line.size() || line[i] != '=') break;
+            std::string key = line.substr(ks, i - ks);
+            ++i;  // 跳过 '='
+            std::string val;
+            if (i < line.size() && line[i] == '"') {
+                ++i;
+                std::string raw;
+                while (i < line.size() && line[i] != '"') {
+                    if (line[i] == '\\' && i + 1 < line.size()) raw += line[++i];
+                    else raw += line[i];
+                    ++i;
+                }
+                ++i;  // 跳过结束引号
+                val = raw;
+            } else {
+                std::size_t start = i;
+                while (i < line.size() && line[i] != ' ') ++i;
+                val = line.substr(start, i - start);
+            }
+            if (!key.empty()) kv[key] = val;
+        }
+        return kv;
+    }
+
+    void dispatch_line(const std::string& line) {
+        if (line.empty()) return;
+        std::string type;
+        std::size_t tp = line.find("type=");
+        if (tp != std::string::npos) {
+            for (std::size_t i = tp + 5; i < line.size() && line[i] != ' ' && line[i] != '='; ++i) type += line[i];
+        }
+        auto f = parse_fields(line);
+        AuditEvent ev;
+        ev.message = line;
+        ev.category = EventCategory::Syscall;
+        auto it_pid = f.find("pid");
+        if (it_pid != f.end()) ev.actor.pid = static_cast<u32>(std::stoul(it_pid->second.c_str()));
+        auto uid = f.find("uid");
+        if (uid != f.end()) ev.actor.user = uid->second;
+        if (f.count("acct")) ev.actor.user = f["acct"];
+        if (f.count("comm")) ev.actor.name = f["comm"];
+        if (f.count("exe")) ev.actor.path = f["exe"];
+        if (f.count("name")) ev.target.path = f["name"];
+        if (f.count("res")) ev.outcome = f["res"] == "success" ? EventOutcome::Success : EventOutcome::Failure;
+        else ev.outcome = EventOutcome::Unknown;
+
+        if (type == "EXECVE") {
+            ev.category = EventCategory::Command;
+            ev.action   = EventAction::Execute;
+            // 重组命令行：a0="cmd" a1="arg1" ...
+            std::string cmd;
+            for (int idx = 0;; ++idx) {
+                auto a = f.find("a" + std::to_string(idx));
+                if (a == f.end()) break;
+                if (idx) cmd += ' ';
+                cmd += a->second;
+            }
+            ev.command = cmd;
+        } else if (type == "PATH") {
+            ev.category = EventCategory::File;
+            ev.action   = EventAction::Read;
+        } else if (type == "USER_CMD" || type == "USER_START" || type == "USER_END") {
+            ev.category = EventCategory::Process;
+            ev.action   = EventAction::Execute;
+        } else if (type == "USER_AUTH" || type == "USER_LOGIN" || type == "USER_ERR") {
+            ev.category = EventCategory::Auth;
+            ev.action   = ev.outcome == EventOutcome::Failure ? EventAction::AuthFail : EventAction::Login;
+        } else if (type == "CRED_REFR" || type == "CRED_ACQ" ||
+                   type == "ROLE_ADD"  || type == "ROLE_ASSIGN" || type == "ROLE_REM" || type == "ROLE_DEL") {
+            ev.category = EventCategory::Privilege;
+            ev.action   = EventAction::PrivilegeEsc;
+        } else if (type == "SYSCALL") {
+            ev.category = EventCategory::Syscall;
+            ev.command  = f.count("comm") ? f["comm"] : "";
+        }
+        logmeta::tag_collector(ev, logmeta::collector::kAuditLinux);
+        ev.attrs["source"] = "audit_log_tail";
+        if (agent_) agent_->submit(ev);
+    }
+
+    bool open_locked() {
+        close_locked();
+        fp_ = std::fopen(path_.c_str(), "rb");
+        if (!fp_) return false;
+        if (::stat(path_.c_str(), &st_) != 0) return true;
+        // 首次打开从文件末尾开始（tail 语义），不回放历史。
+        std::fseek(fp_, 0, SEEK_END);
+        offset_ = std::ftell(fp_);
+        return true;
+    }
+    void close_locked() {
+        if (fp_) { std::fclose(fp_); fp_ = nullptr; }
+    }
+
+    void loop() {
+        path_ = log_path_override_.empty() ? audit_log_path() : log_path_override_;
+        bool warned_missing = false;
+        std::string partial;
+        while (running_) {
+            if (!fp_) {
+                if (open_locked()) {
+                    AF_LOG_INFO("audit: 开始尾随 " << path_);
+                    warned_missing = false;
+                } else if (!warned_missing) {
+                    AF_LOG_WARN("audit: 无法打开 " << path_ << "（可能需要 root 权限或文件尚未生成），稍后重试");
+                    warned_missing = true;
+                }
+            }
+            if (fp_) {
+                // 轮转检测：inode 变化或文件被截断。
+                struct stat cur {};
+                if (::stat(path_.c_str(), &cur) != 0 || cur.st_ino != st_.st_ino ||
+                    cur.st_size < offset_) {
+                    AF_LOG_INFO("audit: 检测到日志轮转/截断，重新打开 " << path_);
+                    if (open_locked()) partial.clear();
+                }
+            }
+            if (fp_) {
+                char buf[64 * 1024];
+                // fread 返回读取的字节数：size=1, count=buf_size 才能按字节计数
+                std::size_t n = std::fread(buf, 1, sizeof(buf), fp_);
+                if (n > 0) {
+                    offset_ += static_cast<long>(n);
+                    partial.append(buf, n);
+                    while (true) {
+                        auto pos = partial.find('\n');
+                        if (pos == std::string::npos) break;
+                        dispatch_line(partial.substr(0, pos));
+                        partial.erase(0, pos + 1);
+                    }
+                }
+            }
+            for (int i = 0; i < 5 && running_; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        close_locked();
+    }
+
+    Agent*       agent_ { nullptr };
+    std::thread  thr_;
+    bool         running_ { false };
+    std::string  log_path_override_;
+    std::string  path_;
+    FILE*        fp_ { nullptr };
+    long         offset_ { 0 };
+    struct stat  st_ {};
 };
 #endif
 

@@ -84,6 +84,9 @@ public:
 
     // 从文件加载规则（JSON 或 YAML）
     Result<void> load_rules(const std::string& path);
+    // 直接从 JSON/YAML 文本加载规则（供服务端远程热加载，无需本地文件）。
+    // 兼容两种规则格式：客户端原生格式与服务端简化格式（operation_type/keyword/severity）。
+    Result<void> load_rules_string(const std::string& content);
     Result<void> add_rule(const Rule& r);
     void clear_rules();
     std::size_t rule_count() const;

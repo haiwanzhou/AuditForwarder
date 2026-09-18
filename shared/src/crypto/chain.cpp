@@ -39,9 +39,11 @@ void Chain::start() {
         fs::create_directories(cfg_.data_dir + "/batches");
     }
     if (!has_signer_ && !has_hmac_) {
-        // Default: use HMAC with a machine-derived key
-        hmac_key_ = "auditforwarder-default-" + proc_hostname();
-        has_hmac_ = true;
+        // 安全红线：绝不使用任何硬编码/机器派生的弱默认密钥。
+        // 未配置签名私钥或 HMAC 密钥时，批次保持“无签名”状态；
+        // 服务端在配置了验签密钥的情况下会拒绝这类批次（只记录不告警的部署除外）。
+        AF_LOG_WARN("chain: 未配置任何签名密钥（chain.signer_key / chain.hmac_key），"
+                      "批次将不签名；生产环境必须配置共享 HMAC 密钥，否则服务端验签会失败");
     }
 }
 
@@ -93,7 +95,9 @@ EventBatch Chain::build_batch(std::vector<AuditEvent>&& events) {
     b.merkle_root = tree.root_hex();
 
     // 签名
-    std::string payload = b.id + "|" + std::to_string(b.created_at.time_since_epoch().count()) + "|" + b.merkle_root;
+    // 使用微秒粒度（与 audit-summary 中 created_at_us 字段一致），保证服务端验签 payload 与客户端签名 payload 完全相同。
+    auto sig_us = std::chrono::duration_cast<std::chrono::microseconds>(b.created_at.time_since_epoch()).count();
+    std::string payload = b.id + "|" + std::to_string(sig_us) + "|" + b.merkle_root;
     if (has_signer_) {
         auto sig = signer_.sign(ByteBuffer(payload.begin(), payload.end()));
         b.signature = crypto::to_hex(sig);
@@ -186,13 +190,17 @@ Result<std::vector<EventBatch>> Chain::recent_batches(std::size_t n) const {
 
 bool Chain::verify_batch(const EventBatch& b, const std::string& hmac_key) {
     if (hmac_key.empty()) return false;
-    std::string payload = b.id + "|" + std::to_string(b.created_at.time_since_epoch().count()) + "|" + b.merkle_root;
+    // 与 build_batch 签名 payload 保持一致：微秒粒度
+    auto verify_us = std::chrono::duration_cast<std::chrono::microseconds>(b.created_at.time_since_epoch()).count();
+    std::string payload = b.id + "|" + std::to_string(verify_us) + "|" + b.merkle_root;
     return b.signature == crypto::hmac_sha256_hex(hmac_key, payload);
 }
 
 bool Chain::verify_batch_with_key(const EventBatch& b, const crypto::KeyPair& kp) {
     if (!kp.is_valid()) return false;
-    std::string payload = b.id + "|" + std::to_string(b.created_at.time_since_epoch().count()) + "|" + b.merkle_root;
+    // 与 build_batch 签名 payload 保持一致：微秒粒度
+    auto verify_us = std::chrono::duration_cast<std::chrono::microseconds>(b.created_at.time_since_epoch()).count();
+    std::string payload = b.id + "|" + std::to_string(verify_us) + "|" + b.merkle_root;
     return kp.verify(ByteBuffer(payload.begin(), payload.end()),
                      crypto::from_hex(b.signature));
 }

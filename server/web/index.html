@@ -50,7 +50,8 @@
         <a href="#config" class="nav-link">配置中心</a>
         <a href="#batches" class="nav-link">证据批次</a>
         <a href="#hosts" class="nav-link">主机管理</a>
-        <a href="#security-monitor" class="nav-link">日志与告警</a>
+        <a href="#collector-control" class="nav-link">采集器控制</a>
+        <a href="#security-mon" class="nav-link">日志与告警</a>
         <a href="#log-policy" class="nav-link">日志策略</a>
         <a href="#operation-records" class="nav-link">操作记录</a>
         <a href="#actions" class="nav-link">运维操作</a>
@@ -243,6 +244,43 @@
             <span class="muted" id="hostHistoryTitle">请选择主机查看集中历史数据</span>
           </div>
           <pre id="hostHistoryOutput" class="text-output">可查看资源指标、审计摘要和命令执行结果。</pre>
+        </div>
+      </section>
+
+      <section id="collector-control" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Collector Control</p>
+            <h3>采集器开关与违规规则统一下发</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshCollectorBtn" class="button ghost small">刷新主机状态</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <label class="field">
+            <span>目标主机</span>
+            <select id="collectorHostSelect">
+              <option value="">-- 请选择主机 --</option>
+            </select>
+          </label>
+          <p class="muted">开关状态来自该主机最近一次心跳上报；点击开关后，指令经 <code>/remote/control</code> 加密队列下发，客户端下次轮询（默认约 10 秒）生效，刷新页面可看到最新心跳状态。</p>
+          <div id="collectorToggleList" class="collector-toggle-list">
+            <div class="empty-state"><strong>请选择在线主机</strong><p>主机心跳会携带各采集器（file/process/network/command/etw…）的运行状态。</p></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <strong>违规规则（服务端单一事实来源，客户端热加载）</strong>
+            <button id="loadViolationRulesBtn" class="button ghost small">加载当前规则</button>
+            <button id="saveViolationRulesBtn" class="button small">保存规则</button>
+            <button id="pushRulesAllBtn" class="button danger small">下发到全部主机</button>
+            <button id="pushRulesHostBtn" class="button danger small">仅下发到上方主机</button>
+          </div>
+          <textarea id="violationRulesEditor" class="rules-editor" rows="12" placeholder="点击“加载当前规则”读取服务端 violation_rules.json；保存后可统一下发，客户端无需重启即热加载。"></textarea>
+          <p id="rulesPushNote" class="muted">下发使用 <code>load_rules</code> 远程命令，要求客户端 allowed_commands 已放行该命令。</p>
         </div>
       </section>
 

@@ -1046,6 +1046,99 @@ a:focus-visible {
   font-size: 13px;
 }
 
+/* ---- 采集器控制 ---- */
+.collector-toggle-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+.collector-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+.collector-row strong {
+  display: block;
+  color: #1e293b;
+  font-size: 14px;
+  margin-bottom: 2px;
+}
+.collector-row code {
+  color: #1d4ed8;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+.collector-row .switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.collector-row .switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.collector-row .slider {
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  position: relative;
+  transition: background 0.18s ease;
+  flex: 0 0 auto;
+}
+.collector-row .slider::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.3);
+  transition: transform 0.18s ease;
+}
+.collector-row .switch input:checked + .slider {
+  background: var(--primary);
+}
+.collector-row .switch input:checked + .slider::after {
+  transform: translateX(18px);
+}
+.collector-row .switch input:focus-visible + .slider {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+}
+.switch-state {
+  font-size: 13px;
+  color: #475569;
+  min-width: 52px;
+  text-align: right;
+}
+.rules-editor {
+  width: 100%;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #1e293b;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
 .empty-cell {
   color: var(--muted);
   text-align: center !important;
