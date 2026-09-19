@@ -76,11 +76,11 @@ http://10.4.122.141:8443/
 本地测试登录：
 
 ```text
-账号：admin
-密码：admin123
+账号：取配置文件中的 manager.login_username
+密码：manager.login_password_sha256 对应的明文密码（请自行设置）
 ```
 
-生产环境请修改默认账号密码并启用 HTTPS/TLS。
+生产环境请务必修改默认账号密码并启用 HTTPS/TLS。
 
 ## 文档
 

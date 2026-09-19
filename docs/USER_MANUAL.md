@@ -144,7 +144,7 @@ http://10.4.122.141:8443/
 
 ```text
 账号：admin
-密码：admin123
+密码：<你设置的密码>
 ```
 
 界面模块包括：
@@ -313,10 +313,10 @@ config/agent.yaml
 manager:
   enabled: true
   listen: 0.0.0.0:8443
-  auth_token: "test-token-12345"
+  auth_token: "<你的auth_token>"
   login_username: "admin"
-  login_password_sha256: "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
-  enrollment_key: "specific_key"
+  login_password_sha256: "<你的密码SHA256哈希，请自行生成>"
+  enrollment_key: "<你的注册密钥>"
 ```
 
 字段说明：
@@ -404,7 +404,7 @@ remote:
   servers:
     - "http://127.0.0.1:8443"
   host_id: "test-agent-001"
-  enrollment_key: "specific_key"
+  enrollment_key: "<你的注册密钥>"
   allowed_commands:
     - collect_status
     - echo
@@ -518,7 +518,7 @@ Get-Process auditforwarderd,auditforwarder-server,auditforwarder-client -ErrorAc
 
 ```text
 账号：admin
-密码：admin123
+密码：<你设置的密码>
 ```
 
 登录成功后，服务端会签发会话 Token，浏览器会自动保存并进入控制台。
@@ -625,7 +625,7 @@ http://127.0.0.1:9000/auditforwarderd.exe
 调试 Token：
 
 ```text
-test-token-12345
+<你的auth_token>
 ```
 
 Token 会保存在当前浏览器，用于访问需要认证的接口。
@@ -660,7 +660,7 @@ GET  /alerts        查看违规告警
 ```powershell
 $body = @{
   username = "admin"
-  password_sha256 = "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+  password_sha256 = "<你的密码SHA256哈希，请自行生成>"
 } | ConvertTo-Json
 
 $login = Invoke-RestMethod `
@@ -682,7 +682,7 @@ Invoke-RestMethod `
 调试环境也可以继续使用固定管理 Token：
 
 ```text
-Authorization: Bearer test-token-12345
+Authorization: Bearer <你的auth_token>
 ```
 
 ---
@@ -768,7 +768,7 @@ README.md               脚本使用说明
 测试 Token：
 
 ```text
-test-token-12345
+<你的auth_token>
 ```
 
 生产环境不要使用简单 Token，也不要继续使用默认测试账号密码。
@@ -785,7 +785,7 @@ AF-prod-2026-long-random-secret
 
 ```text
 账号：admin
-密码：admin123
+密码：<你设置的密码>
 ```
 
 生产环境应修改 `manager.login_username` 和 `manager.login_password_sha256`，并启用 HTTPS/TLS。
@@ -926,13 +926,13 @@ $env:MSYS2_ROOT\usr\bin\make.exe -C build -j4
 
 ```text
 刷新页面
-输入账号 admin 和密码 admin123
+输入账号 admin 和密码 <你设置的密码>
 ```
 
 PowerShell 操作：
 
 ```powershell
--Headers @{"Authorization"="Bearer test-token-12345"}
+-Headers @{"Authorization"="Bearer <你的auth_token>"}
 ```
 
 如果连续登录失败 3 次，需要等待 15 分钟或重启服务端清空内存锁定状态。
@@ -1111,7 +1111,7 @@ Issue 地址：请在正式交付时填写
 1. 构建项目
 2. 启动 auditforwarder-server.exe
 3. 打开 http://127.0.0.1:8443/
-4. 使用 admin / admin123 登录
+4. 使用 admin / <你设置的密码> 登录
 5. 启动 auditforwarder-client.exe
 6. 查看主机管理页面，确认 test-agent-001 在线
 7. 查看运行概览、日志与告警

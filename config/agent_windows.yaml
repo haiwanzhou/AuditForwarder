@@ -24,7 +24,7 @@ chain:
   batch_size: 10
   sign_batches: false
   auto_persist: true
-  hmac_key: "test-hmac-key-12345"
+  hmac_key: ""                      # 防篡改验签密钥，请自行配置（非空时客户端按此签名）
 
 # ---------------------------------------------------------------------------
 # 传输（暂时禁用，避免连接失败）
@@ -35,7 +35,7 @@ transport:
   interval_sec: 60
   compress: false
   encrypt_payload: false
-  auth_token: "test-token-12345"
+  auth_token: ""
   verify_tls: false
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ remote:
   production_mode: false
   require_tls: false
   crl_check: false
-  enrollment_key: "specific_key"
+  enrollment_key: ""
   allowed_commands:
     - collect_status
     - echo
@@ -81,8 +81,8 @@ self_protect:
 manager:
   enabled: true
   listen: 127.0.0.1:8443
-  auth_token: "test-token-12345"
-  enrollment_key: "specific_key"
+  auth_token: ""
+  enrollment_key: ""
   use_tls: false
   require_client_cert: false
   tls_crl_check: false

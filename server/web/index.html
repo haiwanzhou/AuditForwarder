@@ -32,7 +32,7 @@
           <button id="loginSubmitBtn" class="button primary" type="submit">登录</button>
         </div>
       </form>
-      <p class="login-note">本地调试账号：<code>admin</code>，密码：<code>admin123</code>。生产环境请修改配置并启用 HTTPS/TLS。</p>
+      <p class="login-note">登录账号与密码由配置文件 <code>manager.login_username</code> / <code>manager.login_password_sha256</code> 设置，首次部署请自行配置并启用 HTTPS/TLS。</p>
     </div>
   </section>
 
@@ -50,6 +50,7 @@
         <a href="#config" class="nav-link">配置中心</a>
         <a href="#batches" class="nav-link">证据批次</a>
         <a href="#hosts" class="nav-link">主机管理</a>
+        <a href="#enroll" class="nav-link">主机接入</a>
         <a href="#collector-control" class="nav-link">采集器控制</a>
         <a href="#security-mon" class="nav-link">日志与告警</a>
         <a href="#log-policy" class="nav-link">日志策略</a>
@@ -244,6 +245,35 @@
             <span class="muted" id="hostHistoryTitle">请选择主机查看集中历史数据</span>
           </div>
           <pre id="hostHistoryOutput" class="text-output">可查看资源指标、审计摘要和命令执行结果。</pre>
+        </div>
+      </section>
+
+      <section id="enroll" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Enrollment</p>
+            <h3>主机接入（一键生成客户端配置）</h3>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="host-form compact">
+            <label class="field">
+              <span>新主机名称</span>
+              <input id="enrollHostName" placeholder="例如：office-pc-02">
+            </label>
+            <label class="field">
+              <span>服务端地址（IP:端口）</span>
+              <input id="enrollServerAddr" placeholder="已自动填充当前访问地址，可修改">
+            </label>
+            <div class="form-actions">
+              <button id="generateEnrollBtn" class="button primary small">生成接入包</button>
+            </div>
+          </div>
+          <p class="muted">
+            点击生成后会自动下载 <code>client_windows_&lt;主机ID&gt;.yaml</code>，同时该主机以「离线」状态登记到主机管理列表。
+            将下载的文件复制到新电脑客户端目录的 <code>config/client_windows.yaml</code>（替换原文件），启动客户端后自动注册上线，全程无需修改任何代码。
+          </p>
+          <pre id="enrollResult" class="text-output hidden"></pre>
         </div>
       </section>
 

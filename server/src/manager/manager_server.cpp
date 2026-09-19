@@ -2304,6 +2304,128 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         }
         return hosts_response_json(list, cfg_);
     }
+    // 一键生成客户端接入包：Web 控制台填写主机名即可下载预填好的 client_windows.yaml，
+    // 新电脑放置该配置后启动客户端即自动注册上线，无需手工修改配置文件。
+    // 请求体：{"host_name":"...","server_addr":"ip:port","use_tls":false}
+    // server_addr 由前端取当前浏览器访问地址（服务端自身无法得知对外 IP）。
+    if (path == "/hosts/enrollment-package" && method == "POST") {
+        content_type = "application/json; charset=utf-8";
+        auto host_name = json_string_field(body, "host_name");
+        auto server_addr = json_string_field(body, "server_addr");
+        bool use_tls = json_bool_field(body, "use_tls", false);
+        if (host_name.empty()) {
+            status = 422;
+            return "{\n  \"error\": \"host_name required\"\n}";
+        }
+        if (host_name.size() > 80) host_name.resize(80);
+        if (server_addr.empty()) server_addr = cfg_.listen;  // 兜底：前端未传时用监听地址
+        // 生成唯一 host_id：前缀 + 随机十六进制，避免与已注册主机冲突
+        auto host_id = "agent-" + crypto::random_hex(4);
+        const std::string scheme = use_tls ? "https" : "http";
+
+        std::ostringstream yaml;
+        yaml << "# AuditForwarder - 客户端接入配置（由服务端 Web 控制台一键生成）\n"
+             << "# 主机名称: " << host_name << "\n"
+             << "# 生成时间: " << iso_time(epoch_seconds()) << "\n"
+             << "# 使用方法: 将本文件放到客户端目录 config/client_windows.yaml 后启动客户端\n\n"
+             << "agent:\n"
+             << "  id: \"" << host_id << "\"\n"
+             << "  data_dir: data/client\n"
+             << "  config_path: config/client_windows.yaml\n\n"
+             << "log:\n"
+             << "  level: info\n"
+             << "  file: data/client/client.log\n"
+             << "  max_bytes: 52428800\n"
+             << "  max_backups: 5\n\n"
+             << "chain:\n"
+             << "  batch_size: 10\n"
+             << "  sign_batches: false\n"
+             << "  auto_persist: true\n"
+             << "  hmac_key: \"" << cfg_.chain_hmac_key << "\"\n\n"
+             << "transport:\n"
+             << "  servers:\n"
+             << "    - \"" << scheme << "://" << server_addr << "/ingest?agent=" << host_id << "\"\n"
+             << "  mode: realtime\n"
+             << "  interval_sec: 5\n"
+             << "  compress: true\n"
+             << "  encrypt_payload: false\n"
+             << "  auth_token: \"" << cfg_.auth_token << "\"\n"
+             << "  verify_tls: false\n\n"
+             << "remote:\n"
+             << "  enabled: true\n"
+             << "  servers:\n"
+             << "    - \"" << scheme << "://" << server_addr << "\"\n"
+             << "  host_id: \"" << host_id << "\"\n"
+             << "  heartbeat_interval_sec: 5\n"
+             << "  command_poll_interval_sec: 3\n"
+             << "  audit_summary_interval_sec: 5\n"
+             << "  production_mode: false\n"
+             << "  require_tls: " << (use_tls ? "true" : "false") << "\n"
+             << "  crl_check: false\n"
+             << "  enrollment_key: \"" << cfg_.enrollment_key << "\"\n"
+             << "  allowed_commands:\n"
+             << "    - collect_status\n"
+             << "    - echo\n"
+             << "    - set_collector\n"
+             << "    - set_collectors\n"
+             << "    - load_rules\n\n"
+             << "detector:\n"
+             << "  rules_path: config/rules.yaml\n"
+             << "  enable_behavior_baseline: true\n\n"
+             << "self_protect:\n"
+             << "  enabled: false\n\n"
+             << "manager:\n"
+             << "  enabled: false\n"
+             << "  auth_token: \"" << cfg_.auth_token << "\"\n\n"
+             << "collectors:\n"
+             << "  enabled: true\n\n"
+             << "privilege_detect:\n"
+             << "  enabled: true\n\n"
+             << "test_injection:\n"
+             << "  enabled: false\n"
+             << "  interval_ms: 1000\n\n"
+             << "processors:\n"
+             << "  - type: enricher\n"
+             << "  - type: pii_masker\n"
+             << "  - type: deduper\n"
+             << "    window_ms: 50\n";
+
+        // 预登记主机（离线状态）：管理员生成后即可在主机列表看到，客户端首次心跳自动转在线
+        bool pre_registered = false;
+        {
+            std::lock_guard<std::mutex> lk(host_store_mutex());
+            auto hosts_r = load_hosts(cfg_);
+            if (hosts_r.is_ok()) {
+                auto list = hosts_r.value();
+                bool exists = false;
+                for (const auto& h : list) {
+                    if (h.id == host_id) { exists = true; break; }
+                }
+                if (!exists && (cfg_.max_host_count == 0 || list.size() < cfg_.max_host_count)) {
+                    HostRecord rec;
+                    rec.id = host_id;
+                    rec.name = host_name;
+                    rec.network_status = "offline";
+                    rec.permissions = {"status_view"};
+                    auto issues = validate_host_record(rec, false);
+                    if (issues.empty()) {
+                        list.push_back(std::move(rec));
+                        pre_registered = save_hosts(cfg_, list).is_ok();
+                    }
+                }
+            }
+        }
+
+        std::ostringstream o;
+        o << "{\n"
+          << "  \"host_id\": \"" << json_escape(host_id) << "\",\n"
+          << "  \"host_name\": \"" << json_escape(host_name) << "\",\n"
+          << "  \"file_name\": \"client_windows_" << json_escape(host_id) << ".yaml\",\n"
+          << "  \"pre_registered\": " << (pre_registered ? "true" : "false") << ",\n"
+          << "  \"yaml\": \"" << json_escape(yaml.str()) << "\"\n"
+          << "}";
+        return o.str();
+    }
     if ((path == "/hosts/heartbeat" || path == "/hosts/register") && method == "POST") {
         content_type = "application/json; charset=utf-8";
         if (!enrollment_key_valid(cfg_, body)) {

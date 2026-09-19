@@ -51,3 +51,6 @@ vcpkg_installed/
 .DS_Store
 Thumbs.db
 *.zip
+
+# 本地临时依赖目录
+$zlibInstall/

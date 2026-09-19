@@ -178,11 +178,8 @@ target_link_libraries(auditforwarder-client PRIVATE auditforwarder_core)
 add_executable(auditforwarder-server server/src/server_main.cpp)
 target_link_libraries(auditforwarder-server PRIVATE auditforwarder_core)
 
-if(AF_PLATFORM_WINDOWS)
-    set_target_properties(auditforwarderd PROPERTIES WIN32_EXECUTABLE TRUE)
-    set_target_properties(auditforwarder-client PROPERTIES WIN32_EXECUTABLE TRUE)
-    set_target_properties(auditforwarder-server PROPERTIES WIN32_EXECUTABLE TRUE)
-endif()
+# 注意：保持控制台子系统（不设 WIN32_EXECUTABLE），服务端/客户端的运行日志
+# 直接输出在控制台窗口（小黑窗口），监视线程的上下线告警也打印在这里。
 
 install(TARGETS auditforwarderd auditforwarder-client auditforwarder-server
     RUNTIME DESTINATION bin

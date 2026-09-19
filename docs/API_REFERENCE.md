@@ -29,7 +29,7 @@ Authorization: Bearer <manager.auth_token>
 ```json
 {
   "username": "admin",
-  "password_sha256": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+  "password_sha256": "<你的密码SHA256哈希，请自行生成>"
 }
 ```
 
@@ -115,7 +115,7 @@ data/server/login_audit.jsonl
   "hardware": "cpu_threads=8",
   "os_version": "Windows 11",
   "network_status": "online",
-  "enrollment_key": "specific_key",
+  "enrollment_key": "<你的注册密钥>",
   "cpu_usage_percent": 25,
   "memory_usage_percent": 63,
   "permissions": ["collect_status", "echo"]

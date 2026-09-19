@@ -96,6 +96,10 @@ const els = {
   remoteCommandType: $("remoteCommandType"),
   remotePayload: $("remotePayload"),
   sendRemoteCommandBtn: $("sendRemoteCommandBtn"),
+  enrollHostName: $("enrollHostName"),
+  enrollServerAddr: $("enrollServerAddr"),
+  generateEnrollBtn: $("generateEnrollBtn"),
+  enrollResult: $("enrollResult"),
   actorIdentity: $("actorIdentity"),
   operationRecordList: $("operationRecordList"),
   operationRecordJson: $("operationRecordJson"),
@@ -1211,6 +1215,76 @@ async function deleteHost(hostId) {
   }
 }
 
+async function generateEnrollmentPackage() {
+  const hostName = els.enrollHostName.value.trim();
+  if (!hostName) {
+    showNotice("请先填写新主机名称。", "error");
+    return;
+  }
+  const serverAddr = els.enrollServerAddr.value.trim() || window.location.host;
+  if (!serverAddr) {
+    showNotice("无法确定服务端地址，请手动填写。", "error");
+    return;
+  }
+  const useTls = window.location.protocol === "https:";
+  const done = setLoading(els.generateEnrollBtn, "生成中...");
+  try {
+    const text = await request("/hosts/enrollment-package", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ host_name: hostName, server_addr: serverAddr, use_tls: useTls }),
+      timeoutMs: 15000,
+    });
+    const data = parseJson(text, null);
+    if (!data || !data.yaml || !data.host_id) throw new Error("服务端返回内容异常。");
+    // 触发浏览器下载生成的 YAML
+    const blob = new Blob([data.yaml], { type: "application/x-yaml" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = data.file_name || `client_windows_${data.host_id}.yaml`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    els.enrollResult.classList.remove("hidden");
+    els.enrollResult.textContent =
+      `已生成主机：${data.host_id}（${data.host_name}）\n` +
+      `配置文件已下载：${data.file_name}\n` +
+      `主机已登记到主机管理列表${data.pre_registered ? "（离线状态）" : "（登记失败，客户端首次连接时仍会自动注册）"}\n\n` +
+      `部署步骤：\n` +
+      `1. 将下载的 YAML 文件复制到新电脑客户端目录，重命名为 config/client_windows.yaml（替换原文件）；\n` +
+      `2. 启动 auditforwarder-client.exe；\n` +
+      `3. 客户端自动注册并上线，可在「主机管理」页面查看。`;
+    showNotice(`接入包已生成：${data.host_id}`);
+    recordOperation({
+      object: data.host_id,
+      type: "generate_enrollment_package",
+      details: `为主机「${data.host_name}」生成客户端接入包`,
+      status: "success",
+    });
+    // 刷新主机列表，展示预登记的新主机
+    try {
+      const hostsText = await request("/hosts", { timeoutMs: 8000 });
+      state.lastRenderedHostsKey = "";
+      renderHosts(parseJson(hostsText, { hosts: [] }));
+    } catch {
+      // 列表刷新失败不影响主流程
+    }
+  } catch (err) {
+    showNotice(err.message, "error");
+    recordOperation({
+      object: hostName,
+      type: "generate_enrollment_package",
+      details: `为主机「${hostName}」生成客户端接入包失败`,
+      status: "failure",
+      error: err,
+    });
+  } finally {
+    done();
+  }
+}
+
 async function sendRemoteCommand() {
   if (!validateFields(["remoteHostId", "remotePayload"])) {
     recordOperation({
@@ -1554,6 +1628,13 @@ function init() {
   els.saveHostBtn.addEventListener("click", saveHost);
   els.resetHostFormBtn.addEventListener("click", resetHostForm);
   els.sendRemoteCommandBtn.addEventListener("click", sendRemoteCommand);
+  if (els.generateEnrollBtn) {
+    els.generateEnrollBtn.addEventListener("click", generateEnrollmentPackage);
+    // 服务端地址默认取当前浏览器访问地址（跨机部署时管理员正是通过该地址访问控制台）
+    if (els.enrollServerAddr && !els.enrollServerAddr.value) {
+      els.enrollServerAddr.value = window.location.host || "";
+    }
+  }
 
   // ---- 采集器控制 ----
   if (els.refreshCollectorBtn) els.refreshCollectorBtn.addEventListener("click", async () => {
