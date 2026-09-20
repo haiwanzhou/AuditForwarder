@@ -47,15 +47,6 @@ const els = {
   hostStatusFilter: $("hostStatusFilter"),
   hostHistoryTitle: $("hostHistoryTitle"),
   hostHistoryOutput: $("hostHistoryOutput"),
-  refreshCollectorBtn: $("refreshCollectorBtn"),
-  collectorHostSelect: $("collectorHostSelect"),
-  collectorToggleList: $("collectorToggleList"),
-  loadViolationRulesBtn: $("loadViolationRulesBtn"),
-  saveViolationRulesBtn: $("saveViolationRulesBtn"),
-  pushRulesAllBtn: $("pushRulesAllBtn"),
-  pushRulesHostBtn: $("pushRulesHostBtn"),
-  violationRulesEditor: $("violationRulesEditor"),
-  rulesPushNote: $("rulesPushNote"),
   refreshSecurityBtn: $("refreshSecurityBtn"),
   securitySummary: $("securitySummary"),
   alertList: $("alertList"),
@@ -96,10 +87,6 @@ const els = {
   remoteCommandType: $("remoteCommandType"),
   remotePayload: $("remotePayload"),
   sendRemoteCommandBtn: $("sendRemoteCommandBtn"),
-  enrollHostName: $("enrollHostName"),
-  enrollServerAddr: $("enrollServerAddr"),
-  generateEnrollBtn: $("generateEnrollBtn"),
-  enrollResult: $("enrollResult"),
   actorIdentity: $("actorIdentity"),
   operationRecordList: $("operationRecordList"),
   operationRecordJson: $("operationRecordJson"),
@@ -611,7 +598,6 @@ function renderHosts(data) {
   });
   if (renderKey === state.lastRenderedHostsKey) return;
   state.lastRenderedHostsKey = renderKey;
-  refreshCollectorHostSelect();
   if (hosts.length === 0) {
     els.hostList.innerHTML = `
       <div class="empty-state">
@@ -663,147 +649,6 @@ function renderHosts(data) {
       </div>
     </article>
   `).join("");
-}
-
-// ---- 采集器控制 ----
-const COLLECTOR_LABELS = {
-  file_win: "文件采集(Win)", process_win: "进程采集(Win)", network_win: "网络采集(Win)",
-  command_win: "命令行采集(Win)", registry_win: "注册表采集(Win)", etw_win: "ETW 安全日志(Win)",
-  file_linux: "文件采集(Linux)", process_linux: "进程采集(Linux)", network_linux: "网络采集(Linux)",
-  command_linux: "命令行采集(Linux)", audit_linux: "auditd 原生审计(Linux)", unknown: "未知采集器",
-};
-
-function collectorLabel(name) {
-  return COLLECTOR_LABELS[name] || name;
-}
-
-// 用最近一次主机列表刷新“目标主机”下拉框，尽量保留已选项。
-function refreshCollectorHostSelect() {
-  if (!els.collectorHostSelect) return;
-  const keep = els.collectorHostSelect.value;
-  const hosts = Array.isArray(state.hosts) ? state.hosts : [];
-  els.collectorHostSelect.innerHTML =
-    `<option value="">-- 请选择主机 --</option>` +
-    hosts.map((h) => {
-      const flag = h.online === false ? "（离线）" : "";
-      return `<option value="${escapeHtml(h.id)}">${escapeHtml(h.name || h.id)}${flag}</option>`;
-    }).join("");
-  if (keep && hosts.some((h) => h.id === keep)) els.collectorHostSelect.value = keep;
-  renderCollectorToggles();
-}
-
-function renderCollectorToggles() {
-  if (!els.collectorToggleList) return;
-  const hostId = els.collectorHostSelect.value;
-  if (!hostId) {
-    els.collectorToggleList.innerHTML =
-      '<div class="empty-state"><strong>请选择在线主机</strong><p>主机心跳会携带各采集器的运行状态。</p></div>';
-    return;
-  }
-  const host = (state.hosts || []).find((h) => h.id === hostId);
-  const collectors = host && Array.isArray(host.collectors) ? host.collectors : [];
-  if (!collectors.length) {
-    els.collectorToggleList.innerHTML =
-      '<div class="empty-state"><strong>暂无采集器心跳状态</strong>'
-      + '<p>该主机尚未上报采集器状态（旧版客户端或从未心跳）。请升级客户端后点击“刷新主机状态”。</p></div>';
-    return;
-  }
-  els.collectorToggleList.innerHTML = collectors.map((c) => {
-    const on = !!c.running;
-    return `
-      <div class="collector-row">
-        <div>
-          <strong>${escapeHtml(collectorLabel(c.name))}</strong>
-          <code>${escapeHtml(c.name)}</code>
-        </div>
-        <label class="switch">
-          <input type="checkbox" data-collector-name="${escapeHtml(c.name)}" data-host-id="${escapeHtml(host.id)}" ${on ? "checked" : ""}>
-          <span class="slider"></span>
-          <span class="switch-state">${on ? "运行中" : "已停止"}</span>
-        </label>
-      </div>`;
-  }).join("");
-}
-
-// 下发单个采集器开关（set_collector 远程命令）。
-async function sendCollectorToggle(hostId, name, enabled) {
-  const payload = JSON.stringify({ name, enabled });
-  try {
-    const text = await request("/remote/control", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ target_host_id: hostId, command_type: "set_collector", payload }),
-    });
-    const data = parseJson(text, {});
-    showNotice(`采集器 ${collectorLabel(name)} 已${enabled ? "开启" : "关闭"}指令已入队（${data.command_id || "已接受"}），约 10 秒内生效。`);
-    recordOperation({
-      object: hostId, type: "set_collector",
-      details: `采集器=${name}，期望状态=${enabled ? "运行" : "停止"}`,
-      status: "success",
-    });
-  } catch (err) {
-    showNotice(err.message, "error");
-    recordOperation({ object: hostId, type: "set_collector", details: `采集器=${name} 下发失败`, status: "failure", error: err });
-    throw err;
-  }
-}
-
-async function loadViolationRules() {
-  try {
-    const text = await request("/violation/rules");
-    els.violationRulesEditor.value = text;
-    showNotice("已加载服务端当前违规规则。");
-  } catch (err) {
-    showNotice(err.message, "error");
-  }
-}
-
-async function saveViolationRules() {
-  let body = els.violationRulesEditor.value.trim();
-  if (!body) return showNotice("规则内容为空，未保存。", "error");
-  try {
-    parseJson(body);  // 校验 JSON 合法性
-  } catch {
-    return showNotice("规则不是合法 JSON，无法保存。", "error");
-  }
-  try {
-    await request("/violation/rules", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body,
-    });
-    showNotice("违规规则已保存为服务端单一策略。");
-    recordOperation({ object: "violation_rules.json", type: "violation_rules_save", details: "保存违规规则", status: "success" });
-  } catch (err) {
-    showNotice(err.message, "error");
-  }
-}
-
-// 统一下发规则：target 为空表示全部主机。
-async function pushViolationRules(hostId) {
-  const scope = hostId ? `主机 ${hostId}` : "全部已注册主机";
-  const done = setLoading(els.pushRulesAllBtn, "下发中...");
-  const doneHost = setLoading(els.pushRulesHostBtn, "下发中...");
-  try {
-    const text = await request("/violation/rules/push", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify(hostId ? { host_id: hostId } : {}),
-    });
-    const data = parseJson(text, {});
-    showNotice(`违规规则已通过 load_rules 热加载下发到${scope}：${data.queued_count ?? 0} 台主机已入队。`);
-    recordOperation({
-      object: hostId || "*", type: "load_rules_push",
-      details: `违规规则热加载下发到${scope}，入队 ${data.queued_count ?? 0} 台`,
-      status: "success",
-    });
-  } catch (err) {
-    showNotice(err.message, "error");
-    recordOperation({ object: hostId || "*", type: "load_rules_push", details: `下发到${scope}失败`, status: "failure", error: err });
-  } finally {
-    done();
-    doneHost();
-  }
 }
 
 function parseJsonlLines(jsonl, limit = 10) {
@@ -1215,76 +1060,6 @@ async function deleteHost(hostId) {
   }
 }
 
-async function generateEnrollmentPackage() {
-  const hostName = els.enrollHostName.value.trim();
-  if (!hostName) {
-    showNotice("请先填写新主机名称。", "error");
-    return;
-  }
-  const serverAddr = els.enrollServerAddr.value.trim() || window.location.host;
-  if (!serverAddr) {
-    showNotice("无法确定服务端地址，请手动填写。", "error");
-    return;
-  }
-  const useTls = window.location.protocol === "https:";
-  const done = setLoading(els.generateEnrollBtn, "生成中...");
-  try {
-    const text = await request("/hosts/enrollment-package", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ host_name: hostName, server_addr: serverAddr, use_tls: useTls }),
-      timeoutMs: 15000,
-    });
-    const data = parseJson(text, null);
-    if (!data || !data.yaml || !data.host_id) throw new Error("服务端返回内容异常。");
-    // 触发浏览器下载生成的 YAML
-    const blob = new Blob([data.yaml], { type: "application/x-yaml" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = data.file_name || `client_windows_${data.host_id}.yaml`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-    els.enrollResult.classList.remove("hidden");
-    els.enrollResult.textContent =
-      `已生成主机：${data.host_id}（${data.host_name}）\n` +
-      `配置文件已下载：${data.file_name}\n` +
-      `主机已登记到主机管理列表${data.pre_registered ? "（离线状态）" : "（登记失败，客户端首次连接时仍会自动注册）"}\n\n` +
-      `部署步骤：\n` +
-      `1. 将下载的 YAML 文件复制到新电脑客户端目录，重命名为 config/client_windows.yaml（替换原文件）；\n` +
-      `2. 启动 auditforwarder-client.exe；\n` +
-      `3. 客户端自动注册并上线，可在「主机管理」页面查看。`;
-    showNotice(`接入包已生成：${data.host_id}`);
-    recordOperation({
-      object: data.host_id,
-      type: "generate_enrollment_package",
-      details: `为主机「${data.host_name}」生成客户端接入包`,
-      status: "success",
-    });
-    // 刷新主机列表，展示预登记的新主机
-    try {
-      const hostsText = await request("/hosts", { timeoutMs: 8000 });
-      state.lastRenderedHostsKey = "";
-      renderHosts(parseJson(hostsText, { hosts: [] }));
-    } catch {
-      // 列表刷新失败不影响主流程
-    }
-  } catch (err) {
-    showNotice(err.message, "error");
-    recordOperation({
-      object: hostName,
-      type: "generate_enrollment_package",
-      details: `为主机「${hostName}」生成客户端接入包失败`,
-      status: "failure",
-      error: err,
-    });
-  } finally {
-    done();
-  }
-}
-
 async function sendRemoteCommand() {
   if (!validateFields(["remoteHostId", "remotePayload"])) {
     recordOperation({
@@ -1628,51 +1403,6 @@ function init() {
   els.saveHostBtn.addEventListener("click", saveHost);
   els.resetHostFormBtn.addEventListener("click", resetHostForm);
   els.sendRemoteCommandBtn.addEventListener("click", sendRemoteCommand);
-  if (els.generateEnrollBtn) {
-    els.generateEnrollBtn.addEventListener("click", generateEnrollmentPackage);
-    // 服务端地址默认取当前浏览器访问地址（跨机部署时管理员正是通过该地址访问控制台）
-    if (els.enrollServerAddr && !els.enrollServerAddr.value) {
-      els.enrollServerAddr.value = window.location.host || "";
-    }
-  }
-
-  // ---- 采集器控制 ----
-  if (els.refreshCollectorBtn) els.refreshCollectorBtn.addEventListener("click", async () => {
-    const done = setLoading(els.refreshCollectorBtn, "刷新中...");
-    try {
-      const text = await request("/hosts", { timeoutMs: 8000 });
-      state.lastRenderedHostsKey = "";
-      renderHosts(parseJson(text, { hosts: [] }));
-      showNotice("已从服务端刷新最新心跳与采集器状态。");
-    } catch (err) {
-      showNotice(err.message, "error");
-    } finally {
-      done();
-    }
-  });
-  if (els.collectorHostSelect) els.collectorHostSelect.addEventListener("change", renderCollectorToggles);
-  if (els.collectorToggleList) els.collectorToggleList.addEventListener("change", async (event) => {
-    const input = event.target.closest('input[type="checkbox"][data-collector-name]');
-    if (!input) return;
-    const hostId = input.getAttribute("data-host-id");
-    const name = input.getAttribute("data-collector-name");
-    const enabled = input.checked;
-    try {
-      await sendCollectorToggle(hostId, name, enabled);
-    } catch {
-      // 失败回滚 UI 开关
-      input.checked = !enabled;
-    }
-  });
-  if (els.loadViolationRulesBtn) els.loadViolationRulesBtn.addEventListener("click", loadViolationRules);
-  if (els.saveViolationRulesBtn) els.saveViolationRulesBtn.addEventListener("click", saveViolationRules);
-  if (els.pushRulesAllBtn) els.pushRulesAllBtn.addEventListener("click", () => pushViolationRules(""));
-  if (els.pushRulesHostBtn) els.pushRulesHostBtn.addEventListener("click", () => {
-    const hostId = els.collectorHostSelect ? els.collectorHostSelect.value : "";
-    if (!hostId) return showNotice("请先在上方选择目标主机。", "error");
-    pushViolationRules(hostId);
-  });
-
   const updateHostFilter = debounce(() => {
     state.lastRenderedHostsKey = "";
     renderHosts({ hosts: state.hosts });
