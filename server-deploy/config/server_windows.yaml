@@ -1,0 +1,56 @@
+# AuditForwarder - Windows 服务端测试配置
+
+agent:
+  id: "auditforwarder-server"
+  data_dir: data/server
+  config_path: config/server_windows.yaml
+
+log:
+  level: debug
+  file: data/server/server.log
+  max_bytes: 52428800
+  max_backups: 5
+
+chain:
+  batch_size: 10
+  sign_batches: false
+  auto_persist: true
+  hmac_key: ""                      # 客户端 chain.hmac_key 必须与此一致，服务端据此验签（双方为空则跳过验签）
+
+transport:
+  servers: []
+  auth_token: ""
+  verify_tls: false
+
+remote:
+  enabled: false
+  servers: []
+
+detector:
+  rules_path: config/rules.yaml
+  enable_behavior_baseline: false
+
+self_protect:
+  enabled: false
+
+manager:
+  enabled: true
+  listen: 0.0.0.0:8443
+  auth_token: ""
+  login_username: "admin"
+  enrollment_key: ""                # 注册密钥，请自行配置并与客户端 remote.enrollment_key 保持一致
+  # Web 登录密码为 SHA256 哈希（明文密码不落盘）。占位值非空以禁用内置默认口令；
+  # 请替换为你自己的强密码哈希，生成方法（PowerShell）：
+  #   $b=[Text.Encoding]::UTF8.GetBytes("你的密码"); -join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | % { $_.ToString("x2") })
+  # 明文密码 = admin123（仅用于本地开发调试，生产部署请改为强密码的 SHA256）
+  login_password_sha256: "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+  status_timeout_seconds: 30       # 心跳超过此值判定下线（客户端默认 5s 心跳，留 6 次窗口）
+  use_tls: false
+  require_client_cert: false
+  tls_crl_check: false
+
+collectors:
+  enabled: false
+
+processors:
+  - type: enricher

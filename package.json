@@ -1,0 +1,20 @@
+{
+  "name": "auditforwarder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AuditForwarder enterprise security audit forwarding system",
+  "scripts": {
+    "configure": "cmake -S . -B build -DBUILD_TESTING=ON",
+    "build": "cmake --build build --config Release",
+    "dev": "cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --config Release && build\\\\auditforwarder-server.exe -c config\\\\server_windows.yaml",
+    "start:server": "build\\\\auditforwarder-server.exe -c config\\\\server_windows.yaml",
+    "start:client": "build\\\\auditforwarder-client.exe -c config\\\\client_windows.yaml",
+    "test": "ctest --test-dir build --output-on-failure"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}

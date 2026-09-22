@@ -1,0 +1,67 @@
+# 构建产物
+build/
+build_*/
+build_release/
+out/
+dist/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+
+# CMake 生成文件
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.cmake
+install_manifest.txt
+CPackConfig.cmake
+CPackSourceConfig.cmake
+
+# 日志文件
+*.log
+*.out
+
+# 运行数据目录
+data/
+var/
+
+# Windows 本地文件
+*.pdb
+*.ilk
+*.exp
+*.suo
+*.user
+.vscode/
+.vs/
+
+# 本地依赖目录
+.vcpkg/
+node_modules/
+msys64/
+vcpkg_installed/
+
+# 环境与系统文件
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.zip
+
+# 本地临时依赖目录
+$zlibInstall/
+
+# 修改备份与临时脚本
+*.bak_*
+fix_*.py
+setup_firewall.ps1
+
+# 临时构建日志
+build-log.txt
+
+# IDE 工具目录
+.trae/
