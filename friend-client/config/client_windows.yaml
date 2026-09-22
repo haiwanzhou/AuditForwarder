@@ -1,0 +1,67 @@
+# AuditForwarder - 朋友客户端配置（服务端地址已填好）
+# 服务端 Radmin VPN 地址: 26.121.98.221:8443
+
+agent:
+  id: "friend-pc"
+  data_dir: data/client
+  config_path: config/client_windows.yaml
+
+log:
+  level: debug
+  file: data/client/client.log
+  max_bytes: 52428800
+  max_backups: 5
+
+chain:
+  batch_size: 10
+  sign_batches: false
+  auto_persist: true
+  hmac_key: ""
+
+transport:
+  servers:
+    - "http://26.121.98.221:8443/ingest?agent=friend-pc"
+  mode: realtime
+  interval_sec: 5
+  compress: true
+  encrypt_payload: false
+  auth_token: ""
+  verify_tls: false
+
+remote:
+  enabled: true
+  servers:
+    - "http://26.121.98.221:8443"
+  host_id: "friend-pc"
+  heartbeat_interval_sec: 5
+  command_poll_interval_sec: 3
+  audit_summary_interval_sec: 5
+  production_mode: false
+  require_tls: false
+  crl_check: false
+  enrollment_key: ""
+  allowed_commands:
+    - collect_status
+    - echo
+    - set_collector
+    - set_collectors
+    - load_rules
+
+detector:
+  rules_path: config/rules.yaml
+  enable_behavior_baseline: true
+
+self_protect:
+  enabled: false
+
+manager:
+  enabled: false
+
+collectors:
+  enabled: true
+
+processors:
+  - type: enricher
+  - type: pii_masker
+  - type: deduper
+    window_ms: 50

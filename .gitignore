@@ -54,3 +54,6 @@ Thumbs.db
 
 # 本地临时依赖目录
 $zlibInstall/
+
+# Agent / 工作区元数据
+.workbuddy/

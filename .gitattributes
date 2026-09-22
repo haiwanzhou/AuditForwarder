@@ -1,0 +1,6 @@
+# 批处理脚本必须保持 CRLF 行尾，否则 cmd.exe 解析异常
+*.bat text eol=crlf
+
+# 部署包内的二进制与运行数据不参与 diff
+*.exe binary
+*.dll binary

@@ -1,0 +1,48 @@
+AuditForwarder-Client-Bundle
+客户端部署包 —— 本机 (ZWH / 26.121.98.221) 作为客户端接入服务端
+================================================================
+
+一、身份信息
+    主机 ID    : zyh-yxy-001
+    本机 IP    : 26.121.98.221            (Radmin VPN)
+    服务端地址 : http://26.17.173.34:8443 (朋友的机器)
+    Agent ID   : agent-zyh-yxy-001
+
+二、启动方式
+    右键「启动客户端.bat」→「以管理员身份运行」。
+    * 管理员权限用于采集 Windows 安全日志 (ETW)，不加也能跑，只是 etw_win 启动失败。
+    * 脚本会自动等 12 秒，然后把 client.log 的尾部打出来。
+
+三、启动成功的标志（data\client\client.log）
+    agent: init complete, id=agent-zyh-yxy-001
+    collector: file_win / process_win / network_win / command_win / registry_win started
+    transport: started, mode=realtime servers=1
+    remote_client: started, servers=1 host_id=zyh-yxy-001
+    transport: uploaded batch ... status=200
+
+四、目录结构（与 AuditForwarder-Server-Bundle 对称）
+    auditforwarder-client.exe     主程序（取自本项目 AuditForwarder-Server-Bundle 的
+                                  自编译产物，同一份双模二进制，靠配置切换客户端模式）
+    libcrypto-3-x64.dll 等 9 个  运行库，必须与 exe 同目录
+    config\client_windows.yaml   客户端配置（服务端地址 + 主机ID 已填好）
+    config\rules.yaml            检测规则（取自项目 config/rules.yaml）
+    启动客户端.bat                一键启动（GBK 编码）
+    data\client\                运行数据，首次启动自动生成
+
+五、已验证
+    * 服务端 AuditForwarder/1.0 在线，8443 端口从本机可直连。
+    * 客户端启动后自动注册，服务端「主机管理」可见：
+          id = zyh-yxy-001   name = ZWH   ip = 26.121.98.221   online = true
+    * 双方 auth_token / chain.hmac_key 为空 → 跳过敏签，不会 401。
+
+六、注意
+    * 没有做开机自启；需要常驻请自行加计划任务或注册为服务。
+    * 采集器会上报本机 文件/进程/网络/命令/注册表 事件，这是工具的设计目的。
+    * 卸载：结束 auditforwarder-client.exe 进程，删除本目录即可。
+
+七、与项目其他目录的关系
+    * AuditForwarder-Server-Bundle\  —— 服务端部署包（本机当服务端时用）
+    * friend-client\                —— 旧方向（服务端地址写的是 26.121.98.221，
+                                        host_id friend-pc），对应「本机当服务端」的场景，
+                                        与本次联调无关。
+    * config\client_windows.yaml    —— 仓库里的开发模板（指向 127.0.0.1），未改动。

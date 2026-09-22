@@ -1,0 +1,81 @@
+# AuditForwarder - 客户端接入配置
+# 主机名称: zyh-yxy (ZWH / 26.121.98.221)
+# 服务端:   http://26.17.173.34:8443   (Radmin VPN)
+# 生成时间: 2026-09-22
+# 用法: 保持本文件位于客户端目录 config/client_windows.yaml，然后启动客户端
+
+agent:
+  id: "agent-zyh-yxy-001"
+  data_dir: data/client
+  config_path: config/client_windows.yaml
+
+log:
+  level: info
+  file: data/client/client.log
+  max_bytes: 52428800
+  max_backups: 5
+
+chain:
+  batch_size: 10
+  sign_batches: false
+  auto_persist: true
+  hmac_key: ""                      # 必须与服务端 manager 验签密钥一致（双方为空则跳过验签）
+
+transport:
+  servers:
+    - "http://26.17.173.34:8443/ingest?agent=agent-zyh-yxy-001"
+  mode: realtime
+  interval_sec: 5
+  compress: true
+  encrypt_payload: false
+  auth_token: ""
+  verify_tls: false
+
+remote:
+  enabled: true
+  servers:
+    - "http://26.17.173.34:8443"
+  host_id: "zyh-yxy-001"
+  heartbeat_interval_sec: 5
+  command_poll_interval_sec: 3
+  audit_summary_interval_sec: 5
+  production_mode: false
+  require_tls: false
+  crl_check: false
+  enrollment_key: ""                # 注册密钥，请与服务端 manager.enrollment_key 保持一致
+  allowed_commands:
+    - collect_status
+    - echo
+    - set_collector
+    - set_collectors
+    - load_rules
+
+detector:
+  rules_path: config/rules.yaml
+  enable_behavior_baseline: true
+
+self_protect:
+  enabled: false
+
+manager:
+  enabled: false
+  auth_token: ""
+
+collectors:
+  enabled: true
+
+# 高权限操作检测：Windows 识别 UAC 提权令牌与 SYSTEM(S-1-5-18)，Linux 识别 uid=0；
+# 命中的事件打 priority=high 并走传输紧急通道。
+privilege_detect:
+  enabled: true
+
+# 测试注入（仅测试环境，生产必须保持 false）
+test_injection:
+  enabled: false
+  interval_ms: 1000
+
+processors:
+  - type: enricher
+  - type: pii_masker
+  - type: deduper
+    window_ms: 50
