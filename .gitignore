@@ -57,4 +57,14 @@ $zlibInstall/
 
 # Agent / 工作区元数据
 .workbuddy/
+
+# 修改备份与临时脚本
+*.bak_*
+fix_*.py
+setup_firewall.ps1
+
+# 临时构建日志
+build-log.txt
+
+# IDE 工具目录
 .trae/

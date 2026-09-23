@@ -848,24 +848,39 @@ Result<void> append_jsonl_retained(const std::string& dir,
     auto cr = fs::create_directories(dir);
     if (cr.is_err()) return cr;
     auto path = fs::join(dir, file_name);
-    std::vector<std::string> lines;
-    if (fs::exists(path)) {
-        auto old = read_text_file(path);
-        if (old.is_ok()) {
-            std::istringstream in(old.value());
-            std::string item;
-            while (std::getline(in, item)) {
-                if (!item.empty()) lines.push_back(item);
+
+    // 快速追加（O(1)）：不再每次全量读入+截断重写
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        if (!out) return Result<void>(Error::Code::IoError, "cannot append central store");
+        out << line << "\n";
+    }
+
+    // 定期裁剪：仅当文件体积明显超过保留上限时才做一次全量重写
+    // 用文件大小粗估行数（日志行通常 200~1024 字节），避免每次追加都读文件
+    if (max_lines > 0) {
+        constexpr std::uint64_t kAvgLineBytes = 1024;
+        std::uint64_t size = fs::file_size(path);
+        if (size > static_cast<std::uint64_t>(max_lines) * kAvgLineBytes * 2) {
+            auto old = read_text_file(path);
+            if (old.is_ok()) {
+                std::vector<std::string> lines;
+                std::istringstream in(old.value());
+                std::string item;
+                while (std::getline(in, item)) {
+                    if (!item.empty()) lines.push_back(item);
+                }
+                if (lines.size() > max_lines) {
+                    lines.erase(lines.begin(),
+                                lines.begin() + static_cast<std::ptrdiff_t>(lines.size() - max_lines));
+                    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                    if (out) {
+                        for (const auto& item : lines) out << item << "\n";
+                    }
+                }
             }
         }
     }
-    lines.push_back(line);
-    if (lines.size() > max_lines) {
-        lines.erase(lines.begin(), lines.begin() + static_cast<std::ptrdiff_t>(lines.size() - max_lines));
-    }
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return Result<void>(Error::Code::IoError, "cannot append central store");
-    for (const auto& item : lines) out << item << "\n";
     return Result<void>::ok();
 }
 
@@ -928,6 +943,12 @@ std::atomic<u64> g_remote_events_uploaded{0};
 std::atomic<u64> g_remote_bytes_uploaded{0};
 std::atomic<u64> g_remote_alerts{0};
 
+// alerts 写入独立锁：规则复查可在 host_store_mutex 之外并发执行
+std::mutex& alert_store_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 Result<void> append_alert(const ManagerConfig& cfg,
                           const std::string& host_id,
                           const std::string& source,
@@ -936,6 +957,7 @@ Result<void> append_alert(const ManagerConfig& cfg,
                           const std::string& message,
                           const std::string& evidence) {
     auto line = alert_json(host_id, source, severity, rule_id, message, evidence);
+    std::lock_guard<std::mutex> lk(alert_store_mutex());
     auto r = append_jsonl_retained(alert_dir(cfg), host_id + ".jsonl", line, 20000);
     if (r.is_ok()) g_remote_alerts.fetch_add(1, std::memory_order_relaxed);
     return r;
@@ -1091,6 +1113,33 @@ std::vector<std::string> read_jsonl_filtered(const std::string& path,
     return lines;
 }
 
+// 流式统计单个 jsonl 文件中匹配条件的行数（不存储数据）。
+std::size_t count_jsonl_filtered(const std::string& path,
+                                  const std::string& host_id,
+                                  const std::string& operation_type,
+                                  const std::string& from,
+                                  const std::string& to) {
+    std::size_t count = 0;
+    auto fc = read_text_file(path);
+    if (fc.is_err()) return 0;
+    std::istringstream in(fc.value());
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (!host_id.empty() && json_string_field(line, "host_id") != host_id) continue;
+        if (!operation_type.empty()) {
+            auto op = json_string_field(line, "operation_type");
+            auto ev = json_string_field(line, "event_type");
+            if (op != operation_type && ev != operation_type) continue;
+        }
+        auto ts = json_string_field(line, "timestamp");
+        if (!from.empty() && !ts.empty() && ts < from) continue;
+        if (!to.empty() && !ts.empty() && ts > to) continue;
+        ++count;
+    }
+    return count;
+}
+
 std::vector<std::string> read_jsonl_dir_filtered(const std::string& dir,
                                                  const std::string& host_id,
                                                  const std::string& operation_type,
@@ -1115,6 +1164,27 @@ std::vector<std::string> read_jsonl_dir_filtered(const std::string& dir,
         }
     }
     return lines;
+}
+
+// 流式统计目录下所有 jsonl 文件中匹配条件的总行数。
+std::size_t count_jsonl_dir_filtered(const std::string& dir,
+                                      const std::string& host_id,
+                                      const std::string& operation_type,
+                                      const std::string& from,
+                                      const std::string& to) {
+    if (!host_id.empty()) {
+        return count_jsonl_filtered(fs::join(dir, host_id + ".jsonl"), host_id, operation_type, from, to);
+    }
+    std::size_t total = 0;
+    auto listed = fs::list_directory(dir);
+    if (listed.is_err()) return 0;
+    for (const auto& item : listed.value()) {
+        if (fs::extension(item) != ".jsonl") continue;
+        auto p = fs::is_absolute(item) || item.find('/') != std::string::npos || item.find('\\') != std::string::npos
+                 ? item : fs::join(dir, item);
+        total += count_jsonl_filtered(p, "", operation_type, from, to);
+    }
+    return total;
 }
 
 // ================= 两级存储：operation_logs/<host_id>/<collector>.jsonl =================
@@ -1291,6 +1361,76 @@ std::vector<std::string> read_operation_logs_filtered(const ManagerConfig& cfg,
     return result;
 }
 
+// 流式统计操作日志中匹配条件的总行数（不存储、不排序）。
+std::size_t count_operation_logs_filtered(const ManagerConfig& cfg,
+                                           const std::string& host_id,
+                                           const std::string& collector,
+                                           const std::string& priority,
+                                           const std::string& operation_type,
+                                           const std::string& from,
+                                           const std::string& to) {
+    std::size_t count = 0;
+    const std::string root = operation_log_dir(cfg);
+    std::vector<std::string> host_dirs;
+    if (!host_id.empty()) {
+        host_dirs.push_back(fs::join(root, host_id));
+    } else if (fs::exists(root)) {
+        auto hosts = fs::list_directory(root);
+        if (hosts.is_ok())
+            for (const auto& h : hosts.value())
+                if (fs::is_directory(h)) host_dirs.push_back(h);
+    }
+    const std::string want_collector = logmeta::sanitize_collector_id(collector);
+    for (const auto& hdir : host_dirs) {
+        if (!fs::exists(hdir)) continue;
+        const std::string dir_host = fs::basename(hdir);
+        auto files = fs::list_directory(hdir);
+        if (files.is_err()) continue;
+        for (const auto& f : files.value()) {
+            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
+            std::string base = fs::basename(f);
+            base.resize(base.size() - 6);
+            if (priority == logmeta::priority::kHigh) {
+                if (base != "privileged") continue;
+            } else {
+                if (base == "privileged") continue;
+                if (!collector.empty() && base != want_collector) continue;
+            }
+            auto fc = read_text_file(f);
+            if (fc.is_err()) continue;
+            std::istringstream in(fc.value());
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty()) continue;
+                if (host_id.empty()) {
+                    if (json_string_field(line, "host_id") != dir_host) continue;
+                } else if (json_string_field(line, "host_id") != host_id) {
+                    continue;
+                }
+                if (!collector.empty() && priority != logmeta::priority::kHigh &&
+                    json_string_field(line, "collector") != collector
+                    && !(base == "legacy")) {
+                    continue;
+                }
+                if (!priority.empty() && priority != logmeta::priority::kHigh &&
+                    json_string_field(line, "priority") != priority) {
+                    continue;
+                }
+                if (!operation_type.empty()) {
+                    auto op = json_string_field(line, "operation_type");
+                    auto ev = json_string_field(line, "event_type");
+                    if (op != operation_type && ev != operation_type) continue;
+                }
+                auto ts = json_string_field(line, "timestamp");
+                if (!from.empty() && !ts.empty() && ts < from) continue;
+                if (!to.empty() && !ts.empty() && ts > to) continue;
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
 // ================= 日志过滤策略档（strict / lenient，按采集器配置）=================
 
 using LogFilterProfile = logpolicy::Profile;
@@ -1321,6 +1461,7 @@ std::string count_map_json(const std::map<std::string, std::size_t>& counts) {
     for (const auto& kv : counts) {
         if (i) o << ", ";
         o << "\"" << json_escape(kv.first) << "\": " << kv.second;
+        ++i;
     }
     o << "}";
     return o.str();
@@ -1328,10 +1469,14 @@ std::string count_map_json(const std::map<std::string, std::size_t>& counts) {
 
 std::string logs_analytics_json(const ManagerConfig& cfg,
                                 const std::string& host_id,
+                                const std::string& collector,
+                                const std::string& priority,
                                 const std::string& from,
                                 const std::string& to,
                                 std::size_t limit) {
-    auto logs = read_operation_logs_filtered(cfg, host_id, "", "", "", from, to, limit);
+    std::size_t total_logs = count_operation_logs_filtered(cfg, host_id, collector, priority, "", from, to);
+    std::size_t total_alerts = count_jsonl_dir_filtered(alert_dir(cfg), host_id, "", from, to);
+    auto logs = read_operation_logs_filtered(cfg, host_id, collector, priority, "", from, to, limit);
     auto alerts = read_jsonl_dir_filtered(alert_dir(cfg), host_id, "", from, to, limit);
     std::map<std::string, std::size_t> operation_types;
     std::map<std::string, std::size_t> alert_severities;
@@ -1354,8 +1499,8 @@ std::string logs_analytics_json(const ManagerConfig& cfg,
     std::ostringstream o;
     o << "{\n"
       << "  \"host_id\": \"" << json_escape(host_id) << "\",\n"
-      << "  \"log_count\": " << logs.size() << ",\n"
-      << "  \"alert_count\": " << alerts.size() << ",\n"
+      << "  \"log_count\": " << total_logs << ",\n"
+      << "  \"alert_count\": " << total_alerts << ",\n"
       << "  \"operation_types\": " << count_map_json(operation_types) << ",\n"
       << "  \"alert_severities\": " << count_map_json(alert_severities) << ",\n"
       << "  \"host_counts\": " << count_map_json(host_counts) << "\n"
@@ -2619,8 +2764,12 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         if (objects.empty()) objects.push_back(body);
         std::size_t accepted = 0;
         std::string first_host;
-        std::lock_guard<std::mutex> lk(host_store_mutex());
-        for (const auto& raw_item : objects) {
+        // 收集需在锁外做违规规则复查与合谋检测的条目，缩短全局锁临界区
+        std::vector<std::pair<std::string, std::string>> pending_rule_eval;
+        std::string response_body;
+        {
+            std::lock_guard<std::mutex> lk(host_store_mutex());
+            for (const auto& raw_item : objects) {
             auto host_id = json_string_field(raw_item, "host_id");
             if (host_id.empty()) host_id = json_string_field(body, "host_id");
             if (host_id.empty() || !is_valid_host_id(host_id)) {
@@ -2655,9 +2804,7 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                     return "{\n  \"error\": \"cannot save privileged logs\"\n}";
                 }
             }
-            evaluate_operation_log_rules(cfg_, host_id, item);
-            // 合谋检测并行接入：清洗后进入资产组+时间窗口聚合（不改变原有入库与违规检测流程）
-            collusion::Engine::instance().ingest_json(item);
+            pending_rule_eval.emplace_back(host_id, item);
             ++accepted;
         }
         std::ostringstream o;
@@ -2669,7 +2816,15 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
           << "  \"layout\": \"operation_logs/<host_id>/<collector>.jsonl (+privileged.jsonl)\",\n"
           << "  \"indexed_fields\": [\"host_id\", \"collector\", \"priority\", \"operation_type\", \"event_type\", \"timestamp\"]\n"
           << "}";
-        return o.str();
+        response_body = o.str();
+        }
+        // 锁外执行违规规则复查（写 alerts，不阻塞 /hosts 等接口）；
+        // 合谋检测同步接入：清洗后进入资产组+时间窗口聚合（引擎内部自带锁，不改变原有入库流程）
+        for (const auto& pr : pending_rule_eval) {
+            evaluate_operation_log_rules(cfg_, pr.first, pr.second);
+            collusion::Engine::instance().ingest_json(pr.second);
+        }
+        return response_body;
     }
     if (path == "/agent/audit-summaries" && method == "POST") {
         content_type = "application/json; charset=utf-8";
@@ -2806,6 +2961,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
     if (path == "/logs/analytics" && method == "GET") {
         content_type = "application/json; charset=utf-8";
         auto host_id = query_param(query, "host_id");
+        auto collector = query_param(query, "collector");
+        auto priority = query_param(query, "priority");
         auto from = query_param(query, "from");
         auto to = query_param(query, "to");
         auto limit = json_size_field("{\"limit\":" + query_param(query, "limit") + "}", "limit", 1000);
@@ -2813,7 +2970,7 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             status = 422;
             return validation_error_json({{"host_id", "format", "主机 ID 格式不正确"}});
         }
-        return logs_analytics_json(cfg_, host_id, from, to, limit);
+        return logs_analytics_json(cfg_, host_id, collector, priority, from, to, limit);
     }
     if (path == "/logs/collector-counts" && method == "GET") {
         content_type = "application/json; charset=utf-8";
