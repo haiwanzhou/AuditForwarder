@@ -10,6 +10,7 @@ const state = {
   liveRefreshInFlight: false,
   lastRenderedHostsKey: "",
   currentUser: localStorage.getItem("af.currentUser") || "",
+  collusionConfigLoaded: false,   // 合谋检测配置/规则/工单仅在首次进入时拉取，避免覆盖编辑中内容
 };
 
 const $ = (id) => document.getElementById(id);
@@ -101,6 +102,32 @@ const els = {
   clearTokenBtn: $("clearTokenBtn"),
   cancelTokenBtn: $("cancelTokenBtn"),
   saveTokenBtn: $("saveTokenBtn"),
+  // 合谋检测面板
+  refreshCollusionBtn: $("refreshCollusionBtn"),
+  collusionSummary: $("collusionSummary"),
+  collusionHighCount: $("collusionHighCount"),
+  collusionMidCount: $("collusionMidCount"),
+  collusionLowCount: $("collusionLowCount"),
+  collusionPendingCount: $("collusionPendingCount"),
+  collusionEmergencyBtn: $("collusionEmergencyBtn"),
+  collusionEnabled: $("collusionEnabled"),
+  collusionWindows: $("collusionWindows"),
+  collusionThresholds: $("collusionThresholds"),
+  collusionRuleStats: $("collusionRuleStats"),
+  collusionProfileStats: $("collusionProfileStats"),
+  collusionEmergency: $("collusionEmergency"),
+  collusionLevelFilter: $("collusionLevelFilter"),
+  collusionStatusFilter: $("collusionStatusFilter"),
+  collusionEventList: $("collusionEventList"),
+  collusionReportDays: $("collusionReportDays"),
+  collusionReportBtn: $("collusionReportBtn"),
+  collusionReportView: $("collusionReportView"),
+  collusionConfigText: $("collusionConfigText"),
+  collusionRulesText: $("collusionRulesText"),
+  collusionWorkordersText: $("collusionWorkordersText"),
+  saveCollusionConfigBtn: $("saveCollusionConfigBtn"),
+  saveCollusionRulesBtn: $("saveCollusionRulesBtn"),
+  saveCollusionWorkordersBtn: $("saveCollusionWorkordersBtn"),
 };
 
 const validationRules = {
@@ -751,6 +778,216 @@ async function loadSecurityMonitor(options = {}) {
   }
 }
 
+// ---------------- 跨操作员合谋协同检测面板 ----------------
+
+function renderCollusionOverview(o) {
+  const counts = o.event_counts || {};
+  els.collusionHighCount.textContent = String(counts.HIGH ?? 0);
+  els.collusionMidCount.textContent = String(counts.MID ?? 0);
+  els.collusionLowCount.textContent = String(counts.LOW ?? 0);
+  els.collusionPendingCount.textContent = String(o.pending_review ?? 0);
+  els.collusionEnabled.textContent = o.started
+    ? (o.enabled ? "运行中" : "已停用（配置 enabled=false）")
+    : "未启动";
+  els.collusionWindows.textContent = `${o.short_window_minutes ?? "--"} 分钟 / ${o.long_window_hours ?? "--"} 小时`;
+  els.collusionThresholds.textContent = `中风险 ≥ ${o.score_mid ?? "--"} 分，高风险 ≥ ${o.score_high ?? "--"} 分`;
+  els.collusionRuleStats.textContent = `${o.rules_count ?? "--"} 条规则 / ${o.asset_groups_count ?? "--"} 组资产`;
+  els.collusionProfileStats.textContent = `${o.profile_operators ?? 0} 人 / ${o.profile_pairs ?? 0} 对协作`;
+  els.collusionEmergency.textContent = o.emergency_mode ? "生效中（风险等级自动降一级）" : "未启用";
+  els.collusionEmergencyBtn.textContent = o.emergency_mode ? "解除应急模式" : "开启应急模式";
+}
+
+function renderCollusionEvents(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    els.collusionEventList.innerHTML = `<div class="empty-cell">当前过滤条件下暂无风险事件。</div>`;
+    return;
+  }
+  const levelClass = { HIGH: "high", MID: "medium", LOW: "" };
+  els.collusionEventList.innerHTML = items.map((ev) => {
+    const dispose = ev.dispose || {};
+    const rules = (ev.matched_rules || []).join("、") || "仅行为画像线索（规则零命中）";
+    const ops = (ev.operators || []).join("、");
+    const notes = [...(ev.profile_notes || []), ...(ev.score_notes || [])].filter(Boolean).join("；");
+    return `
+      <div class="security-item ${levelClass[ev.risk_level] || ""}" data-event-id="${escapeHtml(ev.event_id || "")}">
+        <div class="security-item-head">
+          <strong>${escapeHtml(ev.risk_level || "--")} · ${ev.risk_score ?? "--"} 分 · ${escapeHtml(ev.asset_group || "--")}</strong>
+          <span>${escapeHtml(ev.window_kind === "short" ? "短窗口" : "长窗口")} ${escapeHtml(ev.window_start || "")} ~ ${escapeHtml(ev.window_end || "")}</span>
+        </div>
+        <p>规则命中：${escapeHtml(rules)}｜操作员（${ev.operator_count ?? (ev.operators || []).length}）：${escapeHtml(ops)}</p>
+        ${notes ? `<p>判定依据：${escapeHtml(notes)}</p>` : ""}
+        <p>处置状态：<code>${escapeHtml(dispose.status || "待复核")}</code>${dispose.disposer ? `（${escapeHtml(dispose.disposer)} ${escapeHtml(dispose.time || "")}）` : ""}</p>
+        <div class="section-actions">
+          <button class="button ghost small" data-collusion-action="detail">查看详情</button>
+          <button class="button ghost small" data-collusion-action="export">导出证据链</button>
+          <button class="button ghost small" data-collusion-action="dispose">处置</button>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+async function loadCollusion(options = {}) {
+  if (!els.collusionEventList) return;
+  try {
+    const level = els.collusionLevelFilter?.value || "";
+    const status = els.collusionStatusFilter?.value || "";
+    const [overviewText, eventsText] = await Promise.all([
+      request("/collusion/overview"),
+      request(`/collusion/events?level=${encodeURIComponent(level)}&status=${encodeURIComponent(status)}&limit=50`),
+    ]);
+    const overview = parseJson(overviewText, {});
+    const events = parseJson(eventsText, { events: [] });
+    renderCollusionOverview(overview);
+    renderCollusionEvents(events.events || []);
+    els.collusionSummary.textContent =
+      `高危 ${counts(overview, "HIGH")} / 中危 ${counts(overview, "MID")} / 待复核 ${overview.pending_review ?? 0}`;
+    // 配置/规则/工单仅在首次进入面板时拉取，避免自动刷新覆盖正在编辑的内容
+    if (!state.collusionConfigLoaded) {
+      const [cfgText, rulesText, woText] = await Promise.all([
+        request("/collusion/config"),
+        request("/collusion/rules"),
+        request("/collusion/workorders"),
+      ]);
+      if (els.collusionConfigText) els.collusionConfigText.value = cfgText;
+      if (els.collusionRulesText) els.collusionRulesText.value = rulesText;
+      if (els.collusionWorkordersText) els.collusionWorkordersText.value = woText;
+      state.collusionConfigLoaded = true;
+    }
+  } catch (err) {
+    els.collusionSummary.textContent = "加载失败";
+    if (!options.silent) showNotice(err.message, "error");
+  }
+
+  function counts(o, level) {
+    return o.event_counts?.[level] ?? 0;
+  }
+}
+
+async function handleCollusionAction(action, eventId) {
+  if (action === "detail") {
+    try {
+      const text = await request(`/collusion/events/detail?id=${encodeURIComponent(eventId)}`);
+      els.collusionReportView.textContent = JSON.stringify(parseJson(text, {}), null, 2);
+      showNotice("事件详情（含证据时间线）已输出到报表区域。");
+    } catch (err) {
+      showNotice(err.message, "error");
+    }
+    return;
+  }
+  if (action === "export") {
+    try {
+      const text = await request(`/collusion/events/export?id=${encodeURIComponent(eventId)}`);
+      const blob = new Blob([JSON.stringify(parseJson(text, {}), null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${eventId}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      recordOperation({
+        object: `合谋风险事件 ${eventId}`,
+        type: "export_collusion_evidence",
+        details: "导出完整证据链 JSON",
+        status: "success",
+      });
+    } catch (err) {
+      showNotice(err.message, "error");
+    }
+    return;
+  }
+  if (action === "dispose") {
+    const status = window.prompt(
+      "处置状态（确认合谋攻击 / 合法运维（误报） / 待进一步调查）：",
+      "合法运维（误报）",
+    );
+    if (!status) return;
+    const note = window.prompt("处置说明（将记入合谋检测审计日志）：", "") || "";
+    try {
+      await request("/collusion/events/dispose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: eventId, status, disposer: state.currentUser || "admin", note }),
+      });
+      recordOperation({
+        object: `合谋风险事件 ${eventId}`,
+        type: "collusion_dispose",
+        details: `处置为「${status}」：${note}`,
+        status: "success",
+      });
+      showNotice("处置完成，已写入审计日志。");
+      await loadCollusion({ silent: true });
+    } catch (err) {
+      showNotice(err.message, "error");
+      recordOperation({
+        object: `合谋风险事件 ${eventId}`,
+        type: "collusion_dispose",
+        details: `处置为「${status}」失败`,
+        status: "failure",
+        error: err,
+      });
+    }
+  }
+}
+
+async function saveCollusionDoc(path, textarea, label, recordType) {
+  if (!textarea) return;
+  try {
+    await request(path, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: textarea.value,
+    });
+    showNotice(`${label}已保存并热生效。`);
+    recordOperation({ object: label, type: recordType, details: `保存${label}成功`, status: "success" });
+  } catch (err) {
+    showNotice(err.message, "error");
+    recordOperation({ object: label, type: recordType, details: `保存${label}失败`, status: "failure", error: err });
+  }
+}
+
+async function toggleCollusionEmergency() {
+  const enable = els.collusionEmergencyBtn.textContent.startsWith("开启");
+  try {
+    await request("/collusion/emergency", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled: enable,
+        duration_minutes: 120,
+        actor: state.currentUser || "admin",
+      }),
+    });
+    recordOperation({
+      object: "合谋检测应急运维模式",
+      type: "collusion_emergency",
+      details: enable ? "开启应急模式 120 分钟（风险等级自动降一级）" : "解除应急模式",
+      status: "success",
+    });
+    showNotice(enable ? "应急运维模式已开启（120 分钟内风险等级自动降一级）。" : "应急运维模式已解除。");
+    await loadCollusion({ silent: true });
+  } catch (err) {
+    showNotice(err.message, "error");
+    recordOperation({
+      object: "合谋检测应急运维模式",
+      type: "collusion_emergency",
+      details: enable ? "开启应急模式失败" : "解除应急模式失败",
+      status: "failure",
+      error: err,
+    });
+  }
+}
+
+async function generateCollusionReport() {
+  const days = Math.max(1, Math.min(180, parseInt(els.collusionReportDays?.value, 10) || 7));
+  try {
+    const text = await request(`/collusion/report?days=${days}`);
+    els.collusionReportView.textContent = JSON.stringify(parseJson(text, {}), null, 2);
+    showNotice(`近 ${days} 天合谋行为分析报表已生成。`);
+  } catch (err) {
+    showNotice(err.message, "error");
+  }
+}
+
 function renderCollectorCounts(data) {
   const totals = data.collector_totals || {};
   const entries = Object.entries(totals).sort((a, b) => b[1] - a[1]);
@@ -1143,6 +1380,7 @@ async function refreshAll(options = {}) {
     renderBatches(parseJson(batchesText, { batches: [] }));
     renderHosts(parseJson(hostsText, { hosts: [] }));
     await loadSecurityMonitor({ silent });
+    await loadCollusion({ silent });
     await loadLogPolicy({ silent });
     if (!silent) showNotice("数据已刷新。");
     if (record) {
@@ -1183,6 +1421,7 @@ async function refreshLiveData() {
     renderStatus(parseJson(statusText, {}));
     renderHosts(parseJson(hostsText, { hosts: [] }));
     await loadSecurityMonitor({ silent: true });
+    await loadCollusion({ silent: true });
     await loadLogPolicy({ silent: true, skipProfiles: true });
   } catch (err) {
     els.statusPill.textContent = "连接异常";
@@ -1380,6 +1619,24 @@ function init() {
   }
   els.refreshBtn.addEventListener("click", () => refreshAll());
   if (els.refreshSecurityBtn) els.refreshSecurityBtn.addEventListener("click", () => loadSecurityMonitor());
+  // 合谋检测面板：刷新 / 过滤 / 事件操作 / 配置规则工单保存 / 应急模式 / 报表
+  if (els.refreshCollusionBtn) els.refreshCollusionBtn.addEventListener("click", () => loadCollusion());
+  if (els.collusionLevelFilter) els.collusionLevelFilter.addEventListener("change", () => loadCollusion({ silent: true }));
+  if (els.collusionStatusFilter) els.collusionStatusFilter.addEventListener("change", () => loadCollusion({ silent: true }));
+  if (els.collusionEventList) els.collusionEventList.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-collusion-action]");
+    if (!btn) return;
+    const item = btn.closest("[data-event-id]");
+    if (item) handleCollusionAction(btn.getAttribute("data-collusion-action"), item.getAttribute("data-event-id"));
+  });
+  if (els.saveCollusionConfigBtn) els.saveCollusionConfigBtn.addEventListener("click",
+    () => saveCollusionDoc("/collusion/config", els.collusionConfigText, "合谋检测配置", "save_collusion_config"));
+  if (els.saveCollusionRulesBtn) els.saveCollusionRulesBtn.addEventListener("click",
+    () => saveCollusionDoc("/collusion/rules", els.collusionRulesText, "合谋检测规则库", "save_collusion_rules"));
+  if (els.saveCollusionWorkordersBtn) els.saveCollusionWorkordersBtn.addEventListener("click",
+    () => saveCollusionDoc("/collusion/workorders", els.collusionWorkordersText, "工单注册表", "save_collusion_workorders"));
+  if (els.collusionEmergencyBtn) els.collusionEmergencyBtn.addEventListener("click", toggleCollusionEmergency);
+  if (els.collusionReportBtn) els.collusionReportBtn.addEventListener("click", generateCollusionReport);
   if (els.logCollectorFilter) els.logCollectorFilter.addEventListener("change", () => loadSecurityMonitor({ silent: true }));
   if (els.logPriorityFilter) els.logPriorityFilter.addEventListener("change", () => loadSecurityMonitor({ silent: true }));
   if (els.refreshLogPolicyBtn) els.refreshLogPolicyBtn.addEventListener("click", () => loadLogPolicy());

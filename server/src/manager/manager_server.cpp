@@ -1,5 +1,6 @@
 #include "auditforwarder/manager.h"
 
+#include "auditforwarder/collusion.h"
 #include "auditforwarder/config.h"
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/fs.h"
@@ -1720,11 +1721,14 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
 
     AF_LOG_INFO("manager: listening on " << cfg_.listen
                 << "  (status_timeout=" << cfg_.status_timeout_seconds << "s)");
+    // 合谋检测模块并行启动：复用 data_dir，与原有审计互不侵入
+    collusion::Engine::instance().start(cfg_.data_dir);
     return Result<void>::ok();
 }
 
 void SimpleHttpManager::stop() {
     if (!running_.exchange(false)) return;
+    collusion::Engine::instance().stop();   // 合谋检测模块停止（画像落盘）
     monitor_running_.store(false);
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, 2);
@@ -2652,6 +2656,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                 }
             }
             evaluate_operation_log_rules(cfg_, host_id, item);
+            // 合谋检测并行接入：清洗后进入资产组+时间窗口聚合（不改变原有入库与违规检测流程）
+            collusion::Engine::instance().ingest_json(item);
             ++accepted;
         }
         std::ostringstream o;
@@ -2879,6 +2885,94 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         AF_LOG_INFO("manager: remote upgrade requested: " << body);
         status = 202;
         return "{\n  \"accepted\": true\n}";
+    }
+
+    // ================= 跨操作员合谋协同检测（/collusion/*，均需登录鉴权） =================
+    if (starts_with(path, "/collusion/")) {
+        content_type = "application/json; charset=utf-8";
+        auto& eng = collusion::Engine::instance();
+        if (path == "/collusion/overview" && method == "GET") {
+            return eng.overview_json();
+        }
+        if (path == "/collusion/events" && method == "GET") {
+            auto level = query_param(query, "level");
+            auto st = query_param(query, "status");
+            auto limit = json_size_field("{\"limit\":" + query_param(query, "limit") + "}", "limit", 100);
+            return eng.events_json(level, st, limit);
+        }
+        if (path == "/collusion/events/detail" && method == "GET") {
+            auto detail = eng.event_detail_json(query_param(query, "id"));
+            if (detail == "{}") status = 404;
+            return detail;
+        }
+        if (path == "/collusion/events/export" && method == "GET") {
+            auto detail = eng.export_event_json(query_param(query, "id"));
+            if (detail == "{}") status = 404;
+            return detail;
+        }
+        if (path == "/collusion/events/dispose" && method == "POST") {
+            std::string err;
+            auto ok = eng.dispose_event(json_string_field(body, "event_id"),
+                                        json_string_field(body, "status"),
+                                        json_string_field(body, "disposer"),
+                                        json_string_field(body, "note"), err);
+            if (!ok) {
+                status = 422;
+                return "{\n  \"error\": \"" + json_escape(err) + "\"\n}";
+            }
+            return "{\n  \"disposed\": true\n}";
+        }
+        if (path == "/collusion/config" && method == "GET") {
+            return eng.config_json();
+        }
+        if (path == "/collusion/config" && method == "PUT") {
+            std::string err;
+            if (!eng.save_config_json(body, err)) {
+                status = 422;
+                return "{\n  \"error\": \"" + json_escape(err) + "\"\n}";
+            }
+            return "{\n  \"saved\": true,\n  \"hot_reload\": true\n}";
+        }
+        if (path == "/collusion/rules" && method == "GET") {
+            return eng.rules_json();
+        }
+        if (path == "/collusion/rules" && method == "PUT") {
+            std::string err;
+            if (!eng.save_rules_json(body, err)) {
+                status = 422;
+                return "{\n  \"error\": \"" + json_escape(err) + "\"\n}";
+            }
+            return "{\n  \"saved\": true,\n  \"hot_reload\": true\n}";
+        }
+        if (path == "/collusion/workorders" && method == "GET") {
+            return eng.workorders_json();
+        }
+        if (path == "/collusion/workorders" && method == "PUT") {
+            std::string err;
+            if (!eng.save_workorders_json(body, err)) {
+                status = 422;
+                return "{\n  \"error\": \"" + json_escape(err) + "\"\n}";
+            }
+            return "{\n  \"saved\": true\n}";
+        }
+        if (path == "/collusion/emergency" && method == "POST") {
+            auto enabled = json_bool_field(body, "enabled", false);
+            auto minutes = json_u64_field(body, "duration_minutes", 0);
+            auto actor = json_string_field(body, "actor");
+            return eng.set_emergency(enabled, minutes, actor.empty() ? "admin" : actor);
+        }
+        if (path == "/collusion/report" && method == "GET") {
+            auto days = json_size_field("{\"days\":" + query_param(query, "days") + "}", "days", 7);
+            return eng.report_json(static_cast<int>(days));
+        }
+        if (path == "/collusion/ingest" && method == "POST") {
+            // 设计文档原生格式事件接入（oper_id/event_timestamp/server_id/op_type/
+            // res_key/op_param/work_order_id/return_code），供外部系统直连与测试
+            auto n = eng.ingest_native_json(body);
+            return "{\n  \"accepted\": true,\n  \"cleaned_events\": " + std::to_string(n) + "\n}";
+        }
+        status = 404;
+        return "{\n  \"error\": \"not found\"\n}";
     }
     status = 404;
     return "{\n  \"error\": \"not found\"\n}";

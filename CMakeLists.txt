@@ -98,6 +98,9 @@ set(AF_CORE_SOURCES
     # 服务端管理模块
     server/src/manager/manager_server.cpp
 
+    # 跨操作员合谋协同检测模块（并行无侵入扩展层）
+    server/src/collusion/collusion.cpp
+
     # 采集器基类
     client/src/collector/collector_base.cpp
 )

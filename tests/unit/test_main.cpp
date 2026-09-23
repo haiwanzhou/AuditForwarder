@@ -3,6 +3,7 @@
 #include "auditforwarder/agent.h"
 #include "auditforwarder/build_config.h"
 #include "auditforwarder/chain.h"
+#include "auditforwarder/collusion.h"
 #include "auditforwarder/config.h"
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/database.h"
@@ -473,9 +474,203 @@ void test_log_filter_profiles() {
               1.3 * static_cast<double>(fields_strict));
 }
 
+// ---------------- 跨操作员合谋协同检测模块 ----------------
+
+void test_collusion_pure_logic() {
+    using namespace af::collusion;
+    // 通配符匹配
+    AF_EXPECT(wildcard_match("*backup*", "C:/data/db_backup_2026.bin"));
+    AF_EXPECT(wildcard_match("*.conf", "/etc/nginx/nginx.CONF"));
+    AF_EXPECT(wildcard_match("key-?", "key-A"));
+    AF_EXPECT(!wildcard_match("key-?", "key-AB"));
+    AF_EXPECT(!wildcard_match("*.sql", "notes.txt"));
+
+    // 资产组归属
+    std::vector<AssetGroup> groups = {
+        {"backup-group", {"*backup*", "*snapshot*"}},
+        {"db-group", {"*.sql", "*mysql*"}},
+    };
+    AF_EXPECT_EQ(match_asset_group(groups, "/var/backups/db.snap"), std::string("backup-group"));
+    AF_EXPECT_EQ(match_asset_group(groups, "dump.sql"), std::string("db-group"));
+    AF_EXPECT_EQ(match_asset_group(groups, "readme.md"), std::string(""));
+
+    // 操作子序列匹配（时间有序、允许跳过无关事件、关键词大小写不敏感）
+    std::vector<RuleStep> seq = { {{"delete"}}, {{"unmount", "detach"}}, {{"snapshot"}} };
+    std::vector<CleanEvent> evs = {
+        {"opA", 1000, "h1", "file/write", "x.bak", "", "", ""},
+        {"opA", 2000, "h1", "file/delete", "a.bak", "", "", ""},
+        {"opB", 3000, "h1", "disk/unmount", "/dev/sdb1", "", "", ""},
+        {"opC", 4000, "h1", "snapshot/DELETE", "snap-1", "", "", ""},
+    };
+    AF_EXPECT(is_subsequence(seq, evs));
+    std::vector<CleanEvent> evs_missing = {evs[0], evs[2], evs[3]};  // 缺 delete 步骤
+    AF_EXPECT(!is_subsequence(seq, evs_missing));
+
+    // 事件清洗：文档原生字段
+    CleanEvent ce;
+    AF_EXPECT(clean_event_json(
+        R"({"oper_id":"opA","event_timestamp":1789700000000,"server_id":"s1",)"
+        R"("op_type":"delete_backup","res_key":"db.bak","op_param":"full",)"
+        R"("work_order_id":"WO-1","return_code":0})", ce));
+    AF_EXPECT_EQ(ce.oper_id, std::string("opA"));
+    AF_EXPECT_EQ(ce.ts_ms, 1789700000000ULL);
+    // 兼容现有审计日志字段（actor/host_id/operation_type+event_type/target/message）
+    AF_EXPECT(clean_event_json(
+        R"({"actor":"opB","client_ts":1789700001000,"host_id":"s1",)"
+        R"("operation_type":"file","event_type":"delete","target":"a.bak",)"
+        R"("message":"del","outcome":"unknown"})", ce));
+    AF_EXPECT_EQ(ce.op_type, std::string("file/delete"));
+    AF_EXPECT_EQ(ce.res_key, std::string("a.bak"));
+    // 执行失败（return_code!=0 / outcome=failed）与缺关键字段 → 丢弃
+    AF_EXPECT(!clean_event_json(
+        R"({"oper_id":"opA","event_timestamp":1,"server_id":"s","op_type":"t",)"
+        R"("res_key":"r","op_param":"p","return_code":5})", ce));
+    AF_EXPECT(!clean_event_json(
+        R"({"oper_id":"opA","event_timestamp":1,"server_id":"s","op_type":"t",)"
+        R"("res_key":"r","op_param":"p","outcome":"failed"})", ce));
+    AF_EXPECT(!clean_event_json(
+        R"({"event_timestamp":1,"server_id":"s","op_type":"t","res_key":"r"})", ce));
+}
+
+void test_collusion_workorder_and_whitelist() {
+    using namespace af::collusion;
+    std::vector<WorkOrder> registry = {
+        {"WO-OK", "执行中", {"opA", "opB"}, 0, 0},
+        {"WO-EXP", "执行中", {"opA", "opB"}, 0, 1000},          // 已过期
+        {"WO-CLOSED", "已关闭", {"opA", "opB"}, 0, 0},          // 状态无效
+    };
+    AF_EXPECT(verify_work_order(registry, registry[0], {"opA", "opB"}, 2000));
+    AF_EXPECT(!verify_work_order(registry, registry[0], {"opA", "opX"}, 2000));  // 人员不匹配
+    AF_EXPECT(!verify_work_order(registry, registry[1], {"opA", "opB"}, 2000));  // 过期
+    AF_EXPECT(!verify_work_order(registry, registry[2], {"opA", "opB"}, 2000));  // 已关闭
+
+    AggSet set;
+    set.operator_ids = {"opA", "opB"};
+    std::vector<WhitelistGroup> wl = { {"合法组", {"opA", "opB"}, 0} };
+    AF_EXPECT(in_whitelist(wl, set, 0));
+    std::vector<WhitelistGroup> wl_partial = { {"组", {"opA"}, 0} };
+    AF_EXPECT(!in_whitelist(wl_partial, set, 0));   // 集合未全部登记 → 不放行
+}
+
+void test_collusion_detect_scoring() {
+    using namespace af::collusion;
+    EngineConfig cfg;   // 默认：rule_cap=40/profile_cap=25/ticket=40/high=80/mid=40
+    std::vector<Rule> rules = {
+        {"R-001", "备份销毁合谋", true, "backup-group", 2, 85,
+         { {{"delete"}}, {{"unmount"}}, {{"snapshot"}} }},
+        {"R-003", "配置篡改链路", true, "sys-config-group", 2, 70,
+         { {{"modify"}}, {{"restart"}}, {{"clear"}} }},
+    };
+    ProfileSnapshot profile;   // 空：全部视为陌生协作(+12)/跨域操作(+12) → 画像 24 分
+    std::vector<WorkOrder> wos = { {"WO-OK", "执行中", {"opA", "opB"}, 0, 0} };
+
+    // R-001 完整链路：基础分 85 + 画像 24 → 109 → 钳制 100 高风险
+    AggSet set;
+    set.asset_group = "backup-group";
+    set.operator_ids = {"opA", "opB"};
+    set.events = {
+        {"opA", 1000, "h", "file/delete", "db.bak", "", "", ""},
+        {"opB", 2000, "h", "disk/unmount", "disk0", "", "", ""},
+        {"opB", 3000, "h", "snap/delete", "snapshot-1", "", "", ""},
+    };
+    auto r = detect(set, cfg, rules, profile, wos, 0);
+    AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(1));
+    AF_EXPECT_EQ(r.total_score, 100);
+    AF_EXPECT_EQ(r.level, std::string("HIGH"));
+
+    // 关联有效工单：109 - 40 = 69 中风险
+    set.work_order_ids = {"WO-OK"};
+    r = detect(set, cfg, rules, profile, wos, 0);
+    AF_EXPECT(r.ticket_valid);
+    AF_EXPECT_EQ(r.total_score, 69);
+    AF_EXPECT_EQ(r.level, std::string("MID"));
+
+    // 伪造工单（未登记）：不减分，画像 +10 封顶 25 → 仍为高风险
+    set.work_order_ids = {"WO-FAKE"};
+    r = detect(set, cfg, rules, profile, wos, 0);
+    AF_EXPECT(r.forged_ticket);
+    AF_EXPECT_EQ(r.level, std::string("HIGH"));
+
+    // 白名单命中：直接放行，仅保留线索
+    set.work_order_ids.clear();
+    cfg.whitelist_groups = { {"组", {"opA", "opB"}, 0} };
+    r = detect(set, cfg, rules, profile, wos, 0);
+    AF_EXPECT(r.whitelisted);
+    AF_EXPECT_EQ(r.level, std::string("LOW"));
+    AF_EXPECT_EQ(r.total_score, 0);
+    cfg.whitelist_groups.clear();
+
+    // 硬约束：仅画像异常（规则零命中）时不得触发高风险
+    AggSet lone;
+    lone.asset_group = "db-group";
+    lone.operator_ids = {"opX", "opY"};
+    lone.events = { {"opX", 1000, "h", "file/write", "n.sql", "", "", ""},
+                    {"opY", 2000, "h", "file/read", "n.sql", "", "", ""} };
+    r = detect(lone, cfg, rules, profile, wos, 0);
+    AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(0));
+    AF_EXPECT(r.total_score < cfg.score_high);
+    AF_EXPECT_EQ(r.level, std::string("LOW"));
+
+    // 多规则不跨资产组误配：R-003 单命中，70 + 画像 24 = 94 高风险
+    AggSet multi = set;
+    multi.asset_group = "sys-config-group";
+    multi.events = { {"opA", 1000, "h", "cfg/modify", "s.conf", "", "", ""},
+                     {"opB", 2000, "h", "svc/restart", "nginx", "", "", ""},
+                     {"opA", 3000, "h", "log/clear", "sys.log", "", "", ""} };
+    multi.operator_ids = {"opA", "opB"};
+    r = detect(multi, cfg, rules, profile, wos, 0);
+    AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(1));
+    AF_EXPECT_EQ(r.total_score, 94);
+    AF_EXPECT_EQ(r.level, std::string("HIGH"));
+}
+
+void test_collusion_engine_end_to_end() {
+    using namespace af;
+    using namespace af::collusion;
+    // 独立临时数据目录，验证 接入→聚合→检测→存储→处置 全链路
+    auto dir = fs::join(fs::temp_directory(), "af_collusion_test_" + crypto::random_hex(4));
+    (void)fs::create_directories(dir);
+    {
+        Engine::instance().start(dir);
+        // 两个"陌生"操作员在 backup-group 上完成备份销毁链路。
+        // 时间戳放在历史窗口（已过期）：单次批量接入后立即冲刷并评估。
+        u64 ts = (1789700000000ULL / 900000) * 900000 - 7200000;  // 15min 窗口对齐且已过期
+        std::ostringstream body;
+        body << R"({"events":[)"
+             << R"({"oper_id":"opH","event_timestamp":)" << ts << R"(,"server_id":"srv-1",)"
+             << R"("op_type":"delete","res_key":"db.bak","op_param":"demo","return_code":0},)"
+             << R"({"oper_id":"opI","event_timestamp":)" << ts << R"(,"server_id":"srv-1",)"
+             << R"("op_type":"unmount","res_key":"backup-disk0","op_param":"demo","return_code":0},)"
+             << R"({"oper_id":"opH","event_timestamp":)" << ts << R"(,"server_id":"srv-1",)"
+             << R"("op_type":"delete_snapshot","res_key":"snapshot-9","op_param":"demo","return_code":0}]})";
+        AF_EXPECT_EQ(Engine::instance().ingest_native_json(body.str()), 3);
+        // 短窗口冲刷 → R-001 命中高风险；长窗口冲刷 → HIGH 降级 MID 线索
+        auto overview = Engine::instance().overview_json();
+        AF_EXPECT(overview.find("\"HIGH\": 1") != std::string::npos);
+        auto events = Engine::instance().events_json("HIGH", "", 10);
+        AF_EXPECT(events.find("R-001") != std::string::npos);
+        AF_EXPECT(events.find("opH") != std::string::npos);
+        // 提取 event_id 并完成处置闭环（"ce-" + 16 位 hex，总长 19）
+        auto p = events.find("ce-");
+        AF_EXPECT(p != std::string::npos);
+        std::string event_id = events.substr(p, 19);
+        std::string err;
+        AF_EXPECT(Engine::instance().dispose_event(event_id, "合法运维（误报）", "审计员", "演练", err));
+        AF_EXPECT(!Engine::instance().dispose_event(event_id, "随便填", "x", "", err));
+        auto after = Engine::instance().event_detail_json(event_id);
+        AF_EXPECT(after.find("合法运维（误报）") != std::string::npos);
+        // 报表应统计到误报
+        auto report = Engine::instance().report_json(7);
+        AF_EXPECT(report.find("\"misreports\": 1") != std::string::npos);
+        Engine::instance().stop();
+    }
+    (void)fs::remove(dir, true);   // 清理临时目录
+}
+
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // 无缓冲输出：崩溃时也能看到最后一条断言
     std::printf("AuditForwarder unit tests\n");
     test_types_and_string_conversion();
     test_crypto_hash_and_sign();
@@ -491,6 +686,10 @@ int main() {
     test_path_utilities();
     test_database_validation_and_crud();
     test_log_filter_profiles();
+    test_collusion_pure_logic();
+    test_collusion_workorder_and_whitelist();
+    test_collusion_detect_scoring();
+    test_collusion_engine_end_to_end();
 
     std::printf("\nResults: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

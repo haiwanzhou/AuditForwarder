@@ -53,6 +53,7 @@
         <a href="#enroll" class="nav-link">主机接入</a>
         <a href="#collector-control" class="nav-link">采集器控制</a>
         <a href="#security-mon" class="nav-link">日志与告警</a>
+        <a href="#collusion" class="nav-link">合谋检测</a>
         <a href="#log-policy" class="nav-link">日志策略</a>
         <a href="#operation-records" class="nav-link">操作记录</a>
         <a href="#actions" class="nav-link">运维操作</a>
@@ -379,6 +380,111 @@
             </div>
             <div id="operationLogList" class="security-list"></div>
           </div>
+        </div>
+      </section>
+
+      <section id="collusion" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Collusion Detection</p>
+            <h3>跨操作员合谋协同检测</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshCollusionBtn" class="button ghost small">刷新检测数据</button>
+            <span class="muted" id="collusionSummary">等待加载</span>
+          </div>
+        </div>
+
+        <div class="panel analytics-panel">
+          <article class="analytics-card">
+            <span>高风险事件</span>
+            <strong id="collusionHighCount">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>中风险事件</span>
+            <strong id="collusionMidCount">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>低风险线索</span>
+            <strong id="collusionLowCount">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>待复核事件</span>
+            <strong id="collusionPendingCount">--</strong>
+          </article>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">引擎状态与双窗口检测</span>
+            <button id="collusionEmergencyBtn" class="button ghost small">切换应急运维模式</button>
+          </div>
+          <dl class="detail-list">
+            <div><dt>模块状态</dt><dd id="collusionEnabled">--</dd></div>
+            <div><dt>短窗口 / 长窗口</dt><dd id="collusionWindows">--</dd></div>
+            <div><dt>风险阈值（中/高）</dt><dd id="collusionThresholds">--</dd></div>
+            <div><dt>检测规则 / 资产组</dt><dd id="collusionRuleStats">--</dd></div>
+            <div><dt>画像覆盖（操作员/协作对）</dt><dd id="collusionProfileStats">--</dd></div>
+            <div><dt>应急运维模式</dt><dd id="collusionEmergency">--</dd></div>
+          </dl>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">风险事件（新事件在前）</span>
+            <div class="section-actions">
+              <select id="collusionLevelFilter" class="field-inline">
+                <option value="">全部级别</option>
+                <option value="HIGH">高风险</option>
+                <option value="MID">中风险</option>
+                <option value="LOW">低风险线索</option>
+              </select>
+              <select id="collusionStatusFilter" class="field-inline">
+                <option value="">全部状态</option>
+                <option value="待复核">待复核</option>
+                <option value="确认合谋攻击">确认合谋攻击</option>
+                <option value="合法运维（误报）">合法运维（误报）</option>
+                <option value="待进一步调查">待进一步调查</option>
+              </select>
+            </div>
+          </div>
+          <div id="collusionEventList" class="security-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">合谋行为分析报表</span>
+            <div class="section-actions">
+              <input id="collusionReportDays" type="number" min="1" max="180" value="7"> 天
+              <button id="collusionReportBtn" class="button ghost small">生成报表</button>
+            </div>
+          </div>
+          <pre id="collusionReportView" class="code-block">点击“生成报表”查看近 7 天合谋检测统计。</pre>
+        </div>
+
+        <div class="panel grid-two">
+          <div>
+            <div class="toolbar">
+              <span class="muted">检测配置（保存后热生效）</span>
+              <button id="saveCollusionConfigBtn" class="button primary small">保存配置</button>
+            </div>
+            <textarea id="collusionConfigText" rows="14" spellcheck="false"></textarea>
+          </div>
+          <div>
+            <div class="toolbar">
+              <span class="muted">检测规则库（支持扩展行为特征）</span>
+              <button id="saveCollusionRulesBtn" class="button primary small">保存规则</button>
+            </div>
+            <textarea id="collusionRulesText" rows="14" spellcheck="false"></textarea>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">工单注册表（外部核验，四要素：存在/状态/人员/有效期）</span>
+            <button id="saveCollusionWorkordersBtn" class="button primary small">保存工单</button>
+          </div>
+          <textarea id="collusionWorkordersText" rows="8" spellcheck="false"></textarea>
         </div>
       </section>
 
