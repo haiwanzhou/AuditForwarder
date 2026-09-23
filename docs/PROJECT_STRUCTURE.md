@@ -15,6 +15,8 @@ AuditForwarder/
 ├── scripts/         # 安装和运维脚本
 │   └── database/    # 关系型数据库建表、初始化和备份恢复脚本
 ├── tests/           # 自动化测试
+├── AuditForwarder-Server-Bundle/  # 服务端一键部署包（启动脚本+配置模板）
+├── AuditForwarder-Client-Bundle/  # 客户端一键部署包（启动脚本+配置模板+使用说明）
 └── CMakeLists.txt   # 统一构建入口
 ```
 
@@ -67,6 +69,12 @@ server/src/manager/
 ```
 
 负责 HTTP/HTTPS 管理 API、主机管理、指标接收、远控命令队列、命令结果回传和静态页面服务。
+
+```text
+server/src/collusion/
+```
+
+跨操作员合谋协同检测模块（v1.1.0 新增）：事件清洗与资产组聚合、双窗口冲刷、规则引擎、行为画像评分、工单核验、风险分级、告警降噪、事件留存与处置报表。通过 manager 中的单行钩子并行接入，不侵入原有审计链路。公共接口声明在 `include/auditforwarder/collusion.h`。
 
 ```text
 server/src/server_main.cpp

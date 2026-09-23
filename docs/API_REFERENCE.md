@@ -200,6 +200,69 @@ data/server/login_audit.jsonl
 
 用途：查看当前 RBAC 策略说明。当前版本使用 Bearer Token 完成接口认证，认证通过后内置为 `admin` 角色；生产环境可扩展为用户表、角色绑定和细粒度接口授权。
 
+## 跨操作员合谋协同检测（v1.1.0）
+
+以下接口均需登录 Bearer Token，数据存储于 `data/server/collusion/` 与 `data/server/policies/collusion_*.json`。
+
+### GET /collusion/overview
+
+用途：返回引擎开关、双窗口时长、风险阈值、规则/资产组数量、画像覆盖、各级别事件计数与待复核数。
+
+### GET /collusion/events?level=<HIGH|MID|LOW>&status=<处置状态>&limit=<n>
+
+用途：按级别和处置状态查询风险事件（新事件在前，默认 100 条）。每条事件含评分、规则因子、画像因子、命中规则、涉事操作员、判定依据、处置对象和证据时间线。
+
+### GET /collusion/events/detail?id=<event_id>
+
+用途：返回单个风险事件完整 JSON；不存在返回 404。
+
+### GET /collusion/events/export?id=<event_id>
+
+用途：导出证据链 JSON（响应内容与 detail 相同，供审计归档下载）。
+
+### POST /collusion/events/dispose
+
+用途：处置风险事件。状态仅限 `待复核`、`确认合谋攻击`、`合法运维（误报）`、`待进一步调查`，非法状态返回 422。处置全程追加写入 `data/server/collusion/audit.jsonl`。
+
+```json
+{
+  "event_id": "ce-xxxxxxxxxxxxxxxx",
+  "status": "合法运维（误报）",
+  "disposer": "admin",
+  "note": "变更窗口内已报备操作"
+}
+```
+
+### GET/PUT /collusion/config
+
+读取 / 保存检测引擎配置（窗口、阈值、资产组、白名单、降噪等）。PUT 保存后约 2 秒热生效；窗口越界自动钳制，`asset_groups` 为空时返回 422。
+
+### GET/PUT /collusion/rules
+
+读取 / 保存规则库（PUT 体需含 `rules` 数组）。规则字段：`rule_id`、`name`、`enabled`、`asset_group`、`min_operator_cnt`、`base_score`、`op_sequence`（有序子序列，每步 `any_of` 关键词任一命中即可）。
+
+### GET/PUT /collusion/workorders
+
+读取 / 保存工单注册表，用于工单外部核验（存在性、状态、允许操作员、有效期四要素）。
+
+### POST /collusion/emergency
+
+用途：开启/解除应急运维模式。请求体：
+
+```json
+{ "enabled": true, "duration_minutes": 120, "actor": "admin" }
+```
+
+生效期间新评估事件风险等级自动降一级。
+
+### GET /collusion/report?days=<n>
+
+用途：生成近 N 天（1~180，默认 7）合谋行为分析报表，含各级别事件数、规则命中分布、按天趋势、确认攻击数、误报数与待复核数。
+
+### POST /collusion/ingest
+
+用途：接入设计文档原生格式审计事件（支持 `{"events":[...]}` 批量或单对象），供外部系统直连与演练。仅接收执行成功（`return_code=0` 且非失败 outcome）的事件。
+
 ## 远程控制
 
 ### POST /remote/control

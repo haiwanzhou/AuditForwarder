@@ -57,3 +57,4 @@ $zlibInstall/
 
 # Agent / 工作区元数据
 .workbuddy/
+.trae/

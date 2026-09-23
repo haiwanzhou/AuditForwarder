@@ -115,3 +115,12 @@ Manager HTTP接口、Self-Protection看门狗和Stats端点是观察/控制管�
 - 新处理器：继承 `af::Processor`，在 `Agent::init()` 中注册。
 - 新检测规则：追加到 `rules.yaml`。
 - 新传输：继承 `af::Transport`，在 `Agent::init()` 中替换。
+
+## 9. 服务端合谋检测引擎（v1.1.0）
+
+跨操作员合谋协同行为检测是**服务端侧**独立子系统（接口见 `include/auditforwarder/collusion.h`，实现见 `server/src/collusion/collusion.cpp`），与上述客户端管道并行、互不阻塞：
+
+- 接入：审计日志落盘后由服务端复制给合谋引擎，同时提供 `POST /collusion/ingest` 直连接口（设计文档原生格式）。
+- 评估：15 分钟短窗 / 4 小时长窗双窗口聚合；窗口到期冲刷，按 R-001~R-005 规则匹配 + 行为画像因子评分（HIGH ≥ 80、MID ≥ 40）；同一聚合 key 5 分钟降噪；有效工单 −40；白名单协同组仅留 0 分线索；应急模式自动降级。
+- 输出：风险事件写入 `data/server/collusion/events.jsonl`（中高 180 天、低 90 天留存），HIGH/MID 事件同时以 `source=collusion` 进入统一告警。
+- 配置热更新：`data/server/policies/collusion_{config,rules,workorders}.json` 由 Web「合谋检测」页管理，约 2 秒生效。
