@@ -922,6 +922,10 @@ RemoteAgentClient::HttpResponse RemoteAgentClient::http_request(const std::strin
     if (method == "POST" || method == "PUT") {
         req << "Content-Type: " << content_type << "\r\n"
             << "Content-Length: " << body.size() << "\r\n";
+        // 请求级完整性签名：服务端配置了同一 hmac_key 时强制验签，防止传输篡改
+        if (!cfg_.hmac_key.empty()) {
+            req << "X-Signature: " << crypto::hmac_sha256_hex(cfg_.hmac_key, body) << "\r\n";
+        }
     }
     req << "\r\n";
     std::string raw = req.str() + body;

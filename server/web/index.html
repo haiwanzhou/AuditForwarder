@@ -55,6 +55,8 @@
         <a href="#security-mon" class="nav-link">日志与告警</a>
         <a href="#collusion" class="nav-link">合谋检测</a>
         <a href="#log-policy" class="nav-link">日志策略</a>
+        <a href="#connection-requests" class="nav-link">连接请求</a>
+        <a href="#database" class="nav-link">数据库管理</a>
         <a href="#operation-records" class="nav-link">操作记录</a>
         <a href="#actions" class="nav-link">运维操作</a>
       </nav>
@@ -629,6 +631,93 @@
             </table>
           </div>
           <pre id="operationRecordJson" class="code-block records-json">[]</pre>
+        </div>
+      </section>
+
+      <section id="connection-requests" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Connection Requests</p>
+            <h3>客户端连接请求</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshConnectionsBtn" class="button ghost small">刷新</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">实时显示所有客户端的连接状态、标识与最近心跳时间</span>
+            <span class="muted" id="connectionCount">--</span>
+          </div>
+          <div class="records-table-wrap">
+            <table class="records-table">
+              <thead>
+                <tr>
+                  <th>主机 ID</th>
+                  <th>主机名称</th>
+                  <th>IP 地址</th>
+                  <th>操作系统</th>
+                  <th>最近心跳</th>
+                  <th>在线状态</th>
+                </tr>
+              </thead>
+              <tbody id="connectionList"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="database" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Database</p>
+            <h3>主机数据库管理</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshDbHostsBtn" class="button ghost small">刷新主机列表</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="filter-panel">
+            <label class="field">
+              <span>目标主机</span>
+              <select id="dbHostSelect"><option value="">请选择主机</option></select>
+            </label>
+            <label class="field">
+              <span>数据表</span>
+              <select id="dbTableSelect">
+                <option value="events">events</option>
+                <option value="metrics">metrics</option>
+                <option value="alerts">alerts</option>
+                <option value="audit">audit</option>
+                <option value="connection_requests">connection_requests</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>搜索关键词</span>
+              <input id="dbSearch" type="search" placeholder="搜索 raw_json 内容">
+            </label>
+            <label class="field">
+              <span>每页条数</span>
+              <input id="dbLimit" type="number" value="50" min="1" max="5000">
+            </label>
+            <button id="dbQueryBtn" class="button primary small">查询</button>
+            <button id="dbExportBtn" class="button ghost small">导出 NDJSON</button>
+          </div>
+          <div class="toolbar">
+            <span class="muted" id="dbResultInfo">请选择主机并点击查询。</span>
+          </div>
+          <div class="records-table-wrap">
+            <table class="records-table" id="dbResultTable">
+              <thead id="dbResultHead"></thead>
+              <tbody id="dbResultBody"></tbody>
+            </table>
+          </div>
+          <div class="action-row" id="dbPagination" style="display:none">
+            <button id="dbPrevPage" class="button ghost small">上一页</button>
+            <span class="muted" id="dbPageInfo"></span>
+            <button id="dbNextPage" class="button ghost small">下一页</button>
+          </div>
         </div>
       </section>
     </main>

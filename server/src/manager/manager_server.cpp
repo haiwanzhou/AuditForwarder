@@ -180,6 +180,34 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
+// SQL 字符串字面量转义：单引号双写，防止拼接 SQL 时注入/断句。
+// 注意：LIKE 场景需另对 % 和 _ 做转义（见 sql_like_escape）。
+std::string sql_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '\'') out += "''";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+// LIKE 模式转义：先转义单引号，再转义 % _ 与转义符本身（配合 ESCAPE '\'）。
+std::string sql_like_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '\'': out += "''"; break;
+            case '\\': out += "\\\\"; break;
+            case '%': out += "\\%"; break;
+            case '_': out += "\\_"; break;
+            default: out.push_back(c);
+        }
+    }
+    return out;
+}
+
 std::string json_unescape(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -1866,6 +1894,12 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
 
     AF_LOG_INFO("manager: listening on " << cfg_.listen
                 << "  (status_timeout=" << cfg_.status_timeout_seconds << "s)");
+    // 初始化每主机独立 SQLite 数据库
+    host_db_mgr_ = std::make_unique<db::HostDbManager>();
+    auto dbinit = host_db_mgr_->init(cfg_.data_dir);
+    if (dbinit.is_err()) {
+        AF_LOG_ERROR("host_db_mgr init failed: " << dbinit.error().message());
+    }
     // 合谋检测模块并行启动：复用 data_dir，与原有审计互不侵入
     collusion::Engine::instance().start(cfg_.data_dir);
     return Result<void>::ok();
@@ -1978,6 +2012,7 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
 
     // 头部（认证检查）。前端静态页面和登录接口允许直接访问，页面内的 API 请求仍按 Token 认证。
     bool auth_ok = cfg_.auth_token.empty() || is_public_path(path);
+    std::string x_signature;   // 请求级 HMAC-SHA256 签名（防篡改完整性校验）
     {
         std::istringstream hl(req.substr(0, bp == std::string::npos ? req.size() : bp));
         std::string line;
@@ -1997,8 +2032,25 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
                     if (v.size() > 7 && v.substr(0, 7) == "Bearer ") v = v.substr(7);
                     if (v == cfg_.auth_token || is_session_token_valid(v)) auth_ok = true;
                 }
+                if (key == "x-signature") {
+                    x_signature = line.substr(colon + 1);
+                    while (!x_signature.empty() && x_signature.front() == ' ') x_signature.erase(0, 1);
+                }
             }
             if (line.empty()) break;
+        }
+    }
+
+    // 请求级完整性校验：服务端配置了 chain_hmac_key 时，对 /agent/* 写请求强制验签；
+    // 未携带签名的写请求拒绝（GET/HEAD 等只读请求不强制；管理后台 POST 不受影响）。
+    bool integrity_ok = true;
+    bool is_agent_endpoint = (path.rfind("/agent/", 0) == 0);
+    if (!cfg_.chain_hmac_key.empty() && (method == "POST" || method == "PUT") && is_agent_endpoint) {
+        if (x_signature.empty()) {
+            integrity_ok = false;
+        } else {
+            const std::string expect = crypto::hmac_sha256_hex(cfg_.chain_hmac_key, body);
+            integrity_ok = constant_time_equal(x_signature, expect);
         }
     }
 
@@ -2008,6 +2060,10 @@ void SimpleHttpManager::handle_client(int fd, void* tls) {
     if (!auth_ok) {
         status = 401;
         resp_body = "{\"error\":\"unauthorized\"}";
+    } else if (!integrity_ok) {
+        status = 403;
+        resp_body = "{\"error\":\"integrity_check_failed\",\"message\":\"请求体完整性校验失败：缺少或无效的 X-Signature 签名\"}";
+        AF_LOG_WARN("integrity check failed from " << client_ip << " " << method << " " << path);
     } else {
         resp_body = route(method, path, query, body, content_type, status, client_ip);
     }
@@ -2805,6 +2861,26 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                 }
             }
             pending_rule_eval.emplace_back(host_id, item);
+            // 同时写入该主机的独立 SQLite 数据库（数据隔离存储）
+            if (host_db_mgr_) {
+                auto db_r = host_db_mgr_->host_db(host_id);
+                if (db_r.is_ok()) {
+                    std::ostringstream sql;
+                    sql << "INSERT INTO events(timestamp,collector,priority,operation_type,event_type,message,raw_json,checksum) VALUES("
+                        << "'" << sql_escape(iso_time(epoch_seconds())) << "',"
+                        << "'" << sql_escape(collector) << "',"
+                        << "'" << sql_escape(prio) << "',"
+                        << "'" << sql_escape(json_string_field(item, "operation_type")) << "',"
+                        << "'" << sql_escape(json_string_field(item, "event_type")) << "',"
+                        << "'" << sql_escape(json_string_field(item, "message")) << "',"
+                        << "'" << sql_escape(item) << "',"
+                        << "'" << sql_escape(crypto::sha256_hex(item)) << "')";
+                    auto ins = db_r.value()->exec(sql.str());
+                    if (ins.is_err()) {
+                        AF_LOG_WARN("sqlite insert event failed for host " << host_id << ": " << ins.error().message());
+                    }
+                }
+            }
             ++accepted;
         }
         std::ostringstream o;
@@ -3131,6 +3207,171 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         status = 404;
         return "{\n  \"error\": \"not found\"\n}";
     }
+
+    // ================= 客户端连接请求列表与主机数据库管理 =================
+    if (path == "/connection-requests" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        std::vector<HostRecord> hosts;
+        {
+            std::lock_guard<std::mutex> lk(host_store_mutex());
+            auto hosts_r = load_hosts(cfg_);
+            if (hosts_r.is_err()) {
+                status = 500;
+                return "{\n  \"error\": \"" + json_escape(hosts_r.error().message()) + "\"\n}";
+            }
+            hosts = std::move(hosts_r.value());
+        }
+        const u64 now = epoch_seconds();
+        std::ostringstream o;
+        o << "{\n  \"requests\": [\n";
+        for (std::size_t i = 0; i < hosts.size(); ++i) {
+            const auto& hr = hosts[i];
+            if (i) o << ",\n";
+            o << "    {\n"
+              << "      \"host_id\": \"" << json_escape(hr.id) << "\",\n"
+              << "      \"name\": \"" << json_escape(hr.name) << "\",\n"
+              << "      \"ip_address\": \"" << json_escape(hr.ip_address) << "\",\n"
+              << "      \"os_version\": \"" << json_escape(hr.os_version) << "\",\n"
+              << "      \"last_seen\": \"" << json_escape(iso_time(hr.last_seen_epoch)) << "\",\n"
+              << "      \"online\": " << ((hr.last_seen_epoch > 0 && now - hr.last_seen_epoch <= cfg_.status_timeout_seconds) ? "true" : "false") << "\n"
+              << "    }";
+        }
+        o << "\n  ]\n}";
+        return o.str();
+    }
+
+    // 列出所有拥有独立数据库的主机
+    if (path == "/db/hosts" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        if (!host_db_mgr_) return "{\n  \"hosts\": []\n}";
+        auto hosts = host_db_mgr_->list_hosts();
+        std::ostringstream o;
+        o << "{\n  \"hosts\": [";
+        for (std::size_t i = 0; i < hosts.size(); ++i) {
+            if (i) o << ", ";
+            o << "\"" << json_escape(hosts[i]) << "\"";
+        }
+        o << "]\n}";
+        return o.str();
+    }
+
+    // 查询指定主机的数据库（事件表分页+筛选）
+    if (path == "/db/query" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        auto host_id = query_param(query, "host_id");
+        if (host_id.empty() || !host_db_mgr_) {
+            status = 422;
+            return "{\n  \"error\": \"host_id required\"\n}";
+        }
+        auto db_r = host_db_mgr_->host_db(host_id);
+        if (db_r.is_err()) {
+            status = 404;
+            return "{\n  \"error\": \"host database not found\"\n}";
+        }
+        auto table = query_param(query, "table");
+        if (table.empty()) table = "events";
+        // 白名单表名，防止注入
+        static const std::set<std::string> allowed_tables = {"events","metrics","alerts","audit","connection_requests"};
+        if (allowed_tables.find(table) == allowed_tables.end()) {
+            status = 422;
+            return "{\n  \"error\": \"invalid table\"\n}";
+        }
+        auto limit = json_size_field("{\"limit\":" + query_param(query, "limit") + "}", "limit", 200);
+        if (limit > 5000) limit = 5000;
+        auto offset = json_size_field("{\"offset\":" + query_param(query, "offset") + "}", "offset", 0);
+        auto search = query_param(query, "search");
+
+        // 各表固定列名（与 sqlite_db.cpp 建表语句保持一致），用于前端渲染与导出
+        static const std::map<std::string, std::vector<std::string>> kTableColumns = {
+            {"events", {"id","timestamp","collector","priority","operation_type","event_type","message","raw_json","checksum"}},
+            {"metrics", {"id","timestamp","metric_name","metric_value","raw_json"}},
+            {"alerts", {"id","timestamp","severity","rule_id","message","evidence","raw_json"}},
+            {"audit", {"id","timestamp","actor","action","detail","raw_json"}},
+            {"connection_requests", {"id","timestamp","host_id","client_ip","status","message"}},
+        };
+        const auto& cols = kTableColumns.at(table);
+
+        std::ostringstream sql;
+        sql << "SELECT * FROM " << table;
+        if (!search.empty()) {
+            sql << " WHERE raw_json LIKE '%" << sql_like_escape(search) << "%' ESCAPE '\\'";
+        }
+        sql << " ORDER BY id DESC LIMIT " << limit << " OFFSET " << offset;
+        auto rows = db_r.value()->query(sql.str());
+        if (rows.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"" + json_escape(rows.error().message()) + "\"\n}";
+        }
+        std::ostringstream o;
+        o << "{\n  \"host_id\": \"" << json_escape(host_id) << "\",\n"
+          << "  \"table\": \"" << json_escape(table) << "\",\n"
+          << "  \"columns\": [";
+        for (std::size_t i = 0; i < cols.size(); ++i) {
+            if (i) o << ", ";
+            o << "\"" << cols[i] << "\"";
+        }
+        o << "],\n  \"count\": " << rows.value().size() << ",\n"
+          << "  \"rows\": [\n";
+        for (std::size_t i = 0; i < rows.value().size(); ++i) {
+            if (i) o << ",\n";
+            o << "    [";
+            for (std::size_t j = 0; j < rows.value()[i].size(); ++j) {
+                if (j) o << ", ";
+                o << "\"" << json_escape(rows.value()[i][j]) << "\"";
+            }
+            o << "]";
+        }
+        o << "\n  ]\n}";
+        return o.str();
+    }
+
+    // 导出指定主机的数据库为 NDJSON（含列名键值对）
+    if (path == "/db/export" && method == "GET") {
+        auto host_id = query_param(query, "host_id");
+        if (host_id.empty() || !host_db_mgr_) {
+            status = 422;
+            return "{\n  \"error\": \"host_id required\"\n}";
+        }
+        auto db_r = host_db_mgr_->host_db(host_id);
+        if (db_r.is_err()) {
+            status = 404;
+            return "{\n  \"error\": \"host database not found\"\n}";
+        }
+        auto table = query_param(query, "table");
+        if (table.empty()) table = "events";
+        static const std::set<std::string> allowed_tables = {"events","metrics","alerts","audit","connection_requests"};
+        if (allowed_tables.find(table) == allowed_tables.end()) {
+            status = 422;
+            return "{\n  \"error\": \"invalid table\"\n}";
+        }
+        static const std::map<std::string, std::vector<std::string>> kTableColumns = {
+            {"events", {"id","timestamp","collector","priority","operation_type","event_type","message","raw_json","checksum"}},
+            {"metrics", {"id","timestamp","metric_name","metric_value","raw_json"}},
+            {"alerts", {"id","timestamp","severity","rule_id","message","evidence","raw_json"}},
+            {"audit", {"id","timestamp","actor","action","detail","raw_json"}},
+            {"connection_requests", {"id","timestamp","host_id","client_ip","status","message"}},
+        };
+        const auto& cols = kTableColumns.at(table);
+        auto rows = db_r.value()->query("SELECT * FROM " + table + " ORDER BY id ASC");
+        if (rows.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"" + json_escape(rows.error().message()) + "\"\n}";
+        }
+        content_type = "application/x-ndjson; charset=utf-8";
+        std::ostringstream o;
+        for (const auto& row : rows.value()) {
+            bool first = true;
+            o << "{";
+            for (std::size_t j = 0; j < row.size() && j < cols.size(); ++j) {
+                if (!first) o << ",";
+                first = false;
+                o << "\"" << cols[j] << "\":\"" << json_escape(row[j]) << "\"";
+            }
+            o << "}\n";
+        }
+        return o.str();
+    }
+
     status = 404;
     return "{\n  \"error\": \"not found\"\n}";
 }

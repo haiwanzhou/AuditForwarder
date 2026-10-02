@@ -128,6 +128,24 @@ const els = {
   saveCollusionConfigBtn: $("saveCollusionConfigBtn"),
   saveCollusionRulesBtn: $("saveCollusionRulesBtn"),
   saveCollusionWorkordersBtn: $("saveCollusionWorkordersBtn"),
+  // 连接请求与数据库管理
+  refreshConnectionsBtn: $("refreshConnectionsBtn"),
+  connectionCount: $("connectionCount"),
+  connectionList: $("connectionList"),
+  refreshDbHostsBtn: $("refreshDbHostsBtn"),
+  dbHostSelect: $("dbHostSelect"),
+  dbTableSelect: $("dbTableSelect"),
+  dbSearch: $("dbSearch"),
+  dbLimit: $("dbLimit"),
+  dbQueryBtn: $("dbQueryBtn"),
+  dbExportBtn: $("dbExportBtn"),
+  dbResultInfo: $("dbResultInfo"),
+  dbResultHead: $("dbResultHead"),
+  dbResultBody: $("dbResultBody"),
+  dbPagination: $("dbPagination"),
+  dbPrevPage: $("dbPrevPage"),
+  dbNextPage: $("dbNextPage"),
+  dbPageInfo: $("dbPageInfo"),
 };
 
 const validationRules = {
@@ -1057,6 +1075,162 @@ async function generateCollusionReport() {
   }
 }
 
+// ---------------- 客户端连接请求 ----------------
+
+async function loadConnectionRequests(options = {}) {
+  if (!els.connectionList) return;
+  try {
+    const text = await request("/connection-requests", { timeoutMs: 8000 });
+    const data = parseJson(text, { requests: [] });
+    const items = data.requests || [];
+    els.connectionCount.textContent = `${items.length} 条记录`;
+    if (items.length === 0) {
+      els.connectionList.innerHTML = `<tr><td colspan="6" class="empty-cell">暂无客户端连接记录。</td></tr>`;
+      return;
+    }
+    els.connectionList.innerHTML = items.map((item) => `
+      <tr>
+        <td><code>${escapeHtml(item.host_id || "--")}</code></td>
+        <td>${escapeHtml(item.name || "--")}</td>
+        <td>${escapeHtml(item.ip_address || "--")}</td>
+        <td>${escapeHtml(item.os_version || "--")}</td>
+        <td>${escapeHtml(item.last_seen || "--")}</td>
+        <td><span class="pill ${item.online ? "ok" : "error"}">${item.online ? "在线" : "离线"}</span></td>
+      </tr>
+    `).join("");
+  } catch (err) {
+    els.connectionCount.textContent = "加载失败";
+    els.connectionList.innerHTML = `<tr><td colspan="6" class="empty-cell">加载连接请求失败：${escapeHtml(err.message)}</td></tr>`;
+    if (!options.silent) showNotice(err.message, "error");
+  }
+}
+
+// ---------------- 主机数据库管理 ----------------
+
+const dbState = {
+  hosts: [],
+  columns: [],
+  rows: [],
+  offset: 0,
+  limit: 50,
+  total: -1, // 未知总数
+  hostId: "",
+  table: "events",
+  search: "",
+};
+
+async function loadDbHosts() {
+  if (!els.dbHostSelect) return;
+  try {
+    const text = await request("/db/hosts", { timeoutMs: 8000 });
+    const data = parseJson(text, { hosts: [] });
+    dbState.hosts = data.hosts || [];
+    els.dbHostSelect.innerHTML = `<option value="">请选择主机</option>` +
+      dbState.hosts.map((h) => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join("");
+  } catch (err) {
+    showNotice(err.message, "error");
+  }
+}
+
+async function queryDatabase(offset = 0) {
+  const hostId = els.dbHostSelect?.value || "";
+  const table = els.dbTableSelect?.value || "events";
+  const search = (els.dbSearch?.value || "").trim();
+  const limit = Math.max(1, Math.min(5000, parseInt(els.dbLimit?.value, 10) || 50));
+  if (!hostId) {
+    showNotice("请先选择目标主机。", "error");
+    return;
+  }
+  dbState.hostId = hostId;
+  dbState.table = table;
+  dbState.search = search;
+  dbState.limit = limit;
+  dbState.offset = offset;
+
+  const qs = new URLSearchParams({ host_id: hostId, table, limit: String(limit), offset: String(offset) });
+  if (search) qs.set("search", search);
+  try {
+    const text = await request(`/db/query?${qs}`, { timeoutMs: 15000 });
+    const data = parseJson(text, { columns: [], rows: [], count: 0 });
+    dbState.columns = data.columns || [];
+    dbState.rows = data.rows || [];
+    renderDbResult();
+    recordOperation({
+      object: `主机数据库 ${hostId}/${table}`,
+      type: "db_query",
+      details: `查询第 ${offset / limit + 1} 页，返回 ${data.count} 条`,
+      status: "success",
+    });
+  } catch (err) {
+    showNotice(err.message, "error");
+    recordOperation({
+      object: `主机数据库 ${hostId}/${table}`,
+      type: "db_query",
+      details: "查询失败",
+      status: "failure",
+      error: err,
+    });
+  }
+}
+
+function renderDbResult() {
+  if (!els.dbResultHead || !els.dbResultBody) return;
+  const cols = dbState.columns;
+  const rows = dbState.rows;
+  els.dbResultInfo.textContent = `主机 ${dbState.hostId} · 表 ${dbState.table} · 返回 ${rows.length} 条（第 ${dbState.offset / dbState.limit + 1} 页）`;
+
+  els.dbResultHead.innerHTML = `<tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
+  if (rows.length === 0) {
+    els.dbResultBody.innerHTML = `<tr><td colspan="${cols.length}" class="empty-cell">暂无数据。</td></tr>`;
+  } else {
+    els.dbResultBody.innerHTML = rows.map((row) =>
+      `<tr>${row.map((cell) => `<td class="db-cell" title="${escapeHtml(cell)}">${escapeHtml(cell.length > 80 ? cell.slice(0, 80) + "…" : cell)}</td>`).join("")}</tr>`
+    ).join("");
+  }
+
+  els.dbPagination.style.display = rows.length > 0 || dbState.offset > 0 ? "flex" : "none";
+  els.dbPageInfo.textContent = `第 ${dbState.offset / dbState.limit + 1} 页 · 每页 ${dbState.limit} 条`;
+  els.dbPrevPage.disabled = dbState.offset === 0;
+  els.dbNextPage.disabled = rows.length < dbState.limit;
+}
+
+async function exportDatabase() {
+  const hostId = els.dbHostSelect?.value || "";
+  const table = els.dbTableSelect?.value || "events";
+  if (!hostId) {
+    showNotice("请先选择目标主机。", "error");
+    return;
+  }
+  try {
+    const text = await request(`/db/export?host_id=${encodeURIComponent(hostId)}&table=${encodeURIComponent(table)}`, { timeoutMs: 30000 });
+    const blob = new Blob([text], { type: "application/x-ndjson" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `auditforwarder_${hostId}_${table}_${new Date().toISOString().slice(0, 10)}.ndjson`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showNotice(`已导出 ${hostId}/${table} 数据。`);
+    recordOperation({
+      object: `主机数据库 ${hostId}/${table}`,
+      type: "db_export",
+      details: "导出 NDJSON 文件",
+      status: "success",
+    });
+  } catch (err) {
+    showNotice(err.message, "error");
+    recordOperation({
+      object: `主机数据库 ${hostId}/${table}`,
+      type: "db_export",
+      details: "导出失败",
+      status: "failure",
+      error: err,
+    });
+  }
+}
+
 function renderCollectorCounts(data) {
   const totals = data.collector_totals || {};
   const entries = Object.entries(totals).sort((a, b) => b[1] - a[1]);
@@ -1763,6 +1937,17 @@ function init() {
   els.copyRecordsBtn.addEventListener("click", copyOperationRecords);
   els.exportRecordsBtn.addEventListener("click", exportOperationRecords);
   els.clearRecordsBtn.addEventListener("click", clearOperationRecords);
+  // 连接请求与数据库管理
+  if (els.refreshConnectionsBtn) els.refreshConnectionsBtn.addEventListener("click", () => loadConnectionRequests());
+  if (els.refreshDbHostsBtn) els.refreshDbHostsBtn.addEventListener("click", () => loadDbHosts());
+  if (els.dbQueryBtn) els.dbQueryBtn.addEventListener("click", () => queryDatabase(0));
+  if (els.dbExportBtn) els.dbExportBtn.addEventListener("click", exportDatabase);
+  if (els.dbPrevPage) els.dbPrevPage.addEventListener("click", () => queryDatabase(Math.max(0, dbState.offset - dbState.limit)));
+  if (els.dbNextPage) els.dbNextPage.addEventListener("click", () => queryDatabase(dbState.offset + dbState.limit));
+  if (els.dbHostSelect) els.dbHostSelect.addEventListener("change", () => queryDatabase(0));
+  if (els.dbSearch) els.dbSearch.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") queryDatabase(0);
+  });
   els.tokenDialog.addEventListener("click", (event) => {
     if (event.target === els.tokenDialog) closeTokenDialog();
   });

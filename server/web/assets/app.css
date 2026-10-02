@@ -1144,6 +1144,14 @@ a:focus-visible {
   text-align: center !important;
 }
 
+.db-cell {
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
 .status-tag {
   display: inline-flex;
   align-items: center;

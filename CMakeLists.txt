@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(AuditForwarder
     VERSION 1.0.0
     DESCRIPTION "企业级跨平台安全审计 Agent"
-    LANGUAGES CXX)
+    LANGUAGES C CXX)
 
 # -----------------------------------------------------------------------------
 # 全局设置
@@ -76,6 +76,7 @@ set(AF_CORE_SOURCES
     shared/src/common/process.cpp
     shared/src/common/event.cpp
     shared/src/database/database.cpp
+    shared/src/database/sqlite_db.cpp
 
     # 客户端核心模块
     client/src/core/agent.cpp
@@ -125,12 +126,18 @@ endif()
 
 add_library(auditforwarder_core STATIC ${AF_CORE_SOURCES})
 
+# SQLite 内嵌源码（零外部依赖）
+add_library(sqlite3_embedded STATIC third_party/sqlite3/sqlite3.c)
+target_include_directories(sqlite3_embedded PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite3")
+target_compile_definitions(sqlite3_embedded PRIVATE SQLITE_ENABLE_FTS5)
+
 target_include_directories(auditforwarder_core
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/client/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/server/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/shared/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite3"
 )
 
 target_link_libraries(auditforwarder_core
@@ -138,6 +145,7 @@ target_link_libraries(auditforwarder_core
         Threads::Threads
         OpenSSL::SSL
         OpenSSL::Crypto
+        sqlite3_embedded
         ZLIB::ZLIB
 )
 
@@ -181,6 +189,15 @@ target_link_libraries(auditforwarder-client PRIVATE auditforwarder_core)
 add_executable(auditforwarder-server server/src/server_main.cpp)
 target_link_libraries(auditforwarder-server PRIVATE auditforwarder_core)
 
+# 客户端 GUI 程序（Windows 原生窗口，仅 Windows 构建）
+if(WIN32)
+    add_executable(auditforwarder-client-gui client/src/gui/client_gui.cpp)
+    target_link_libraries(auditforwarder-client-gui PRIVATE auditforwarder_core comctl32)
+    set_target_properties(auditforwarder-client-gui PROPERTIES
+        WIN32_EXECUTABLE TRUE
+    )
+endif()
+
 # 注意：保持控制台子系统（不设 WIN32_EXECUTABLE），服务端/客户端的运行日志
 # 直接输出在控制台窗口（小黑窗口），监视线程的上下线告警也打印在这里。
 
@@ -189,6 +206,9 @@ install(TARGETS auditforwarderd auditforwarder-client auditforwarder-server
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
+if(WIN32)
+    install(TARGETS auditforwarder-client-gui RUNTIME DESTINATION bin)
+endif()
 
 # -----------------------------------------------------------------------------
 # 测试

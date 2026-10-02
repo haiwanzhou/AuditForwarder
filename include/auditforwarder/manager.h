@@ -3,8 +3,10 @@
 // 用于状态查询、配置重载、日志查询和远程升级。
 
 #include "auditforwarder/agent.h"
+#include "auditforwarder/sqlite_db.h"
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -63,6 +65,9 @@ private:
     std::mutex          auth_mutex_;
     std::map<std::string, std::pair<int, std::uint64_t>> login_failures_;
     std::map<std::string, std::pair<std::string, std::uint64_t>> session_tokens_;
+
+    // 每主机独立 SQLite 数据库（数据隔离存储）
+    std::unique_ptr<db::HostDbManager> host_db_mgr_;
 };
 
 }  // namespace af

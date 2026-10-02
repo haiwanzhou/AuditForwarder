@@ -250,6 +250,7 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     rc.auth_token = tc.auth_token;
     rc.host_id = cfg_.remote_host_id.empty() ? cfg_.agent_id : cfg_.remote_host_id;
     rc.data_dir = cfg_.data_dir;
+    rc.hmac_key = cfg_.chain_hmac_key;
     rc.heartbeat_interval_sec = cfg_.remote_heartbeat_interval_sec;
     rc.command_poll_interval_sec = cfg_.remote_command_poll_interval_sec;
     rc.audit_summary_interval_sec = cfg_.remote_audit_summary_interval_sec;
