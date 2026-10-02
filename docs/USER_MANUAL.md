@@ -677,6 +677,38 @@ Token 会保存在当前浏览器，用于访问需要认证的接口。
 
 新增自定义规则时，在规则库 JSON 中追加规则对象：`op_sequence` 为按时间有序的操作子序列，每一步 `any_of` 中任一关键词命中即视为完成该步骤。
 
+### 7.12 连接请求
+
+左侧导航点击「连接请求」进入客户端连接管理页面：
+
+- 实时显示所有客户端的连接状态、主机标识、IP 地址、操作系统版本、最近心跳时间与在线/离线状态。
+- 支持手动刷新，也可依赖顶部「自动刷新」开关每 30 秒自动更新。
+- 在线状态根据 `manager.status_timeout_seconds`（默认 30 秒）心跳超时自动判定。
+
+### 7.13 数据库管理
+
+左侧导航点击「数据库管理」进入主机数据库查看页面：
+
+1. **选择主机**：下拉列表显示所有拥有独立数据库的客户端主机（服务端自动扫描 `data/hosts/<host_id>/host.db`）。
+2. **选择数据表**：支持 `events`（审计事件）、`metrics`（资源指标）、`alerts`（告警）、`audit`（操作审计）、`connection_requests`（连接记录）。
+3. **搜索**：输入关键词后点击「查询」或按回车，对 `raw_json` 字段进行模糊匹配（LIKE 查询，防注入转义）。
+4. **分页浏览**：默认每页 50 条，可调整每页条数（1~5000），支持上一页/下一页翻页。
+5. **导出**：点击「导出 NDJSON」将当前查询结果保存为本地文件，文件名格式为 `auditforwarder_<host>_<table>_<date>.ndjson`。
+
+注意：数据库查询与导出操作需要管理员 Token 认证，所有操作会记录到「操作记录」页面。
+
+### 7.14 客户端 GUI
+
+客户端提供 Windows 原生图形界面程序 `auditforwarder-client-gui.exe`，位于构建输出目录。
+
+主要功能：
+
+- **服务端地址配置**：输入服务端 IP 地址和端口号，支持保存到 `config/client_windows.yaml`。
+- **客户端标识**：设置 Agent ID（留空则自动使用主机名 + `-gui` 后缀）。
+- **连接管理**：点击「连接服务端」后，先通过 HTTP 探测 `/status` 接口验证连通性，成功后启动 Agent 采集与上报。
+- **重试机制**：连接失败时按设定次数自动重试，采用指数退避策略（5s/10s/15s...最大 30s）。
+- **状态显示**：实时显示连接状态（未连接/连接中/已连接/连接失败/运行中/已停止）与详细操作日志。
+
 ---
 
 ## 8. API 使用说明
@@ -700,6 +732,10 @@ POST /agent/operation-logs 上传结构化操作日志
 GET  /logs/query    检索操作日志
 GET  /logs/analytics 日志与告警统计分析
 GET  /alerts        查看违规告警
+GET  /connection-requests           查看客户端连接请求列表
+GET  /db/hosts                       列出拥有独立数据库的主机
+GET  /db/query?host_id=&table=&limit=&offset=&search=  分页查询主机数据库
+GET  /db/export?host_id=&table=      导出主机数据库表为 NDJSON
 ```
 
 合谋协同检测接口（均需登录 Token）：
@@ -1108,6 +1144,16 @@ pending 事件数量 >= batch_size 时自动 flush
 ---
 
 ## 13. 版本更新记录
+
+### v1.2.0
+
+- 新增客户端图形化界面（GUI）：Windows 原生窗口程序 `auditforwarder-client-gui.exe`，支持服务端 IP/端口配置、客户端标识设置、连接状态实时显示、自动重试与指数退避、配置持久化保存到 YAML。
+- 新增每主机独立 SQLite 数据库存储：服务端为每个客户端主机创建独立数据库实例（`data/hosts/<host_id>/host.db`），自动建表 `events`/`metrics`/`alerts`/`audit`/`connection_requests`，启用 WAL 模式提升并发可靠性，实现数据隔离与安全管理。
+- 新增客户端连接请求管理：Web 控制台「连接请求」页面实时显示所有客户端的连接状态、主机标识、IP 地址、最近心跳时间与在线/离线状态。
+- 新增数据库查看功能：Web 控制台「数据库管理」页面支持选择目标主机、切换数据表、关键词搜索（raw_json LIKE）、分页浏览、导出 NDJSON 文件。
+- 新增请求级 HMAC-SHA256 完整性校验：客户端对 POST/PUT 请求体计算 `X-Signature` 头，服务端对 `/agent/*` 写请求强制验签，防止传输篡改；密钥由 `manager.chain_hmac_key` 配置。
+- 新增 SQL 注入防护：所有 SQL 拼接使用 `sql_escape`/`sql_like_escape` 转义，LIKE 搜索支持 `%`/`_` 转义。
+- 构建系统：CMake 集成 SQLite amalgamation（内嵌零依赖），新增 C 语言支持以编译 `sqlite3.c`。
 
 ### v1.1.0
 
