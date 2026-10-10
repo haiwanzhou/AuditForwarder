@@ -52,7 +52,7 @@
         <a href="#hosts" class="nav-link">主机管理</a>
         <a href="#enroll" class="nav-link">主机接入</a>
         <a href="#collector-control" class="nav-link">采集器控制</a>
-        <a href="#security-mon" class="nav-link">日志与告警</a>
+        <a href="#security-monitor" class="nav-link">日志与告警</a>
         <a href="#collusion" class="nav-link">合谋检测</a>
         <a href="#log-policy" class="nav-link">日志策略</a>
         <a href="#connection-requests" class="nav-link">连接请求</a>
@@ -68,9 +68,12 @@
 
     <main class="content">
       <header class="topbar">
-        <div>
-          <p class="eyebrow">实时控制台</p>
-          <h2>审计代理运行状态</h2>
+        <div class="topbar-title">
+          <button id="viewBackBtn" class="button ghost small view-back" type="button" title="返回上一视图（浏览器后退）" hidden>← 返回</button>
+          <div>
+            <p class="eyebrow">实时控制台</p>
+            <h2 id="currentViewTitle">运行概览</h2>
+          </div>
         </div>
         <div class="topbar-actions">
           <label class="toggle-field" title="开启后每 30 秒只刷新运行状态、主机和日志摘要，避免频繁拉取大体积配置与批次数据。">
@@ -84,7 +87,7 @@
 
       <section id="notice" class="notice hidden" role="status"></section>
 
-      <section id="overview" class="section">
+      <section id="overview" class="section view-active">
         <div class="section-head">
           <div>
             <p class="eyebrow">系统概览</p>
@@ -123,6 +126,46 @@
           <div class="help-card">
             <h4>使用提示</h4>
             <p>请优先使用登录页进入系统。Token 会由服务端登录接口签发，也可以在调试时手动设置。</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <h4>快捷入口</h4>
+            <span class="muted">常用功能一键直达，无需在长页面中查找</span>
+          </div>
+          <div class="quick-grid">
+            <a href="#database" class="quick-card quick-card-primary" data-quick-goto="#database" role="button">
+              <span class="quick-icon" aria-hidden="true">▤</span>
+              <span class="quick-body">
+                <strong>数据库查询</strong>
+                <span class="muted">按主机查看独立数据库，支持搜索、分页与导出</span>
+              </span>
+              <span class="quick-arrow" aria-hidden="true">→</span>
+            </a>
+            <a href="#connection-requests" class="quick-card" data-quick-goto="#connection-requests" role="button">
+              <span class="quick-icon" aria-hidden="true">◔</span>
+              <span class="quick-body">
+                <strong>连接请求</strong>
+                <span class="muted">查看客户端在线状态、标识与最近心跳</span>
+              </span>
+              <span class="quick-arrow" aria-hidden="true">→</span>
+            </a>
+            <a href="#hosts" class="quick-card" data-quick-goto="#hosts" role="button">
+              <span class="quick-icon" aria-hidden="true">▦</span>
+              <span class="quick-body">
+                <strong>主机管理</strong>
+                <span class="muted">注册主机、远程控制指令下发</span>
+              </span>
+              <span class="quick-arrow" aria-hidden="true">→</span>
+            </a>
+            <a href="#security-monitor" class="quick-card" data-quick-goto="#security-monitor" role="button">
+              <span class="quick-icon" aria-hidden="true">⚠</span>
+              <span class="quick-body">
+                <strong>日志与告警</strong>
+                <span class="muted">结构化日志检索与违规告警分析</span>
+              </span>
+              <span class="quick-arrow" aria-hidden="true">→</span>
+            </a>
           </div>
         </div>
       </section>
@@ -659,6 +702,7 @@
                   <th>操作系统</th>
                   <th>最近心跳</th>
                   <th>在线状态</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody id="connectionList"></tbody>

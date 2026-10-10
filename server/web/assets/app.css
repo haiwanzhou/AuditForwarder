@@ -251,9 +251,39 @@ a:focus-visible {
 }
 
 .section {
+  display: none;
   margin: 26px 0;
   min-width: 0;
   scroll-margin-top: 24px;
+}
+
+/* 视图路由：同一时刻只渲染当前导航对应的 section，避免长页面拥挤 */
+.content > .section.view-active {
+  display: block;
+  animation: af-view-in 0.22s ease both;
+}
+
+@keyframes af-view-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 顶栏标题区：返回按钮 + 当前视图名 */
+.topbar-title {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.view-back[hidden] {
+  display: none;
 }
 
 .section-head {
@@ -312,6 +342,93 @@ a:focus-visible {
   display: grid;
   grid-template-columns: 1.4fr 1fr;
   gap: 18px;
+}
+
+/* 主页快捷入口卡片 */
+.quick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.quick-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  border: 1px solid rgba(219, 227, 239, 0.9);
+  border-radius: 16px;
+  background: var(--surface-soft);
+  color: var(--text);
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.quick-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--primary);
+  box-shadow: 0 14px 30px rgba(37, 99, 235, 0.14);
+  background: var(--surface);
+}
+
+.quick-card:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 2px;
+}
+
+.quick-card-primary {
+  border-color: rgba(37, 99, 235, 0.45);
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.10), rgba(37, 99, 235, 0.02));
+}
+
+.quick-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.12);
+  color: var(--primary);
+  font-size: 20px;
+}
+
+.quick-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.quick-body strong {
+  font-size: 15px;
+}
+
+.quick-body .muted {
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.quick-arrow {
+  flex: none;
+  color: var(--muted);
+  font-size: 18px;
+  transition: transform 0.18s ease, color 0.18s ease;
+}
+
+.quick-card:hover .quick-arrow {
+  color: var(--primary);
+  transform: translateX(4px);
+}
+
+@media (max-width: 640px) {
+  .quick-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .detail-list {
@@ -1231,13 +1348,40 @@ a:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  /* 移动端：侧边栏收敛为顶部常驻横向导航条，切换视图后仍可随时跳转 */
   .sidebar {
-    position: relative;
+    position: sticky;
+    top: 0;
+    z-index: 30;
     height: auto;
+    max-height: none;
+    padding: 10px 12px;
+    overflow: visible;
+  }
+
+  .brand {
+    display: none;
+  }
+
+  .sidebar-card {
+    display: none;
   }
 
   .nav {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: flex;
+    grid-template-columns: none;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+
+  .nav-link {
+    flex: none;
+    padding: 8px 14px;
+    white-space: nowrap;
+    font-size: 14px;
   }
 
   .cards,

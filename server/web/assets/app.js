@@ -27,6 +27,8 @@ const els = {
   autoRefreshToggle: $("autoRefreshToggle"),
   refreshBtn: $("refreshBtn"),
   tokenBtn: $("tokenBtn"),
+  viewBackBtn: $("viewBackBtn"),
+  currentViewTitle: $("currentViewTitle"),
   notice: $("notice"),
   statusPill: $("statusPill"),
   eventsCollected: $("eventsCollected"),
@@ -285,6 +287,7 @@ async function login(event) {
     els.loginPassword.value = "";
     setLoginMessage("登录成功，正在进入控制台。", "success");
     showApp();
+    renderView(routerState.current);
     refreshAll({ record: false });
   } catch (err) {
     setLoginMessage(err.message || "账号或密码不正确。");
@@ -1075,6 +1078,109 @@ async function generateCollusionReport() {
   }
 }
 
+// ---------------- 单页视图路由（侧边栏导航切换） ----------------
+
+const VIEW_DEFAULT = "#overview";
+const routerState = { current: "", navDepth: 0 };
+const loadedViews = new Set();
+
+// 各视图首次激活时的惰性数据加载器（会话期间只触发一次，避免无谓请求）
+const VIEW_LOADERS = {
+  "#database": () => loadDbHosts(),
+  "#connection-requests": () => loadConnectionRequests({ silent: true }),
+};
+
+function knownViews() {
+  return [...document.querySelectorAll(".nav-link")]
+    .map((link) => link.getAttribute("href"))
+    .filter((hash) => hash && hash.startsWith("#") && document.querySelector(hash));
+}
+
+function normalizeView(hash) {
+  return knownViews().includes(hash) ? hash : VIEW_DEFAULT;
+}
+
+// 渲染指定视图：只显示对应 section，更新导航高亮、顶栏标题与返回按钮。
+// 纯 DOM 切换，不刷新页面，登录 Token 等会话状态保持不变。
+function renderView(hash, options = {}) {
+  const view = normalizeView(hash);
+  document.querySelectorAll(".content > .section").forEach((section) => {
+    section.classList.toggle("view-active", `#${section.id}` === view);
+  });
+  document.querySelectorAll(".nav-link").forEach((link) => {
+    link.classList.toggle("active", link.getAttribute("href") === view);
+  });
+  const activeLink = document.querySelector(`.nav-link[href="${view}"]`);
+  if (els.currentViewTitle && activeLink) {
+    els.currentViewTitle.textContent = activeLink.textContent.trim();
+  }
+  if (els.viewBackBtn) els.viewBackBtn.hidden = view === VIEW_DEFAULT;
+  if (!options.initial && view !== routerState.current) {
+    // 切换后回到内容顶部，防止新视图停留在上个视图的滚动位置
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }
+  routerState.current = view;
+
+  // 仅在已登录后惰性加载（未登录时的 401 会打断登录页），每个视图会话内只触发一次
+  if (state.token && !loadedViews.has(view)) {
+    loadedViews.add(view);
+    const loader = VIEW_LOADERS[view];
+    if (loader) {
+      Promise.resolve()
+        .then(() => loader())
+        .catch(() => {});
+    }
+  }
+}
+
+// 编程式导航：写入历史栈（支持浏览器前进/后退与返回按钮）
+function navigateTo(hash) {
+  const view = normalizeView(hash);
+  if (view === routerState.current && window.location.hash === view) return;
+  routerState.navDepth += 1;
+  history.pushState({ afView: view }, "", view);
+  renderView(view);
+}
+
+function goBackOrOverview() {
+  if (routerState.navDepth > 0) {
+    history.back();
+  } else {
+    navigateTo(VIEW_DEFAULT);
+  }
+}
+
+function initRouter() {
+  // 侧边栏导航：拦截默认锚点跳转，改走视图路由（侧边栏始终固定可见）
+  document.querySelectorAll(".nav-link").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      const hash = link.getAttribute("href");
+      if (hash && hash.startsWith("#")) {
+        event.preventDefault();
+        navigateTo(hash);
+      }
+    });
+  });
+  // 浏览器前进/后退
+  window.addEventListener("popstate", () => {
+    routerState.navDepth = Math.max(0, routerState.navDepth - 1);
+    renderView(normalizeView(window.location.hash || VIEW_DEFAULT));
+  });
+  // 初始视图：尊重地址栏 hash（刷新/书签/分享链接可恢复到指定界面）
+  const initial = normalizeView(window.location.hash || VIEW_DEFAULT);
+  if (window.location.hash !== initial) {
+    history.replaceState({ afView: initial }, "", initial);
+  }
+  renderView(initial, { initial: true });
+}
+
+// 兼容既有调用：平滑切换到目标视图，返回目标是否存在。
+function gotoSection(selector) {
+  if (!document.querySelector(selector)) return false;
+  navigateTo(selector);
+  return true;
+}
+
 // ---------------- 客户端连接请求 ----------------
 
 async function loadConnectionRequests(options = {}) {
@@ -1085,23 +1191,45 @@ async function loadConnectionRequests(options = {}) {
     const items = data.requests || [];
     els.connectionCount.textContent = `${items.length} 条记录`;
     if (items.length === 0) {
-      els.connectionList.innerHTML = `<tr><td colspan="6" class="empty-cell">暂无客户端连接记录。</td></tr>`;
+      els.connectionList.innerHTML = `<tr><td colspan="7" class="empty-cell">暂无客户端连接记录。</td></tr>`;
       return;
     }
-    els.connectionList.innerHTML = items.map((item) => `
+    els.connectionList.innerHTML = items.map((item) => {
+      const hostId = item.host_id || "";
+      return `
       <tr>
-        <td><code>${escapeHtml(item.host_id || "--")}</code></td>
+        <td><code>${escapeHtml(hostId || "--")}</code></td>
         <td>${escapeHtml(item.name || "--")}</td>
         <td>${escapeHtml(item.ip_address || "--")}</td>
         <td>${escapeHtml(item.os_version || "--")}</td>
         <td>${escapeHtml(item.last_seen || "--")}</td>
         <td><span class="pill ${item.online ? "ok" : "error"}">${item.online ? "在线" : "离线"}</span></td>
+        <td>${hostId ? `<button class="button ghost small" type="button" data-db-host="${escapeHtml(hostId)}">查看数据库</button>` : "--"}</td>
       </tr>
-    `).join("");
+    `;
+    }).join("");
   } catch (err) {
     els.connectionCount.textContent = "加载失败";
-    els.connectionList.innerHTML = `<tr><td colspan="6" class="empty-cell">加载连接请求失败：${escapeHtml(err.message)}</td></tr>`;
+    els.connectionList.innerHTML = `<tr><td colspan="7" class="empty-cell">加载连接请求失败：${escapeHtml(err.message)}</td></tr>`;
     if (!options.silent) showNotice(err.message, "error");
+  }
+}
+
+// 从连接请求/其他页面联动进入数据库界面：跳转后刷新主机列表、预选主机并自动查询。
+async function openHostDatabase(hostId) {
+  if (!hostId) return;
+  gotoSection("#database");
+  try {
+    const hosts = await loadDbHosts();
+    if (!hosts.includes(hostId)) {
+      showNotice(`主机 ${hostId} 暂无独立数据库（可能尚未上报日志数据）。`, "error");
+      if (els.dbHostSelect) els.dbHostSelect.value = "";
+      return;
+    }
+    if (els.dbHostSelect) els.dbHostSelect.value = hostId;
+    await queryDatabase(0);
+  } catch (err) {
+    showNotice(err.message, "error");
   }
 }
 
@@ -1119,17 +1247,31 @@ const dbState = {
   search: "",
 };
 
+// 在途请求去重：路由惰性加载与“查看数据库”联动可能同时触发，避免重复渲染覆盖已选主机
+let dbHostsInFlight = null;
+
 async function loadDbHosts() {
-  if (!els.dbHostSelect) return;
-  try {
-    const text = await request("/db/hosts", { timeoutMs: 8000 });
-    const data = parseJson(text, { hosts: [] });
-    dbState.hosts = data.hosts || [];
-    els.dbHostSelect.innerHTML = `<option value="">请选择主机</option>` +
-      dbState.hosts.map((h) => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join("");
-  } catch (err) {
-    showNotice(err.message, "error");
-  }
+  if (!els.dbHostSelect) return [];
+  if (dbHostsInFlight) return dbHostsInFlight;
+  dbHostsInFlight = (async () => {
+    // 记住当前选择，刷新列表后尽量保持
+    const previous = els.dbHostSelect.value;
+    try {
+      const text = await request("/db/hosts", { timeoutMs: 8000 });
+      const data = parseJson(text, { hosts: [] });
+      dbState.hosts = data.hosts || [];
+      els.dbHostSelect.innerHTML = `<option value="">请选择主机</option>` +
+        dbState.hosts.map((h) => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join("");
+      if (previous && dbState.hosts.includes(previous)) els.dbHostSelect.value = previous;
+      return dbState.hosts;
+    } catch (err) {
+      showNotice(err.message, "error");
+      return [];
+    } finally {
+      dbHostsInFlight = null;
+    }
+  })();
+  return dbHostsInFlight;
 }
 
 async function queryDatabase(offset = 0) {
@@ -1460,7 +1602,7 @@ function fillHostForm(host) {
   els.hostNote.value = host.note || "";
   els.remoteHostId.value = host.id || "";
   validateFields(["hostId", "hostName", "hostIp", "hostHardware", "hostOs", "hostPermissions", "hostNote", "remoteHostId"]);
-  location.hash = "#hosts";
+  navigateTo("#hosts");
 }
 
 async function saveHost() {
@@ -1625,6 +1767,7 @@ async function refreshAll(options = {}) {
     await loadSecurityMonitor({ silent });
     await loadCollusion({ silent });
     await loadLogPolicy({ silent });
+    await loadConnectionRequests({ silent });
     if (!silent) showNotice("数据已刷新。");
     if (record) {
       recordOperation({
@@ -1666,6 +1809,7 @@ async function refreshLiveData() {
     await loadSecurityMonitor({ silent: true });
     await loadCollusion({ silent: true });
     await loadLogPolicy({ silent: true, skipProfiles: true });
+    await loadConnectionRequests({ silent: true });
   } catch (err) {
     els.statusPill.textContent = "连接异常";
     els.statusPill.className = "pill error";
@@ -1817,28 +1961,8 @@ function saveActorIdentity() {
 }
 
 function bindNavigation() {
-  const links = [...document.querySelectorAll(".nav-link")];
-  const byHash = new Map(links.map((link) => [link.getAttribute("href"), link]));
-  const activate = (hash) => {
-    links.forEach((item) => item.classList.toggle("active", item.getAttribute("href") === hash));
-  };
-  links.forEach((link) => {
-    link.addEventListener("click", () => {
-      activate(link.getAttribute("href"));
-    });
-  });
-  if ("IntersectionObserver" in window) {
-    const observer = new IntersectionObserver((entries) => {
-      const visible = entries
-        .filter((entry) => entry.isIntersecting)
-        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-      if (visible) activate(`#${visible.target.id}`);
-    }, { rootMargin: "-20% 0px -65% 0px", threshold: [0.1, 0.35, 0.65] });
-    byHash.forEach((_, hash) => {
-      const section = document.querySelector(hash);
-      if (section) observer.observe(section);
-    });
-  }
+  // 导航已由单页视图路由接管（见 initRouter），此处保留函数名供 init 调用
+  initRouter();
 }
 
 function init() {
@@ -1861,6 +1985,7 @@ function init() {
     });
   }
   els.refreshBtn.addEventListener("click", () => refreshAll());
+  if (els.viewBackBtn) els.viewBackBtn.addEventListener("click", goBackOrOverview);
   if (els.refreshSecurityBtn) els.refreshSecurityBtn.addEventListener("click", () => loadSecurityMonitor());
   // 合谋检测面板：刷新 / 过滤 / 事件操作 / 配置规则工单保存 / 应急模式 / 报表
   if (els.refreshCollusionBtn) els.refreshCollusionBtn.addEventListener("click", () => loadCollusion());
@@ -1947,6 +2072,19 @@ function init() {
   if (els.dbHostSelect) els.dbHostSelect.addEventListener("change", () => queryDatabase(0));
   if (els.dbSearch) els.dbSearch.addEventListener("keydown", (event) => {
     if (event.key === "Enter") queryDatabase(0);
+  });
+  // 主页快捷入口：拦截锚点默认跳转，统一走平滑滚动并立即高亮导航
+  document.querySelectorAll("[data-quick-goto]").forEach((card) => {
+    card.addEventListener("click", (event) => {
+      event.preventDefault();
+      gotoSection(card.getAttribute("data-quick-goto"));
+    });
+  });
+  // 连接请求列表：点击“查看数据库”联动跳转到数据库界面并预选主机
+  if (els.connectionList) els.connectionList.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-db-host]");
+    if (!btn) return;
+    openHostDatabase(btn.getAttribute("data-db-host"));
   });
   els.tokenDialog.addEventListener("click", (event) => {
     if (event.target === els.tokenDialog) closeTokenDialog();
