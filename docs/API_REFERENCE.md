@@ -237,6 +237,20 @@ data/server/login_audit.jsonl
 
 读取 / 保存检测引擎配置（窗口、阈值、资产组、白名单、降噪等）。PUT 保存后约 2 秒热生效；窗口越界自动钳制，`asset_groups` 为空时返回 422。
 
+配置 JSON 中除原有窗口、阈值、资产组、白名单、降噪字段外，M3/M4 新增以下字段（与 `data/server/policies/collusion_config.json` 对应）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `ml_enabled` | bool | false | ML 异常检测开关。模型就绪后再开启；无 ONNX Runtime 时引擎优雅降级。 |
+| `ml_high_threshold` | float | 0.7 | 异常分数高于此值时计入 `ml_factor`，范围 0~1。 |
+| `ml_max_factor` | int | 30 | ML 因子上限。线索性质，不直接触发 HIGH 风险。 |
+| `ml_model_path` | string | `models/isolation_forest.onnx` | ONNX 模型文件路径。预训练模型为孤立森林，输入 [1,20] → 输出 [1] 异常分数。 |
+| `graph_enabled` | bool | false | 图算法分析开关。历史基线图就绪后再开启。 |
+| `graph_threshold` | float | 0.3 | 图异常分量阈值，任一图算法分量（度中心性/社区/三角形/相似度）超过此值即计入 `graph_factor`。 |
+| `graph_max_factor` | int | 25 | 图因子上限。线索性质，不直接触发 HIGH 风险。 |
+
+风险评分总分公式更新为：`total = min(rule_factor, rule_max_factor) + min(profile_factor, profile_max_factor) + min(ml_factor, ml_max_factor) + min(graph_factor, graph_max_factor) - 有效工单扣减(40)`，硬约束不变：规则零命中时总分强制 < 80。`ml_factor` 与 `graph_factor` 均为线索性质，上限受各自 `*_max_factor` 约束，不直接触发 HIGH。`DetectionResult` 新增 `ml_factor` / `graph_factor` / `ml_notes` / `graph_notes` 字段，分别承载 ML 推理说明与图算法异常说明（社区/三角形/相似度线索）。
+
 ### GET/PUT /collusion/rules
 
 读取 / 保存规则库（PUT 体需含 `rules` 数组）。规则字段：`rule_id`、`name`、`enabled`、`asset_group`、`min_operator_cnt`、`base_score`、`op_sequence`（有序子序列，每步 `any_of` 关键词任一命中即可）。

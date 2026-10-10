@@ -12,6 +12,12 @@
 #include "auditforwarder/self_protect.h"
 #include "auditforwarder/transport.h"
 #include "auditforwarder/detector.h"
+
+// 安全产品适配器
+#include "collector/adapters/syslog_adapter.h"
+#include "collector/adapters/db_audit_adapter.h"
+#include "collector/adapters/bastion_adapter.h"
+
 #ifdef AF_PLATFORM_LINUX
 #  include "auditforwarder/platform_linux.h"
 #endif
@@ -94,6 +100,7 @@ Result<void> Agent::init(const AgentConfig& cfg) {
             cfg_.chain_batch_size = static_cast<std::size_t>(c.get_int("chain.batch_size", static_cast<long long>(cfg_.chain_batch_size)));
             cfg_.chain_signing_key = c.get_string("chain.signing_key", cfg_.chain_signing_key);
             cfg_.chain_hmac_key = c.get_string("chain.hmac_key", cfg_.chain_hmac_key);
+            cfg_.chain_super_batch_k = static_cast<std::size_t>(c.get_int("chain.super_batch_k", static_cast<long long>(cfg_.chain_super_batch_k)));
             cfg_.transport_mode = c.get_string("transport.mode", cfg_.transport_mode);
             cfg_.transport_interval_sec = static_cast<int>(c.get_int("transport.interval_sec", cfg_.transport_interval_sec));
             cfg_.transport_max_backoff_sec = static_cast<int>(c.get_int("transport.max_backoff_sec", cfg_.transport_max_backoff_sec));
@@ -167,9 +174,10 @@ Result<void> Agent::init(const AgentConfig& cfg) {
 
     // 初始化链
     chain::ChainConfig cc;
-    cc.data_dir      = cfg_.data_dir;
-    cc.batch_size    = cfg_.chain_batch_size;
-    cc.auto_persist  = true;
+    cc.data_dir       = cfg_.data_dir;
+    cc.batch_size     = cfg_.chain_batch_size;
+    cc.auto_persist   = true;
+    cc.super_batch_k  = cfg_.chain_super_batch_k;
     chain_ = std::make_unique<chain::Chain>(cc);
     if (!cfg_.chain_signing_key.empty()) {
         auto kp = crypto::KeyPair::load_pem(cfg_.chain_signing_key);
@@ -186,6 +194,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
 
     // 构建默认处理器链
     processors_.emplace_back(std::make_unique<processor::Enricher>(proc::hostname(), cfg_.agent_id));
+    // 数据清洗与标准化：在增强（补 host/agent_id）之后、去重之前统一字段格式
+    processors_.emplace_back(std::make_unique<processor::Normalizer>());
     processors_.emplace_back(std::make_unique<processor::PIIMasker>());
     processors_.emplace_back(std::make_unique<processor::Deduper>());
 
@@ -298,6 +308,37 @@ Result<void> Agent::init(const AgentConfig& cfg) {
         manager_ = std::make_unique<SimpleHttpManager>(mc);
     }
 
+    // 安全产品适配器（Syslog/DB审计/堡垒机），从配置文件 adapters 列表创建
+    {
+        auto& c = Config::instance();
+        if (c.root().has("adapters") && c.root()["adapters"].type() == ConfigValue::Type::List) {
+            const auto& adapters_list = c.root()["adapters"].as_list();
+            for (const auto& acfg : adapters_list) {
+                std::string type = acfg["type"].as_string();
+                std::string json_cfg = acfg.dump_json();
+
+                std::unique_ptr<SecurityAdapter> adapter;
+                if (type == "syslog") {
+                    adapter = std::make_unique<SyslogAdapter>();
+                } else if (type == "db_audit") {
+                    adapter = std::make_unique<DatabaseAuditAdapter>();
+                } else if (type == "bastion") {
+                    adapter = std::make_unique<BastionAdapter>();
+                }
+
+                if (adapter) {
+                    auto r = adapter->open(json_cfg);
+                    if (r.is_err()) {
+                        AF_LOG_ERROR("adapter: " << type << " open failed: " << r.error().message());
+                    } else {
+                        AF_LOG_INFO("adapter: " << adapter->name() << " opened");
+                        security_adapters_.push_back(std::move(adapter));
+                    }
+                }
+            }
+        }
+    }
+
     pool_.start(std::max<std::size_t>(4u, std::thread::hardware_concurrency()));
     AF_LOG_INFO("agent: init complete, id=" << cfg_.agent_id);
     return Result<void>::ok();
@@ -325,6 +366,15 @@ Result<void> Agent::start() {
         }
     } else {
         AF_LOG_INFO("collectors: created but disabled by config (can be enabled remotely)");
+    }
+
+    // 启动安全产品适配器轮询线程
+    if (!security_adapters_.empty()) {
+        adapters_running_.store(true);
+        for (auto& a : security_adapters_) {
+            adapter_threads_.emplace_back(&Agent::adapter_poll_loop, this, a.get());
+            AF_LOG_INFO("adapter: " << a->name() << " poll thread started");
+        }
     }
 
     if (self_protect_) {
@@ -367,6 +417,13 @@ void Agent::stop() {
     if (!running_.exchange(false)) return;
     AF_LOG_INFO("agent: stopping");
     if (injecting_.exchange(false) && injector_.joinable()) injector_.join();
+    // 停止安全产品适配器
+    adapters_running_.store(false);
+    for (auto& t : adapter_threads_) {
+        if (t.joinable()) t.join();
+    }
+    adapter_threads_.clear();
+    for (auto& a : security_adapters_) a->close();
     if (remote_client_) remote_client_->stop();
     if (transport_) transport_->stop();
     if (manager_)   manager_->stop();
@@ -376,6 +433,18 @@ void Agent::stop() {
     if (chain_) chain_->stop();
     pool_.shutdown(true);
     Logger::instance().flush();
+}
+
+void Agent::adapter_poll_loop(SecurityAdapter* adapter) {
+    while (adapters_running_.load()) {
+        int n = adapter->poll([this](const AuditEvent& ev) {
+            AuditEvent e = ev;
+            this->submit(e);
+        });
+        if (n == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
 }
 
 void Agent::submit(AuditEvent& ev) {

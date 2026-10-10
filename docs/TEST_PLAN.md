@@ -6,12 +6,19 @@
 
 ## 单元测试
 
+当前单元测试共 349 项，覆盖范围如下：
+
 | 范围 | 验证点 |
 | --- | --- |
 | 配置解析 | YAML/JSON、内联列表、注释、带引号 URL、文件后缀识别 |
 | 事件模型 | JSON 输出合法、字段完整、哈希稳定 |
 | 规则引擎 | 规则加载、列表字段解析、阈值窗口、响应动作 |
 | Chain | 批次大小、Merkle Root、签名、批次文件格式 |
+| 超级批次（M1） | `super_batch_k` 聚合触发、`super_root` 计算、`prev_super_root` 链式锚定、HMAC/Ed25519 签名校验、`verify_super_batch` / `verify_super_batch_with_key`、`recent_super_batches` 逆序返回、`super_batch_k=0` 禁用 |
+| 安全产品适配器（M2） | Syslog UDP 514 监听 + RFC 3164/5424 解析、数据库审计 JSON Lines 增量轮询、堡垒机 REST API 游标轮询、`AuditEvent` 转换正确性 |
+| 行为特征工程（M3） | `FeatureExtractor` 20 维 `BehaviorFeatures` 提取、特征顺序稳定、归一化边界、空集合降级 |
+| ONNX 推理（M3） | `OnnxModel` 加载/卸载、`is_loaded` 状态、`infer` 推理结果、无 Runtime 优雅降级（返回空向量不崩溃） |
+| 行为图算法（M4） | `BehaviorGraph` 节点/边增删查、度中心性异常、Louvain 社区检测、三角形计数、Jaccard 相似度、与基线对比 `analyze`、空图降级 |
 | 校验模块 | 必填、格式、长度、范围、错误返回 |
 | Remote Client | 指标 JSON、命令白名单、结果 JSON |
 
@@ -93,4 +100,5 @@ node --check server\web\assets\app.js
 ## 已知非阻塞项
 
 - Windows ETW Security 日志订阅需要管理员权限，普通权限下会出现 `EvtSubscribe` 失败。
-- 当前 CTest 项目返回成功，但测试用例数量较少，后续应补充配置解析和远端客户端单元测试。
+- M3 ONNX 推理测试在无 ONNX Runtime 的构建环境中验证优雅降级路径（`is_loaded()=false`、`infer()` 返回空向量），有运行时时验证真实推理路径。
+- M4 图算法测试在空图或无基线场景下验证降级路径，确保不崩溃、不阻断检测。

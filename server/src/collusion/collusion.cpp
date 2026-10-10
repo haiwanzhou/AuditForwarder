@@ -8,6 +8,9 @@
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/fs.h"
 #include "auditforwarder/logger.h"
+#include "auditforwarder/onnx_inference.h"      // M3: ONNX 推理封装
+#include "auditforwarder/feature_extractor.h"   // M3: 行为特征工程
+#include "auditforwarder/behavior_graph.h"      // M4: 轻量级图算法替代 GNN
 #include "manager/log_policy_util.h"
 
 #include <algorithm>
@@ -248,6 +251,13 @@ std::string default_config_json() {
   "emergency_mode": false,
   "emergency_until_epoch": 0,
   "profile_enabled": true,
+  "ml_enabled": false,
+  "ml_high_threshold_pct": 70,
+  "ml_max_factor": 30,
+  "ml_model_path": "models/isolation_forest.onnx",
+  "graph_enabled": false,
+  "graph_threshold_pct": 30,
+  "graph_max_factor": 25,
   "asset_groups": [
     { "name": "backup-group",    "patterns": ["*backup*", "*snapshot*", "*快照*", "*.bak", "*备份*"] },
     { "name": "key-mgmt-group",  "patterns": ["*key*", "*secret*", "*cert*", "*.pem", "*密钥*"] },
@@ -345,6 +355,13 @@ std::string config_to_json(const EngineConfig& c) {
       << "  \"emergency_mode\": " << (c.emergency_mode ? "true" : "false") << ",\n"
       << "  \"emergency_until_epoch\": " << c.emergency_until_epoch << ",\n"
       << "  \"profile_enabled\": " << (c.profile_enabled ? "true" : "false") << ",\n"
+      << "  \"ml_enabled\": " << (c.ml_enabled ? "true" : "false") << ",\n"
+      << "  \"ml_high_threshold_pct\": " << static_cast<int>(c.ml_high_threshold * 100) << ",\n"
+      << "  \"ml_max_factor\": " << c.ml_max_factor << ",\n"
+      << "  \"ml_model_path\": \"" << json_escape(c.ml_model_path) << "\",\n"
+      << "  \"graph_enabled\": " << (c.graph_enabled ? "true" : "false") << ",\n"
+      << "  \"graph_threshold_pct\": " << static_cast<int>(c.graph_threshold * 100) << ",\n"
+      << "  \"graph_max_factor\": " << c.graph_max_factor << ",\n"
       << "  \"asset_groups\": [\n";
     for (std::size_t i = 0; i < c.asset_groups.size(); ++i) {
         o << "    { \"name\": \"" << json_escape(c.asset_groups[i].name)
@@ -386,6 +403,18 @@ EngineConfig config_from_json(const std::string& j) {
     c.emergency_mode = json_bool_field(j, "emergency_mode", false);
     c.emergency_until_epoch = static_cast<u64>(logpolicy::json_size_field(j, "emergency_until_epoch", 0));
     c.profile_enabled = json_bool_field(j, "profile_enabled", true);
+    // ---- ML 配置解析（M3 措施3）----
+    c.ml_enabled = json_bool_field(j, "ml_enabled", false);
+    // 阈值存为整数百分比（70 = 0.70），避免引入 float JSON 解析
+    int ml_pct = static_cast<int>(logpolicy::json_size_field(j, "ml_high_threshold_pct", 70));
+    c.ml_high_threshold = std::min(std::max(ml_pct, 0), 100) / 100.f;
+    c.ml_max_factor = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "ml_max_factor", 30)), 0), 50);
+    c.ml_model_path = logpolicy::json_string_field(j, "ml_model_path");
+    // ---- 图算法配置解析（M4 措施4）----
+    c.graph_enabled = json_bool_field(j, "graph_enabled", false);
+    int g_pct = static_cast<int>(logpolicy::json_size_field(j, "graph_threshold_pct", 30));
+    c.graph_threshold = std::min(std::max(g_pct, 0), 100) / 100.f;
+    c.graph_max_factor = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "graph_max_factor", 25)), 0), 50);
     for (const auto& rec : logpolicy::json_object_array_field(j, "asset_groups")) {
         AssetGroup g;
         g.name = logpolicy::json_string_field(rec, "name");
@@ -630,7 +659,9 @@ DetectionResult detect(const AggSet& set,
                        const std::vector<Rule>& rules,
                        const ProfileSnapshot& profile,
                        const std::vector<WorkOrder>& workorders,
-                       u64 now_epoch) {
+                       u64 now_epoch,
+                       af::ml::OnnxModel* onnx_model,
+                       af::graph::BehaviorGraph* baseline_graph) {
     DetectionResult res;
 
     // ---- 白名单预检：预登记合法协同组直接放行（仅保留低级别线索记录） ----
@@ -727,15 +758,86 @@ DetectionResult detect(const AggSet& set,
         res.profile_factor = std::min(res.profile_factor, cfg.profile_max_factor);
     }
 
-    // ---- 风险评分：total = 规则因子 + 画像因子 - 有效工单扣减，收敛 0~100 ----
-    int total = res.rule_factor + res.profile_factor -
+    // ---- ML 异常检测引擎（M3 措施3，ONNX 推理，因子上限 ml_max_factor）----
+    //   设计约束：ML 仅提供线索因子，不直接触发 HIGH 风险（后续硬约束会钳制）
+    if (cfg.ml_enabled) {
+        if (onnx_model && onnx_model->is_loaded()) {
+            // 特征工程：从聚合事件提取 20 维行为特征
+            af::ml::FeatureExtractor extractor;
+            auto feats = extractor.extract(set.events, profile, set.asset_group);
+            auto feat_vec = feats.to_vector();
+
+            // ONNX 推理
+            auto scores = onnx_model->infer(feat_vec);
+            if (!scores.empty()) {
+                float if_score = scores[0];
+                if (if_score > cfg.ml_high_threshold) {
+                    int add = static_cast<int>(if_score * cfg.ml_max_factor);
+                    res.ml_factor += std::min(add, cfg.ml_max_factor);
+                    res.ml_notes.push_back("孤立森林异常分数=" +
+                                           std::to_string(if_score) +
+                                           "（阈值 " + std::to_string(cfg.ml_high_threshold) + "）");
+                } else {
+                    res.ml_notes.push_back("ML 异常分数 " +
+                                           std::to_string(if_score) +
+                                           " 未超阈值，不计入因子");
+                }
+            } else {
+                res.ml_notes.push_back("ML 推理返回空结果（模型输出异常），因子降级为 0");
+            }
+        } else {
+            // 优雅降级：ML 已开启但模型未加载/未集成
+            res.ml_notes.push_back("ML 已开启但 ONNX 模型未加载（优雅降级：ml_factor=0）");
+        }
+        res.ml_factor = std::min(res.ml_factor, cfg.ml_max_factor);
+    }
+
+    // ---- 图算法异常检测引擎（M4 措施4，轻量级图算法替代 GNN，因子上限 graph_max_factor）----
+    //   设计约束：图分析仅提供线索因子，不直接触发 HIGH 风险（后续硬约束会钳制）
+    if (cfg.graph_enabled) {
+        // 从聚合事件集合构建当前行为图：操作员→资产、操作员→操作类型 边
+        af::graph::BehaviorGraph cur;
+        for (const auto& ev : set.events) {
+            auto op_id  = cur.add_node(af::graph::NodeType::Operator, ev.oper_id);
+            auto ast_id = cur.add_node(af::graph::NodeType::Asset, ev.server_id);
+            auto t_id   = cur.add_node(af::graph::NodeType::OpType, ev.op_type);
+            cur.add_edge(op_id, ast_id);
+            cur.add_edge(op_id, t_id);
+        }
+        // 与历史基线对比分析（baseline_graph 为空时仅做度/社区/三角形分析）
+        af::graph::BehaviorGraph empty_baseline;
+        const auto& baseline = baseline_graph ? *baseline_graph : empty_baseline;
+        auto analysis = cur.analyze(baseline);
+
+        // 任一异常分量超阈值即贡献 graph_factor（按分量加权和，受 graph_max_factor 上限约束）
+        float graph_score = analysis.degree_anomaly + analysis.community_anomaly +
+                            analysis.triangle_anomaly + analysis.similarity_anomaly;
+        if (graph_score > cfg.graph_threshold) {
+            int add = static_cast<int>(graph_score * static_cast<float>(cfg.graph_max_factor));
+            res.graph_factor += std::min(add, cfg.graph_max_factor);
+            res.graph_notes.push_back("图异常综合分=" + std::to_string(graph_score) +
+                                     "（度=" + std::to_string(analysis.degree_anomaly) +
+                                     " 社区=" + std::to_string(analysis.community_anomaly) +
+                                     " 三角=" + std::to_string(analysis.triangle_anomaly) +
+                                     " 相似=" + std::to_string(analysis.similarity_anomaly) + "）");
+        } else if (!analysis.notes.empty()) {
+            res.graph_notes.push_back("图异常分 " + std::to_string(graph_score) +
+                                     " 未超阈值，不计入因子");
+        }
+        // 追加线索描述
+        for (const auto& n : analysis.notes) res.graph_notes.push_back(n);
+        res.graph_factor = std::min(res.graph_factor, cfg.graph_max_factor);
+    }
+
+    // ---- 风险评分：total = 规则+画像+ML+图 - 有效工单扣减，收敛 0~100 ----
+    int total = res.rule_factor + res.profile_factor + res.ml_factor + res.graph_factor -
                 (res.ticket_valid ? cfg.work_order_deduct : 0);
     res.total_score = std::max(0, std::min(total, 100));
 
-    // ---- 硬约束：仅画像异常、规则零命中时，禁止触发高风险（防画像误报） ----
+    // ---- 硬约束：仅画像/ML/图异常、规则零命中时，禁止触发高风险（防误报） ----
     if (res.rule_factor == 0 && res.total_score >= cfg.score_high) {
         res.total_score = cfg.score_high - 1;
-        res.score_notes.push_back("规则零命中，画像线索不触发高风险（评分钳制）");
+        res.score_notes.push_back("规则零命中，画像/ML/图线索不触发高风险（评分钳制）");
     }
 
     if (res.total_score >= cfg.score_high) res.level = "HIGH";
@@ -751,6 +853,8 @@ Engine& Engine::instance() {
     static Engine inst;
     return inst;
 }
+
+Engine::~Engine() = default;  // unique_ptr<OnnxModel> 在此析构（完整类型在此可见）
 
 void Engine::start(const std::string& data_dir) {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -781,12 +885,26 @@ void Engine::start(const std::string& data_dir) {
     workorders_ = workorders_from_json(wo_text);
 
     load_profile_locked();
+
+    // ---- M3: 初始化 ONNX 模型（条件编译，优雅降级）----
+    if (cfg_.ml_enabled && !cfg_.ml_model_path.empty()) {
+        onnx_if_ = std::make_unique<af::ml::OnnxModel>();
+        if (onnx_if_->load(cfg_.ml_model_path)) {
+            AF_LOG_INFO("collusion: ML 引擎已启用，模型加载成功: " << cfg_.ml_model_path);
+        } else {
+            AF_LOG_WARN("collusion: ML 已启用但模型加载失败: " << onnx_if_->last_error()
+                        << " —— ML 因子将降级为 0");
+        }
+    }
+
     started_ = true;
     AF_LOG_INFO("collusion: 模块已启动 short_window=" << (cfg_.short_window_ms / 60000)
                 << "min long_window=" << (cfg_.long_window_ms / 3600000)
                 << "h rules=" << rules_.size()
                 << " asset_groups=" << cfg_.asset_groups.size()
-                << (cfg_.enabled ? "" : "（当前已禁用）"));
+                << (cfg_.enabled ? "" : "（当前已禁用）")
+                << (cfg_.ml_enabled ? " ml=on" : "")
+                << (cfg_.graph_enabled ? " graph=on" : ""));
 }
 
 void Engine::stop() {
@@ -1011,7 +1129,7 @@ void Engine::evaluate_locked(const AggSet& set) {
     if (set.distinct_op_count() < 2) return;
 
     u64 now_ep = now_epoch();
-    auto res = detect(set, cfg_, rules_, profile_, workorders_, now_ep);
+    auto res = detect(set, cfg_, rules_, profile_, workorders_, now_ep, onnx_if_.get(), graph_baseline_.get());
 
     // 画像以本次集合为历史：先检测后更新（保证“陌生/跨域”基于此前基线判定）
     update_profile_locked(set);
@@ -1064,11 +1182,15 @@ void Engine::evaluate_locked(const AggSet& set) {
        << "\"risk_score\": " << res.total_score << ","
        << "\"rule_factor\": " << res.rule_factor << ","
        << "\"profile_factor\": " << res.profile_factor << ","
+       << "\"ml_factor\": " << res.ml_factor << ","
+       << "\"graph_factor\": " << res.graph_factor << ","
        << "\"matched_rules\": " << json_array_of_strings(res.hit_rules) << ","
        << "\"operators\": " << json_array_of_strings(set.operator_ids) << ","
        << "\"operator_count\": " << set.operator_ids.size() << ","
        << "\"work_order_ids\": " << json_array_of_strings(set.work_order_ids) << ","
        << "\"profile_notes\": " << json_array_of_strings(res.profile_notes) << ","
+       << "\"ml_notes\": " << json_array_of_strings(res.ml_notes) << ","
+       << "\"graph_notes\": " << json_array_of_strings(res.graph_notes) << ","
        << "\"score_notes\": " << json_array_of_strings(res.score_notes) << ","
        << "\"dispose\": { \"status\": \"待复核\", \"disposer\": \"\", \"note\": \"\", \"time\": \"\" },";
 

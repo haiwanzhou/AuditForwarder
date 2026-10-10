@@ -1,5 +1,17 @@
 // Unit tests for AuditForwarder core utilities.
 
+// winsock2 必须在 windows.h 之前引入（SyslogAdapter 测试用到 UDP socket）
+#ifdef AF_PLATFORM_WINDOWS
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
+
 #include "auditforwarder/agent.h"
 #include "auditforwarder/build_config.h"
 #include "auditforwarder/chain.h"
@@ -15,11 +27,25 @@
 #include "auditforwarder/thread_pool.h"
 #include "manager/log_policy_util.h"
 
+// 安全产品适配器
+#include "collector/adapters/syslog_adapter.h"
+#include "collector/adapters/db_audit_adapter.h"
+#include "collector/adapters/bastion_adapter.h"
+#include "auditforwarder/processor.h"
+
+// M3: ML 异常检测
+#include "auditforwarder/onnx_inference.h"
+#include "auditforwarder/feature_extractor.h"
+
+// M4: 轻量级图算法
+#include "auditforwarder/behavior_graph.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -284,6 +310,168 @@ void test_chain_submission_and_signing() {
     AF_EXPECT_EQ(b.value().events.size(), (std::size_t)5);
     AF_EXPECT(ch.verify_batch(b.value(), "test-key"));
     AF_EXPECT(!ch.verify_batch(b.value(), "wrong-key"));
+}
+
+void test_chain_super_batch() {
+    using namespace af;
+
+    // ---- 测试 1：HMAC 签名的分层 Merkle 超级批次 ----
+    auto dir = fs::join(fs::temp_directory(),
+                        "af_super_batch_test_" + crypto::random_hex(4));
+    (void)fs::create_directories(dir);
+    {
+        chain::ChainConfig cfg;
+        cfg.data_dir       = dir;
+        cfg.batch_size     = 4;      // 小批次，快速触发
+        cfg.auto_persist   = true;
+        cfg.super_batch_k  = 3;      // 每 3 个批次组成一个超级批次
+        chain::Chain ch(cfg);
+        ch.start();
+        ch.set_hmac_key("sb-test-key");
+
+        // 提交 3 个批次（每个 4 事件）→ 触发 1 个超级批次
+        for (int bi = 0; bi < 3; ++bi) {
+            for (int j = 0; j < 4; ++j) {
+                AuditEvent ev;
+                ev.category = EventCategory::Process;
+                ev.action   = EventAction::Spawn;
+                ev.actor.pid = 1000 + bi * 10 + j;
+                ev.target.path = "/usr/bin/test";
+                ch.submit(ev);
+            }
+            ch.flush();
+        }
+
+        // 验证超级批次根非空且为 64 字符 hex（SHA-256）
+        auto sr = ch.last_super_root();
+        AF_EXPECT(!sr.empty());
+        AF_EXPECT_EQ(sr.size(), (std::size_t)64);
+
+        // 读取持久化的超级批次
+        auto sbs = ch.recent_super_batches(10);
+        AF_EXPECT(sbs.is_ok());
+        AF_EXPECT_EQ(sbs.value().size(), (std::size_t)1);
+        auto& sb1 = sbs.value()[0];
+        AF_EXPECT_EQ(sb1.super_root, sr);
+        AF_EXPECT(sb1.prev_super_root.empty());  // 第一个无前驱
+
+        // HMAC 验签：正确密钥通过，错误密钥失败
+        AF_EXPECT(chain::Chain::verify_super_batch(sb1, "sb-test-key"));
+        AF_EXPECT(!chain::Chain::verify_super_batch(sb1, "wrong-key"));
+        AF_EXPECT(!chain::Chain::verify_super_batch(sb1, ""));  // 空密钥拒绝
+
+        // 再提交 3 个批次 → 触发第二个超级批次
+        for (int bi = 0; bi < 3; ++bi) {
+            for (int j = 0; j < 4; ++j) {
+                AuditEvent ev;
+                ev.category = EventCategory::Process;
+                ev.action   = EventAction::Spawn;
+                ev.actor.pid = 2000 + bi * 10 + j;
+                ev.target.path = "/usr/bin/test2";
+                ch.submit(ev);
+            }
+            ch.flush();
+        }
+
+        auto sr2 = ch.last_super_root();
+        AF_EXPECT(!sr2.empty());
+        AF_EXPECT(sr2 != sr);  // 新根不同于旧根
+
+        // 链式锚定验证：第二个的 prev = 第一个的 root
+        auto sbs2 = ch.recent_super_batches(10);
+        AF_EXPECT(sbs2.is_ok());
+        AF_EXPECT_EQ(sbs2.value().size(), (std::size_t)2);
+        // recent_super_batches 按文件名逆序返回（最新在前）
+        auto& newest = sbs2.value()[0];
+        auto& oldest = sbs2.value()[1];
+        AF_EXPECT_EQ(newest.prev_super_root, oldest.super_root);
+        AF_EXPECT(oldest.prev_super_root.empty());
+
+        ch.stop();
+    }
+    (void)fs::remove(dir, true);
+
+    // ---- 测试 2：super_batch_k=0 禁用超级批次 ----
+    {
+        chain::ChainConfig cfg;
+        cfg.data_dir       = ".";
+        cfg.batch_size     = 2;
+        cfg.auto_persist   = false;
+        cfg.super_batch_k  = 0;      // 禁用
+        chain::Chain ch(cfg);
+        ch.start();
+        ch.set_hmac_key("disabled-key");
+
+        for (int i = 0; i < 4; ++i) {
+            AuditEvent ev;
+            ev.actor.pid = 5000 + i;
+            ch.submit(ev);
+        }
+        ch.flush();
+        ch.flush();
+
+        // 禁用时超级批次根为空
+        AF_EXPECT(ch.last_super_root().empty());
+    }
+
+    // ---- 测试 3：Ed25519 签名的超级批次 ----
+    auto dir2 = fs::join(fs::temp_directory(),
+                         "af_super_batch_ed25519_" + crypto::random_hex(4));
+    (void)fs::create_directories(dir2);
+    {
+        chain::ChainConfig cfg;
+        cfg.data_dir       = dir2;
+        cfg.batch_size     = 2;
+        cfg.auto_persist   = true;
+        cfg.super_batch_k  = 2;
+        chain::Chain ch(cfg);
+        ch.start();
+
+        auto kp_result = crypto::KeyPair::generate(
+            crypto::KeyPair::Algorithm::Ed25519);
+        AF_EXPECT(kp_result.is_ok());
+        auto& kp = kp_result.value();
+        // 在 move 前保存私钥 PEM，用于验签时重建 KeyPair
+        auto priv_pem_r = kp.private_pem();
+        AF_EXPECT(priv_pem_r.is_ok());
+        std::string priv_pem = priv_pem_r.value();
+        ch.set_signer(std::move(kp));
+
+        // 提交 2 个批次 → 触发 1 个超级批次
+        for (int bi = 0; bi < 2; ++bi) {
+            for (int j = 0; j < 2; ++j) {
+                AuditEvent ev;
+                ev.category = EventCategory::File;
+                ev.action   = EventAction::Write;
+                ev.actor.pid = 7000 + bi * 10 + j;
+                ch.submit(ev);
+            }
+            ch.flush();
+        }
+
+        auto sr = ch.last_super_root();
+        AF_EXPECT(!sr.empty());
+
+        auto sbs = ch.recent_super_batches(10);
+        AF_EXPECT(sbs.is_ok());
+        AF_EXPECT_EQ(sbs.value().size(), (std::size_t)1);
+
+        // 用保存的私钥 PEM 重建 KeyPair 进行验签
+        auto kp_verify = crypto::KeyPair::load_pem(priv_pem);
+        AF_EXPECT(kp_verify.is_ok());
+        AF_EXPECT(chain::Chain::verify_super_batch_with_key(
+            sbs.value()[0], kp_verify.value()));
+
+        // 用错误的密钥验签应失败
+        auto kp_wrong = crypto::KeyPair::generate(
+            crypto::KeyPair::Algorithm::Ed25519);
+        AF_EXPECT(kp_wrong.is_ok());
+        AF_EXPECT(!chain::Chain::verify_super_batch_with_key(
+            sbs.value()[0], kp_wrong.value()));
+
+        ch.stop();
+    }
+    (void)fs::remove(dir2, true);
 }
 
 void test_path_utilities() {
@@ -667,7 +855,714 @@ void test_collusion_engine_end_to_end() {
     (void)fs::remove(dir, true);   // 清理临时目录
 }
 
+// ---- 安全产品适配器测试 ----
+
+// UDP 发送辅助：向指定地址端口发送一条 UDP 数据报
+static bool send_udp(const std::string& addr, std::uint16_t port, const std::string& msg) {
+#ifdef AF_PLATFORM_WINDOWS
+    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return false;
+#else
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return false;
+#endif
+    sockaddr_in dst;
+    std::memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(port);
+    dst.sin_addr.s_addr = ::inet_addr(addr.c_str());
+    auto ret = ::sendto(s, msg.c_str(), static_cast<int>(msg.size()), 0,
+                        reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+#ifdef AF_PLATFORM_WINDOWS
+    ::closesocket(s);
+    return ret != SOCKET_ERROR;
+#else
+    ::close(s);
+    return ret >= 0;
+#endif
+}
+
+void test_syslog_adapter() {
+    using namespace af;
+
+    // 打开适配器（端口 0 = OS 分配）
+    SyslogAdapter adapter;
+    auto r = adapter.open(R"({"port": 0, "bind": "127.0.0.1"})");
+    AF_EXPECT(!r.is_err());
+    u16 port = adapter.bound_port();
+    AF_EXPECT(port > 0);
+
+    // RFC 3164（传统 BSD syslog）：PRI=34 → facility=4(auth) severity=2(critical)
+    {
+        std::string msg = "<34>Oct 11 22:14:15 myhost su: 'su root' failed";
+        AF_EXPECT(send_udp("127.0.0.1", port, msg));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        AuditEvent captured;
+        int n = adapter.poll([&](const AuditEvent& ev) { captured = ev; });
+        AF_EXPECT_EQ(n, 1);
+        AF_EXPECT(captured.category == EventCategory::Auth);
+        AF_EXPECT(captured.severity == Severity::Critical);
+        AF_EXPECT_EQ(captured.host, std::string("myhost"));
+        AF_EXPECT_EQ(captured.actor.name, std::string("su"));
+        AF_EXPECT_EQ(captured.message, std::string("'su root' failed"));
+        AF_EXPECT_EQ(captured.attrs["syslog_facility"], std::string("4"));
+        AF_EXPECT_EQ(captured.attrs["syslog_severity"], std::string("2"));
+        AF_EXPECT_EQ(captured.attrs["collector"], std::string("syslog"));
+    }
+
+    // RFC 5424（结构化 syslog）：PRI=165 → facility=20(local4) severity=5(notice)
+    {
+        std::string msg = "<165>1 2026-10-10T12:00:00Z host1 sshd - ID47 - user admin logged in";
+        AF_EXPECT(send_udp("127.0.0.1", port, msg));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        AuditEvent captured;
+        int n = adapter.poll([&](const AuditEvent& ev) { captured = ev; });
+        AF_EXPECT_EQ(n, 1);
+        AF_EXPECT(captured.severity == Severity::Notice);
+        AF_EXPECT_EQ(captured.host, std::string("host1"));
+        AF_EXPECT_EQ(captured.actor.name, std::string("sshd"));
+        AF_EXPECT_EQ(captured.message, std::string("user admin logged in"));
+        AF_EXPECT_EQ(captured.attrs["syslog_severity"], std::string("5"));
+    }
+
+    adapter.close();
+    std::printf("[info]  syslog adapter: RFC 3164 + RFC 5424 解析验证通过\n");
+}
+
+void test_db_audit_adapter() {
+    using namespace af;
+
+    // 创建临时 JSONL 审计日志文件
+    std::string path = "af_test_db_audit.jsonl";
+    {
+        std::ofstream f(path);
+        f << R"({"user":"app_user","host":"db01","statement":"SELECT * FROM users","command_type":"QUERY","database":"prod"})" << "\n";
+        f << R"({"user":"admin","host":"db01","statement":"DROP TABLE temp","command_type":"DDL","database":"prod"})" << "\n";
+    }
+
+    DatabaseAuditAdapter adapter;
+    auto r = adapter.open(R"({"path": ")" + path + R"("})");
+    AF_EXPECT(!r.is_err());
+
+    // 第一次轮询：应读到 2 条记录
+    int count = 0;
+    AuditEvent ev1, ev2;
+    int n = adapter.poll([&](const AuditEvent& ev) {
+        if (count == 0) ev1 = ev;
+        if (count == 1) ev2 = ev;
+        ++count;
+    });
+    AF_EXPECT_EQ(n, 2);
+    AF_EXPECT_EQ(count, 2);
+    AF_EXPECT_EQ(ev1.actor.user, std::string("app_user"));
+    AF_EXPECT(ev1.action == EventAction::Read);   // QUERY → Read
+    AF_EXPECT_EQ(ev1.attrs["db_command_type"], std::string("QUERY"));
+    AF_EXPECT_EQ(ev1.attrs["collector"], std::string("db_audit"));
+    AF_EXPECT_EQ(ev2.actor.user, std::string("admin"));
+    AF_EXPECT(ev2.action == EventAction::Set);     // DDL → Set
+
+    // 第二次轮询：无新增数据，应返回 0
+    int n2 = adapter.poll([](const AuditEvent&) {});
+    AF_EXPECT_EQ(n2, 0);
+
+    // 追加 1 条新记录
+    {
+        std::ofstream f(path, std::ios::app);
+        f << R"({"user":"guest","host":"db01","statement":"UPDATE users SET active=0","command_type":"DML","database":"prod"})" << "\n";
+    }
+    // 第三次轮询：增量读取 1 条
+    count = 0;
+    AuditEvent ev3;
+    n = adapter.poll([&](const AuditEvent& ev) { ev3 = ev; ++count; });
+    AF_EXPECT_EQ(n, 1);
+    AF_EXPECT_EQ(count, 1);
+    AF_EXPECT_EQ(ev3.actor.user, std::string("guest"));
+    AF_EXPECT(ev3.action == EventAction::Write);  // DML → Write
+
+    adapter.close();
+    std::remove(path.c_str());
+    std::printf("[info]  db_audit adapter: JSONL 增量读取验证通过\n");
+}
+
+void test_bastion_adapter() {
+    using namespace af;
+
+    int call_count = 0;
+    BastionAdapter::FetchFn mock_fetch = [&](
+        const std::string&, const std::string&, const std::string& cursor) -> std::string {
+        ++call_count;
+        if (call_count == 1) {
+            // 首次返回 2 条命令
+            return R"({"commands":[{"id":"cmd-001","user":"admin","asset":"web-01","command":"ls -la /etc"},{"id":"cmd-002","user":"admin","asset":"db-01","command":"sudo systemctl restart nginx"}],"next_cursor":"cmd-002"})";
+        }
+        if (call_count == 2 && cursor == "cmd-002") {
+            // 第二次：游标正确推进后返回 1 条
+            return R"({"commands":[{"id":"cmd-003","user":"dev","asset":"web-02","command":"cat /etc/shadow"}],"next_cursor":"cmd-003"})";
+        }
+        return R"({"commands":[],"next_cursor":""})";  // 无更多数据
+    };
+
+    BastionAdapter adapter(std::move(mock_fetch));
+    auto r = adapter.open(R"({"url":"http://bastion.test/api","token":"tok123"})");
+    AF_EXPECT(!r.is_err());
+
+    // 第一次轮询：2 条命令
+    int count = 0;
+    AuditEvent ev1, ev2;
+    int n = adapter.poll([&](const AuditEvent& ev) {
+        if (count == 0) ev1 = ev;
+        if (count == 1) ev2 = ev;
+        ++count;
+    });
+    AF_EXPECT_EQ(n, 2);
+    AF_EXPECT_EQ(count, 2);
+    AF_EXPECT(ev1.category == EventCategory::Command);
+    AF_EXPECT(ev1.action == EventAction::Execute);
+    AF_EXPECT_EQ(ev1.actor.user, std::string("admin"));
+    AF_EXPECT_EQ(ev1.target.path, std::string("web-01"));
+    AF_EXPECT_EQ(ev1.command, std::string("ls -la /etc"));
+    AF_EXPECT_EQ(ev1.attrs["bastion_cmd_id"], std::string("cmd-001"));
+    AF_EXPECT_EQ(ev1.attrs["collector"], std::string("bastion"));
+    AF_EXPECT_EQ(ev2.command, std::string("sudo systemctl restart nginx"));
+
+    // 第二次轮询：游标推进后 1 条
+    count = 0;
+    AuditEvent ev3;
+    n = adapter.poll([&](const AuditEvent& ev) { ev3 = ev; ++count; });
+    AF_EXPECT_EQ(n, 1);
+    AF_EXPECT_EQ(count, 1);
+    AF_EXPECT_EQ(ev3.actor.user, std::string("dev"));
+    AF_EXPECT_EQ(ev3.target.path, std::string("web-02"));
+    AF_EXPECT_EQ(ev3.command, std::string("cat /etc/shadow"));
+
+    // 第三次轮询：无数据
+    n = adapter.poll([](const AuditEvent&) {});
+    AF_EXPECT_EQ(n, 0);
+
+    adapter.close();
+    std::printf("[info]  bastion adapter: REST API 增量游标验证通过\n");
+}
+
 }  // namespace
+
+void test_normalizer() {
+    using namespace af;
+    processor::Normalizer nz;
+
+    // 时间规整：ts_micros 为 0 时从 timestamp 补算微秒
+    {
+        AuditEvent ev;
+        ev.timestamp = SysClock::now();
+        AF_EXPECT(nz.process(ev));
+        AF_EXPECT(ev.ts_micros > 0);
+    }
+    // 来源标注：缺失时标注为 agent
+    {
+        AuditEvent ev;
+        nz.process(ev);
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSource], std::string("agent"));
+    }
+    // 来源标注：已有来源不被覆盖
+    {
+        AuditEvent ev;
+        ev.attrs[logmeta::attr::kSource] = "syslog";
+        nz.process(ev);
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSource], std::string("syslog"));
+    }
+    // action 推断：login
+    {
+        AuditEvent ev;
+        ev.message = "user login from 1.2.3.4";
+        nz.process(ev);
+        AF_EXPECT(ev.action == EventAction::Login);
+    }
+    // action 推断：delete（rm 关键词）
+    {
+        AuditEvent ev;
+        ev.command = "rm -rf /tmp/x";
+        nz.process(ev);
+        AF_EXPECT(ev.action == EventAction::Delete);
+    }
+    // action 推断：execute
+    {
+        AuditEvent ev;
+        ev.command = "exec /bin/sh";
+        nz.process(ev);
+        AF_EXPECT(ev.action == EventAction::Execute);
+    }
+    // action 不覆盖：已有 action 保留
+    {
+        AuditEvent ev;
+        ev.action = EventAction::Write;
+        ev.message = "login";  // 即便 message 含 login，也不覆盖已有 action
+        nz.process(ev);
+        AF_EXPECT(ev.action == EventAction::Write);
+    }
+    // outcome 标准化：失败关键词 → Failure
+    {
+        AuditEvent ev;
+        ev.message = "authentication failed for root";
+        nz.process(ev);
+        AF_EXPECT(ev.outcome == EventOutcome::Failure);
+    }
+    // outcome 标准化：无失败关键词 → Success
+    {
+        AuditEvent ev;
+        ev.message = "command completed";
+        nz.process(ev);
+        AF_EXPECT(ev.outcome == EventOutcome::Success);
+    }
+    // severity 提升：Failure → Warning
+    {
+        AuditEvent ev;
+        ev.message = "operation failed";
+        nz.process(ev);
+        AF_EXPECT(ev.severity == Severity::Warning);
+    }
+    // severity 提升：Delete → Notice
+    {
+        AuditEvent ev;
+        ev.command = "rm /etc/passwd";
+        nz.process(ev);
+        AF_EXPECT(ev.severity == Severity::Notice);
+    }
+    // severity 不覆盖：非 Info 保留
+    {
+        AuditEvent ev;
+        ev.severity = Severity::Error;
+        ev.message = "failed";
+        nz.process(ev);
+        AF_EXPECT(ev.severity == Severity::Error);
+    }
+    // 字段补全：command 空 + message 非空 → command = message
+    {
+        AuditEvent ev;
+        ev.message = "ls -la";
+        nz.process(ev);
+        AF_EXPECT_EQ(ev.command, std::string("ls -la"));
+    }
+    // 字段补全：message 空 + command 非空 → message = command
+    {
+        AuditEvent ev;
+        ev.command = "cat /etc/hosts";
+        nz.process(ev);
+        AF_EXPECT_EQ(ev.message, std::string("cat /etc/hosts"));
+    }
+    // 端到端：模拟 syslog 风格事件（无 action/outcome，有 message）
+    {
+        AuditEvent ev;
+        ev.message = "Failed password for invalid user admin";
+        nz.process(ev);
+        AF_EXPECT(ev.action == EventAction::AuthFail);
+        AF_EXPECT(ev.outcome == EventOutcome::Failure);
+        AF_EXPECT(ev.severity == Severity::Warning);
+    }
+}
+
+// ==================== M3: ONNX 推理 + 行为特征工程 测试 ====================
+
+void test_feature_extractor() {
+    using namespace af::ml;
+    using namespace af::collusion;
+
+    AF_LOG_INFO("=== test_feature_extractor ===");
+
+    // 空事件集合：所有特征为 0
+    {
+        FeatureExtractor fe;
+        ProfileSnapshot profile;
+        auto f = fe.extract({}, profile, "test-group");
+        auto v = f.to_vector();
+        AF_EXPECT_EQ(v.size(), BehaviorFeatures::DIM);
+        // 空集合 → 全零
+        for (float x : v) { AF_EXPECT(x == 0.f); }
+    }
+
+    // 单条事件：无间隔，部分特征有值
+    {
+        FeatureExtractor fe;
+        ProfileSnapshot profile;
+        std::vector<CleanEvent> events = {
+            {"opA", 1000, "host1", "file/delete", "db.bak", "rm db.bak", "", ""}
+        };
+        auto f = fe.extract(events, profile, "backup-group");
+        auto v = f.to_vector();
+        AF_EXPECT_EQ(v.size(), BehaviorFeatures::DIM);
+        AF_EXPECT(f.op_count_norm > 0.f);  // 有操作
+        AF_EXPECT(f.distinct_op_type_ratio == 1.f);  // 单类型
+        AF_EXPECT(f.distinct_server_ratio == 1.f);  // 单服务器
+    }
+
+    // 多条事件：间隔、多样性、重复率等
+    {
+        FeatureExtractor fe;
+        ProfileSnapshot profile;
+        std::vector<CleanEvent> events = {
+            {"opA", 1000,   "host1", "file/delete",  "db.bak",  "rm db.bak",  "", ""},
+            {"opB", 61000,  "host1", "disk/unmount", "disk0",   "unmount /disk0", "", ""},
+            {"opA", 121000, "host2", "snap/delete",   "snap-1",  "rm db.bak",  "", ""},  // op_param 重复
+        };
+        auto f = fe.extract(events, profile, "backup-group");
+        auto v = f.to_vector();
+        AF_EXPECT_EQ(v.size(), BehaviorFeatures::DIM);
+
+        // 间隔均值（60秒归一化）
+        AF_EXPECT(f.op_interval_mean > 0.f);
+        // 间隔标准差 > 0（两次间隔相同但均值差不为 0？实际相同 60s → std=0）
+        // burst_ratio：60 秒间隔 → 不突发
+        AF_EXPECT(f.burst_ratio == 0.f);
+        // 操作类型多样性：3 种 → 1.0
+        AF_EXPECT(f.distinct_op_type_ratio > 0.5f);
+        // 服务器多样性：2/3
+        AF_EXPECT(f.distinct_server_ratio > 0.5f);
+        AF_EXPECT(f.distinct_server_ratio < 1.f);
+        // 命令重复率：rm db.bak 出现 2 次 → repeat=1, ratio=1/3
+        AF_EXPECT(f.cmd_repeat_ratio > 0.f);
+    }
+
+    // 画像协作熟悉度
+    {
+        FeatureExtractor fe;
+        ProfileSnapshot profile;
+        profile.pair_counts["opA|opB"] = 10;   // 10 次历史协作
+        profile.operator_assets["opA"]["backup-group"] = 15;  // 15 次该资产组操作
+
+        std::vector<CleanEvent> events = {
+            {"opA", 1000, "host1", "file/delete", "db.bak", "rm db.bak", "", ""},
+            {"opB", 2000, "host1", "file/read",  "db.bak", "cat db.bak", "", ""},
+        };
+        auto f = fe.extract(events, profile, "backup-group");
+        // pair_familiarity = 10/20 = 0.5
+        AF_EXPECT(f.pair_familiarity > 0.f);
+        AF_EXPECT(f.pair_familiarity <= 0.6f);
+        // asset_familiarity = 15/20 = 0.75
+        AF_EXPECT(f.asset_familiarity > 0.5f);
+    }
+
+    // 跨域操作员比例
+    {
+        FeatureExtractor fe;
+        ProfileSnapshot profile;
+        // opA 有历史记录，opB 无
+        profile.operator_assets["opA"]["db-group"] = 5;
+
+        std::vector<CleanEvent> events = {
+            {"opA", 1000, "host1", "file/delete", "db.bak", "rm", "", ""},
+            {"opB", 2000, "host2", "file/read",  "db.bak", "cat", "", ""},
+        };
+        auto f = fe.extract(events, profile, "db-group");
+        // opA 熟悉(db-group 5次), opB 陌生 → cross_domain_ratio = 0.5
+        AF_EXPECT(f.cross_domain_ratio > 0.f);
+        AF_EXPECT(f.cross_domain_ratio <= 0.6f);
+    }
+
+    // 突发操作检测：10 个事件在 1 秒内 → burst
+    {
+        FeatureExtractor fe;
+        ProfileSnapshot profile;
+        std::vector<CleanEvent> events;
+        for (int i = 0; i < 15; ++i) {
+            events.push_back(CleanEvent{"opA", static_cast<af::u64>(1000 + i * 50), "h", "cmd", "r", "c", "", ""});
+        }
+        auto f = fe.extract(events, profile, "g");
+        AF_EXPECT(f.burst_ratio == 1.f);  // 60秒内超过10个操作 → 突发
+    }
+}
+
+void test_onnx_inference() {
+    using namespace af::ml;
+
+    AF_LOG_INFO("=== test_onnx_inference ===");
+
+    // 默认构造：未加载
+    {
+        OnnxModel model;
+        AF_EXPECT(!model.is_loaded());
+        // 推理返回空向量（优雅降级）
+        auto result = model.infer({0.1f, 0.2f, 0.3f});
+        AF_EXPECT(result.empty());
+        // last_error 有内容
+        AF_EXPECT(!model.last_error().empty());
+    }
+
+    // 加载不存在的模型文件：失败但不崩溃
+    {
+        OnnxModel model;
+        bool ok = model.load("models/nonexistent_model.onnx");
+        AF_EXPECT(!ok);
+        AF_EXPECT(!model.is_loaded());
+        AF_EXPECT(!model.last_error().empty());
+        // 推理仍返回空
+        auto result = model.infer(std::vector<float>(20, 0.5f));
+        AF_EXPECT(result.empty());
+    }
+
+    // 加载空路径：失败
+    {
+        OnnxModel model;
+        bool ok = model.load("");
+        AF_EXPECT(!ok);
+        AF_EXPECT(!model.is_loaded());
+    }
+}
+
+void test_collusion_ml_integration() {
+    using namespace af::collusion;
+
+    AF_LOG_INFO("=== test_collusion_ml_integration ===");
+
+    EngineConfig cfg;   // 默认 ml_enabled=false
+    std::vector<Rule> rules;
+    ProfileSnapshot profile;
+    std::vector<WorkOrder> wos;
+
+    AggSet set;
+    set.asset_group = "backup-group";
+    set.operator_ids = {"opA", "opB"};
+    set.events = {
+        {"opA", 1000, "h", "file/delete", "db.bak", "rm db.bak", "", ""},
+        {"opB", 2000, "h", "disk/unmount", "disk0", "unmount", "", ""},
+    };
+
+    // ml_enabled=false：ml_factor=0，ml_notes 为空
+    {
+        auto r = detect(set, cfg, rules, profile, wos, 0);
+        AF_EXPECT_EQ(r.ml_factor, 0);
+        AF_EXPECT(r.ml_notes.empty());
+    }
+
+    // ml_enabled=true 但无模型指针：优雅降级，ml_notes 有提示
+    {
+        EngineConfig cfg2 = cfg;
+        cfg2.ml_enabled = true;
+        auto r = detect(set, cfg2, rules, profile, wos, 0);
+        AF_EXPECT_EQ(r.ml_factor, 0);  // 降级为 0
+        AF_EXPECT(!r.ml_notes.empty());  // 有降级提示
+    }
+
+    // ml_enabled=true 且传入未加载的 OnnxModel：优雅降级
+    {
+        EngineConfig cfg2 = cfg;
+        cfg2.ml_enabled = true;
+        af::ml::OnnxModel model;  // 未加载
+        auto r = detect(set, cfg2, rules, profile, wos, 0, &model);
+        AF_EXPECT_EQ(r.ml_factor, 0);
+        AF_EXPECT(!r.ml_notes.empty());
+    }
+
+    // 硬约束：规则零命中 + ML 开启 → 总分不触发 HIGH
+    {
+        EngineConfig cfg2 = cfg;
+        cfg2.ml_enabled = true;
+        af::ml::OnnxModel model;
+        auto r = detect(set, cfg2, rules, profile, wos, 0, &model);
+        AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(0));
+        AF_EXPECT(r.total_score < cfg2.score_high);
+    }
+}
+
+// ==================== M4: 图算法模块测试 ====================
+
+void test_behavior_graph_basic() {
+    using namespace af::graph;
+    AF_LOG_INFO("=== test_behavior_graph_basic ===");
+
+    BehaviorGraph g;
+
+    // 空图测试
+    AF_EXPECT_EQ(g.node_count(), std::size_t(0));
+    AF_EXPECT_EQ(g.edge_count(), std::size_t(0));
+
+    // 添加节点
+    auto op1 = g.add_node(NodeType::Operator, "opA");
+    auto op2 = g.add_node(NodeType::Operator, "opB");
+    auto ast1 = g.add_node(NodeType::Asset, "host1");
+    auto ast2 = g.add_node(NodeType::Asset, "host2");
+    auto t1 = g.add_node(NodeType::OpType, "file/delete");
+
+    AF_EXPECT_EQ(g.node_count(), std::size_t(5));
+    AF_EXPECT(op1 != op2);
+    AF_EXPECT(ast1 != ast2);
+    AF_EXPECT(op1 != ast1);
+
+    // 重复添加同 label+type 应返回既有 ID
+    auto op1_again = g.add_node(NodeType::Operator, "opA");
+    AF_EXPECT_EQ(op1_again, op1);
+    AF_EXPECT_EQ(g.node_count(), std::size_t(5));
+
+    // 查找节点
+    AF_EXPECT_EQ(g.find_node(NodeType::Operator, "opA"), op1);
+    AF_EXPECT_EQ(g.find_node(NodeType::Asset, "host2"), ast2);
+    AF_EXPECT_EQ(g.find_node(NodeType::Operator, "opZ"), BehaviorGraph::INVALID_NODE);
+
+    // 添加边
+    g.add_edge(op1, ast1);
+    g.add_edge(op1, t1);
+    g.add_edge(op2, ast2);
+    g.add_edge(op2, t1);   // opB 也操作了 t1（共同操作类型）
+    g.add_edge(op1, op2);  // 协作边
+    g.add_edge(op2, op1);  // 双向
+
+    AF_EXPECT_EQ(g.edge_count(), std::size_t(6));
+
+    // 边权重累加
+    g.add_edge(op1, ast1, 2.0);
+    // op1→ast1 应只有一条边，权重=3.0
+    const auto& nb = g.neighbors(op1);
+    double w_ast1 = 0;
+    for (const auto& e : nb) {
+        if (e.to == ast1) w_ast1 = e.weight;
+    }
+    AF_EXPECT(w_ast1 > 2.9 && w_ast1 < 3.1);
+
+    // 度数
+    AF_EXPECT(g.degree(op1) >= 3);   // 出度3（ast1,t1,op2）+ 入度1（op2→op1）
+}
+
+void test_behavior_graph_analyze() {
+    using namespace af::graph;
+    AF_LOG_INFO("=== test_behavior_graph_analyze ===");
+
+    // 构建一个有异常的图：opA 操作大量资产，其他操作员度数低
+    BehaviorGraph g;
+    auto opA = g.add_node(NodeType::Operator, "opA");
+    auto opB = g.add_node(NodeType::Operator, "opB");
+    auto opC = g.add_node(NodeType::Operator, "opC");
+    auto opD = g.add_node(NodeType::Operator, "opD");
+    auto opE = g.add_node(NodeType::Operator, "opE");
+    auto opF = g.add_node(NodeType::Operator, "opF");
+
+    // opA 连接 5 个资产（高度数异常）
+    for (int i = 0; i < 5; ++i) {
+        auto ast = g.add_node(NodeType::Asset, "host" + std::to_string(i));
+        g.add_edge(opA, ast);
+    }
+    // opB~opF 各连接 1 个资产
+    g.add_edge(opB, g.add_node(NodeType::Asset, "hostB"));
+    g.add_edge(opC, g.add_node(NodeType::Asset, "hostC"));
+    g.add_edge(opD, g.add_node(NodeType::Asset, "hostD"));
+    g.add_edge(opE, g.add_node(NodeType::Asset, "hostE"));
+    g.add_edge(opF, g.add_node(NodeType::Asset, "hostF"));
+
+    // 无基线分析
+    BehaviorGraph empty_baseline;
+    auto result = g.analyze(empty_baseline);
+
+    // 应有度中心性异常（opA 度数远高于均值+2σ）
+    AF_EXPECT(result.degree_anomaly > 0.f);
+    AF_EXPECT(!result.notes.empty());
+
+    // 全对称图不应有度异常
+    BehaviorGraph sym;
+    auto s1 = sym.add_node(NodeType::Operator, "s1");
+    auto s2 = sym.add_node(NodeType::Operator, "s2");
+    auto s3 = sym.add_node(NodeType::Operator, "s3");
+    auto a1 = sym.add_node(NodeType::Asset, "a1");
+    auto a2 = sym.add_node(NodeType::Asset, "a2");
+    auto a3 = sym.add_node(NodeType::Asset, "a3");
+    sym.add_edge(s1, a1); sym.add_edge(s1, a2);
+    sym.add_edge(s2, a2); sym.add_edge(s2, a3);
+    sym.add_edge(s3, a3); sym.add_edge(s3, a1);
+    auto sym_result = sym.analyze(empty_baseline);
+    // 对称图度数差异小，sigma 可能极小 → degree_anomaly 接近 0
+    AF_EXPECT(sym_result.degree_anomaly <= result.degree_anomaly);
+}
+
+void test_behavior_graph_similarity() {
+    using namespace af::graph;
+    AF_LOG_INFO("=== test_behavior_graph_similarity ===");
+
+    // 构建基线图
+    BehaviorGraph baseline;
+    auto b_opA = baseline.add_node(NodeType::Operator, "opA");
+    auto b_opB = baseline.add_node(NodeType::Operator, "opB");
+    auto b_ast1 = baseline.add_node(NodeType::Asset, "host1");
+    auto b_ast2 = baseline.add_node(NodeType::Asset, "host2");
+    baseline.add_edge(b_opA, b_ast1);
+    baseline.add_edge(b_opB, b_ast2);
+
+    // 当前图与基线完全一致 → Jaccard=1.0，不触发相似度异常
+    BehaviorGraph same;
+    auto s_opA = same.add_node(NodeType::Operator, "opA");
+    auto s_opB = same.add_node(NodeType::Operator, "opB");
+    auto s_ast1 = same.add_node(NodeType::Asset, "host1");
+    auto s_ast2 = same.add_node(NodeType::Asset, "host2");
+    same.add_edge(s_opA, s_ast1);
+    same.add_edge(s_opB, s_ast2);
+    auto r1 = same.analyze(baseline);
+    AF_EXPECT(r1.similarity_anomaly < 0.01f);   // 相似度=1，不异常
+
+    // 当前图与基线完全不同 → Jaccard=0，触发相似度异常
+    BehaviorGraph diff;
+    auto d_opX = diff.add_node(NodeType::Operator, "opX");
+    auto d_opY = diff.add_node(NodeType::Operator, "opY");
+    auto d_ast9 = diff.add_node(NodeType::Asset, "host9");
+    auto d_ast8 = diff.add_node(NodeType::Asset, "host8");
+    diff.add_edge(d_opX, d_ast9);
+    diff.add_edge(d_opY, d_ast8);
+    auto r2 = diff.analyze(baseline);
+    AF_EXPECT(r2.similarity_anomaly > 0.1f);   // Jaccard=0 < 0.3 → 异常 0.15
+}
+
+void test_collusion_graph_integration() {
+    using namespace af::collusion;
+    AF_LOG_INFO("=== test_collusion_graph_integration ===");
+
+    EngineConfig cfg;   // 默认 graph_enabled=false
+    std::vector<Rule> rules;
+    ProfileSnapshot profile;
+    std::vector<WorkOrder> wos;
+
+    AggSet set;
+    set.asset_group = "backup-group";
+    set.operator_ids = {"opA", "opB"};
+    set.events = {
+        {"opA", 1000, "h1", "file/delete", "db.bak", "rm db.bak", "", ""},
+        {"opB", 2000, "h2", "disk/unmount", "disk0", "unmount", "", ""},
+    };
+
+    // graph_enabled=false：graph_factor=0，graph_notes 为空
+    {
+        auto r = detect(set, cfg, rules, profile, wos, 0);
+        AF_EXPECT_EQ(r.graph_factor, 0);
+        AF_EXPECT(r.graph_notes.empty());
+    }
+
+    // graph_enabled=true 但无基线：图分析执行，graph_notes 有输出
+    {
+        EngineConfig cfg2 = cfg;
+        cfg2.graph_enabled = true;
+        auto r = detect(set, cfg2, rules, profile, wos, 0);
+        AF_EXPECT_EQ(r.graph_factor, 0);   // 2操作员对称图，无度异常 → factor=0
+        // 但 graph_notes 可能有"未超阈值"提示或为空（取决于图结构）
+        AF_EXPECT(r.graph_factor <= cfg2.graph_max_factor);
+    }
+
+    // 硬约束：规则零命中 + graph 开启 → 总分不触发 HIGH
+    {
+        EngineConfig cfg2 = cfg;
+        cfg2.graph_enabled = true;
+        auto r = detect(set, cfg2, rules, profile, wos, 0);
+        AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(0));
+        AF_EXPECT(r.total_score < cfg2.score_high);
+    }
+
+    // 传入基线图指针：不崩溃，正常分析
+    {
+        EngineConfig cfg2 = cfg;
+        cfg2.graph_enabled = true;
+        af::graph::BehaviorGraph baseline;
+        baseline.add_node(af::graph::NodeType::Operator, "opA");
+        baseline.add_node(af::graph::NodeType::Operator, "opB");
+        auto b_ast = baseline.add_node(af::graph::NodeType::Asset, "h1");
+        auto opA = baseline.find_node(af::graph::NodeType::Operator, "opA");
+        baseline.add_edge(opA, b_ast);
+        auto r = detect(set, cfg2, rules, profile, wos, 0, nullptr, &baseline);
+        AF_EXPECT(r.graph_factor <= cfg2.graph_max_factor);
+    }
+}
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // 无缓冲输出：崩溃时也能看到最后一条断言
@@ -683,6 +1578,7 @@ int main() {
     test_privilege_detection();
     test_thread_pool_priority();
     test_chain_submission_and_signing();
+    test_chain_super_batch();
     test_path_utilities();
     test_database_validation_and_crud();
     test_log_filter_profiles();
@@ -690,6 +1586,17 @@ int main() {
     test_collusion_workorder_and_whitelist();
     test_collusion_detect_scoring();
     test_collusion_engine_end_to_end();
+    test_syslog_adapter();
+    test_db_audit_adapter();
+    test_bastion_adapter();
+    test_normalizer();
+    test_feature_extractor();
+    test_onnx_inference();
+    test_collusion_ml_integration();
+    test_behavior_graph_basic();
+    test_behavior_graph_analyze();
+    test_behavior_graph_similarity();
+    test_collusion_graph_integration();
 
     std::printf("\nResults: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

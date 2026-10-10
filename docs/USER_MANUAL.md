@@ -461,6 +461,101 @@ scripts/database/postgresql/
 
 当前版本保留 JSON/JSONL 文件持久化能力；数据库脚本用于服务端关系型存储升级。
 
+### 5.7 超级批次配置（M1）
+
+监管链支持跨批次分层 Merkle 聚合，配置项位于 `config.yaml` 的 `chain` 段：
+
+```yaml
+chain:
+  batch_size: 256
+  super_batch_k: 8
+```
+
+字段说明：
+
+- `super_batch_k`：每 K 个已签名 EventBatch 组成一个超级批次（SuperBatch），0 = 禁用超级批次功能，默认 8。
+
+启用后，每凑齐 K 个批次，系统会以这 K 个批次的 `merkle_root` 作为叶子构建上层 Merkle 树生成 `super_root`，并通过 `prev_super_root` 链式锚定前一个超级批次。超级批次文件持久化到 `data/super_batches/<id>.json`。
+
+### 5.8 安全产品适配器配置（M2）
+
+安全产品适配器用于接入三类异构安全产品日志源，配置项位于 `config.yaml` 的 `security_adapters` 段：
+
+```yaml
+security_adapters:
+  - type: syslog
+    name: syslog_udp_514
+    config:
+      listen: "0.0.0.0:514"
+      protocol: udp
+      parse_format: rfc3164   # 可选 rfc3164 / rfc5424
+  - type: db_audit
+    name: db_audit_local
+    config:
+      path: "/var/log/audit/db_audit.jsonl"
+      poll_interval_ms: 5000
+  - type: bastion
+    name: bastion_api
+    config:
+      base_url: "https://bastion.example.com/api/v1"
+      cursor_file: "data/bastion_cursor.json"
+      poll_interval_ms: 10000
+      api_token: "<堡垒机 API Token>"
+```
+
+字段说明：
+
+- `type`：适配器类型，取值 `syslog` / `db_audit` / `bastion`。
+- `name`：适配器实例名称，用于日志与统计区分。
+- `config`：各适配器类型特定的配置块：
+  - **syslog**：`listen`（UDP 监听地址）、`protocol`（传输协议）、`parse_format`（RFC 3164/5424 解析格式）。
+  - **db_audit**：`path`（JSON Lines 文件路径）、`poll_interval_ms`（轮询间隔）。
+  - **bastion**：`base_url`（REST API 基址）、`cursor_file`（游标持久化文件）、`poll_interval_ms`（轮询间隔）、`api_token`（鉴权令牌）。
+
+适配器在 Agent 启动时按此列表注册，产出事件统一转为 `AuditEvent` 进入链签名流水线。
+
+### 5.9 ML 异常检测配置（M3）
+
+合谋检测引擎的 ML 异常检测为线索性质（不直接触发 HIGH），配置项位于 `data/server/policies/collusion_config.json`：
+
+```json
+{
+  "ml_enabled": false,
+  "ml_high_threshold": 0.7,
+  "ml_max_factor": 30,
+  "ml_model_path": "models/isolation_forest.onnx"
+}
+```
+
+字段说明：
+
+- `ml_enabled`：ML 异常检测开关，默认关闭。模型就绪后再开启。
+- `ml_high_threshold`：异常分数超过此值时计入 `ml_factor`，默认 0.7。
+- `ml_max_factor`：ML 因子上限，默认 30。线索性质，不直接触发 HIGH 风险。
+- `ml_model_path`：ONNX 模型文件路径，预训练模型为孤立森林（输入 [1,20] → 输出 [1] 异常分数）。
+
+无 ONNX Runtime 或模型未加载时，引擎优雅降级（跳过 ML 因子），不崩溃、不阻断检测。
+
+### 5.10 图算法配置（M4）
+
+合谋检测引擎的图算法为线索性质（不直接触发 HIGH），配置项位于 `data/server/policies/collusion_config.json`：
+
+```json
+{
+  "graph_enabled": false,
+  "graph_threshold": 0.3,
+  "graph_max_factor": 25
+}
+```
+
+字段说明：
+
+- `graph_enabled`：图分析开关，默认关闭。历史基线图就绪后再开启。
+- `graph_threshold`：图异常分量阈值，任一图算法分量超过此值即计入 `graph_factor`，默认 0.3。
+- `graph_max_factor`：图因子上限，默认 25。线索性质，不直接触发 HIGH 风险。
+
+图算法从聚合事件构建「操作员-资产-操作类型」异构图，运行度中心性、Louvain 社区检测、三角形计数、Jaccard 相似度四类算法，与历史基线图对比产出 `graph_factor`。纯 C++ 实现，无外部依赖。
+
 ---
 
 ## 6. 启动与停止
@@ -1144,6 +1239,14 @@ pending 事件数量 >= batch_size 时自动 flush
 ---
 
 ## 13. 版本更新记录
+
+### v1.3.0（M1-M4 里程碑）
+
+- **M1 分层 Merkle 树（超级批次）**：监管链新增跨批次分层聚合结构，每 K 个 EventBatch 的 `merkle_root` 作为叶子构建上层 Merkle 树生成 `super_root`，通过 `prev_super_root` 链式锚定；新增 `SuperBatch` 结构体、`set_super_batch_size` / `last_super_root` / `verify_super_batch` / `recent_super_batches` 方法。
+- **M2 安全产品适配器**：新增 `SecurityAdapter` 抽象基类与三类具体适配器（Syslog UDP 514 监听 + RFC 3164/5424 解析、数据库审计 JSON Lines 增量轮询、堡垒机 REST API 游标轮询），统一转为 `AuditEvent` 接入链签名流水线。
+- **M3 ONNX Runtime 集成 + 行为特征工程**：新增 `OnnxModel`（PIMPL + 条件编译 `AF_HAVE_ONNXRUNTIME` + 优雅降级）与 `FeatureExtractor`（固定 20 维 `BehaviorFeatures`）；合谋检测引擎 `detect()` 新增 ML 推理段，产出 `ml_factor`（上限 30，线索性质，不直接触发 HIGH）。
+- **M4 轻量级图算法替代 GNN**：新增 `BehaviorGraph`（纯 C++ 无外部依赖），从聚合事件构建操作员-资产-操作类型异构图，运行度中心性 / Louvain 社区检测 / 三角形计数 / Jaccard 相似度四类算法；合谋检测引擎 `detect()` 新增图分析段，产出 `graph_factor`（上限 25，线索性质，不直接触发 HIGH）。
+- 单元测试扩展至 349 项，新增超级批次、三类适配器、特征工程、ONNX 推理、行为图等测试。
 
 ### v1.2.0
 

@@ -28,6 +28,11 @@ constexpr const char* kNetworkLinux = "network_linux";
 constexpr const char* kCommandLinux = "command_linux";
 constexpr const char* kAuditLinux   = "audit_linux";
 
+// 安全产品适配器
+constexpr const char* kSyslog    = "syslog";     // Syslog UDP 适配器
+constexpr const char* kDbAudit   = "db_audit";   // 数据库审计适配器
+constexpr const char* kBastion   = "bastion";    // 堡垒机适配器
+
 constexpr const char* kLegacy  = "legacy";   // 服务端迁移的旧记录
 constexpr const char* kUnknown = "unknown";  // 无采集器字段时的兜底
 }  // namespace collector

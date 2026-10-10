@@ -104,6 +104,18 @@ set(AF_CORE_SOURCES
 
     # 采集器基类
     client/src/collector/collector_base.cpp
+
+    # 安全产品适配器（Syslog/DB审计/堡垒机）
+    client/src/collector/adapters/syslog_adapter.cpp
+    client/src/collector/adapters/db_audit_adapter.cpp
+    client/src/collector/adapters/bastion_adapter.cpp
+
+    # ML 异常检测模块（M3 措施3：ONNX 推理 + 行为特征工程）
+    shared/src/ml/onnx_inference.cpp
+    shared/src/ml/feature_extractor.cpp
+
+    # 图算法模块（M4 措施4：轻量级图算法替代 GNN）
+    shared/src/graph/behavior_graph.cpp
 )
 
 if(AF_PLATFORM_LINUX)

@@ -3,6 +3,7 @@
 
 #include "auditforwarder/event.h"
 #include "auditforwarder/chain.h"
+#include "auditforwarder/security_adapter.h"
 #include "auditforwarder/thread_pool.h"
 #include <atomic>
 #include <chrono>
@@ -38,6 +39,7 @@ struct AgentConfig {
     std::size_t chain_batch_size { 256 };
     std::string chain_signing_key;     // PEM 格式
     std::string chain_hmac_key;        // 备选方案
+    std::size_t chain_super_batch_k { 8 };  // 超级批次容量（0=禁用）
 
     // 传输配置
     std::vector<std::string> server_urls;
@@ -189,6 +191,12 @@ private:
     std::thread       injector_;
     std::atomic<bool> injecting_ { false };
     void injector_loop();
+
+    // 安全产品适配器（Syslog/DB 审计/堡垒机）
+    std::vector<std::unique_ptr<SecurityAdapter>> security_adapters_;
+    std::vector<std::thread>                      adapter_threads_;
+    std::atomic<bool> adapters_running_ { false };
+    void adapter_poll_loop(SecurityAdapter* adapter);
 };
 
 // ---- 采集器基类 ----

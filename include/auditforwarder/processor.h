@@ -90,4 +90,13 @@ private:
     void* re_ { nullptr };
 };
 
+// 数据清洗与标准化：统一不同来源（Syslog/DB审计/堡垒机/本机采集器）的事件字段格式。
+// 职责：时间规整（微秒粒度）、来源标注、action/outcome/severity 推断、command/message 互补补全。
+// 为后续特征工程与 ONNX 异常检测提供规范化输入。
+class Normalizer : public Processor {
+public:
+    bool process(AuditEvent& ev) override;
+    std::string name() const override { return "normalizer"; }
+};
+
 }  // namespace af::processor

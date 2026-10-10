@@ -30,13 +30,18 @@ std::string proc_hostname() {
 }
 }  // namespace
 
-Chain::Chain(ChainConfig cfg) : cfg_(std::move(cfg)) {}
+Chain::Chain(ChainConfig cfg) : cfg_(std::move(cfg)) {
+    super_batch_k_ = cfg_.super_batch_k;
+}
 Chain::~Chain() { stop(); }
 
 void Chain::start() {
     if (running_.exchange(true)) return;
     if (cfg_.auto_persist && !cfg_.data_dir.empty()) {
         fs::create_directories(cfg_.data_dir + "/batches");
+        if (super_batch_k_ > 0) {
+            fs::create_directories(cfg_.data_dir + "/super_batches");
+        }
     }
     if (!has_signer_ && !has_hmac_) {
         // 安全红线：绝不使用任何硬编码/机器派生的弱默认密钥。
@@ -116,11 +121,36 @@ Result<EventBatch> Chain::flush() {
     }
     auto b = build_batch(std::move(events));
     if (cfg_.auto_persist) persist_batch(b);
+
+    // 检查是否达到超级批次阈值
+    bool need_super = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         last_batch_id_ = b.id;
         last_merkle_   = b.merkle_root;
         total_batches_++;
+        if (super_batch_k_ > 0) {
+            pending_batch_ids_.push_back(b.id);
+            pending_batch_roots_.push_back(b.merkle_root);
+            if (pending_batch_roots_.size() >= super_batch_k_) {
+                need_super = true;
+            }
+        }
+    }
+    // 超级批次构建在锁外完成（涉及 Merkle 树 + 签名，耗时操作）
+    if (need_super) {
+        std::vector<std::string> sb_ids;
+        std::vector<std::string> sb_roots;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            sb_ids.swap(pending_batch_ids_);
+            sb_roots.swap(pending_batch_roots_);
+        }
+        auto sb = build_super_batch(std::move(sb_ids), std::move(sb_roots));
+        if (cfg_.auto_persist) persist_super_batch(sb);
+        AF_LOG_INFO("chain: super batch id=" << sb.id
+                      << " batches=" << sb.batch_ids.size()
+                      << " super_root=" << sb.super_root.substr(0, 16) << "...");
     }
     AF_LOG_INFO("chain: flushed batch id=" << b.id << " events=" << b.events.size()
                   << " merkle=" << b.merkle_root.substr(0, 16) << "...");
@@ -207,5 +237,154 @@ bool Chain::verify_batch_with_key(const EventBatch& b, const crypto::KeyPair& kp
 
 std::string Chain::last_batch_id() const { return last_batch_id_; }
 std::string Chain::last_merkle_root() const { return last_merkle_; }
+
+// ---------------- 超级批次实现 ----------------
+
+std::string Chain::super_batch_payload(const SuperBatch& sb) {
+    // 与 EventBatch 签名 payload 模式一致：微秒粒度
+    // 含 prev_super_root 实现跨超级批次的链式锚定
+    return sb.id + "|" + std::to_string(sb.created_at_us) + "|" +
+           sb.super_root + "|" + sb.prev_super_root;
+}
+
+SuperBatch Chain::build_super_batch(std::vector<std::string>&& batch_ids,
+                                    std::vector<std::string>&& batch_roots) {
+    SuperBatch sb;
+    sb.batch_ids   = std::move(batch_ids);
+    sb.batch_roots = std::move(batch_roots);
+
+    // 生成超级批次 ID（与 EventBatch ID 生成方式一致）
+    auto now = SysClock::now();
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      now.time_since_epoch()).count();
+    sb.created_at_us = static_cast<u64>(micros);
+    sb.id = crypto::to_hex(crypto::sha256(
+        std::to_string(micros) + "-" + std::to_string(sb.batch_ids.size()))).substr(0, 16);
+
+    // 将各批次的 merkle_root（hex 字符串）转为 ByteBuffer 作为叶子
+    std::vector<ByteBuffer> leaves;
+    leaves.reserve(sb.batch_roots.size());
+    for (const auto& root : sb.batch_roots) {
+        leaves.push_back(ByteBuffer(root.begin(), root.end()));
+    }
+    crypto::MerkleTree tree(std::move(leaves));
+    sb.super_root = tree.root_hex();
+
+    // 链式锚定：记录前一个超级批次根
+    sb.prev_super_root = last_super_root_;
+
+    // 签名（与 EventBatch 签名逻辑一致：优先 Ed25519，回退 HMAC）
+    std::string payload = super_batch_payload(sb);
+    if (has_signer_) {
+        auto sig = signer_.sign(ByteBuffer(payload.begin(), payload.end()));
+        sb.signature = crypto::to_hex(sig);
+    } else if (has_hmac_) {
+        sb.signature = crypto::hmac_sha256_hex(hmac_key_, payload);
+    }
+
+    // 更新链式锚定根
+    last_super_root_ = sb.super_root;
+    return sb;
+}
+
+void Chain::persist_super_batch(const SuperBatch& sb) {
+    if (cfg_.data_dir.empty()) return;
+    std::string path = cfg_.data_dir + "/super_batches/" + sb.id + ".json";
+    std::ofstream o(path, std::ios::binary);
+    if (!o) return;
+    o << "{\n"
+      << "  \"id\": \"" << sb.id << "\",\n"
+      << "  \"super_root\": \"" << sb.super_root << "\",\n"
+      << "  \"prev_super_root\": \"" << sb.prev_super_root << "\",\n"
+      << "  \"signature\": \"" << sb.signature << "\",\n"
+      << "  \"batch_count\": " << sb.batch_ids.size() << ",\n"
+      << "  \"created_at\": " << sb.created_at_us << ",\n"
+      << "  \"batch_ids\": [";
+    for (std::size_t i = 0; i < sb.batch_ids.size(); ++i) {
+        o << "\"" << sb.batch_ids[i] << "\"";
+        if (i + 1 < sb.batch_ids.size()) o << ", ";
+    }
+    o << "],\n  \"batch_roots\": [";
+    for (std::size_t i = 0; i < sb.batch_roots.size(); ++i) {
+        o << "\"" << sb.batch_roots[i] << "\"";
+        if (i + 1 < sb.batch_roots.size()) o << ", ";
+    }
+    o << "]\n}\n";
+    o.close();
+    if (!o) {
+        AF_LOG_WARN("chain: failed to persist super batch file " << path);
+    }
+}
+
+bool Chain::verify_super_batch(const SuperBatch& sb, const std::string& hmac_key) {
+    if (hmac_key.empty()) return false;
+    std::string payload = super_batch_payload(sb);
+    return sb.signature == crypto::hmac_sha256_hex(hmac_key, payload);
+}
+
+bool Chain::verify_super_batch_with_key(const SuperBatch& sb, const crypto::KeyPair& kp) {
+    if (!kp.is_valid()) return false;
+    std::string payload = super_batch_payload(sb);
+    return kp.verify(ByteBuffer(payload.begin(), payload.end()),
+                     crypto::from_hex(sb.signature));
+}
+
+Result<std::vector<SuperBatch>> Chain::recent_super_batches(std::size_t n) const {
+    std::vector<SuperBatch> out;
+    if (cfg_.data_dir.empty()) return out;
+    auto lst = fs::list_directory(cfg_.data_dir + "/super_batches");
+    if (lst.is_err()) return Result<std::vector<SuperBatch>>(lst.error());
+    auto& files = lst.value();
+
+    // 先解析全部文件，再按 created_at_us 降序排列（最新在前），最后截取 n 条
+    for (const auto& f : files) {
+        std::ifstream in(f, std::ios::binary);
+        if (!in) continue;
+        std::ostringstream ss; ss << in.rdbuf();
+        std::string content = ss.str();
+
+        // 最小化重建：提取元数据字段
+        SuperBatch sb;
+        auto get_str = [&](const std::string& key) -> std::string {
+            auto marker = "\"" + key + "\":";
+            auto pos = content.find(marker);
+            if (pos == std::string::npos) return {};
+            pos += marker.size();
+            // 跳过冒号后的空白字符
+            while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) ++pos;
+            if (pos >= content.size() || content[pos] != '"') return {};
+            ++pos;
+            auto end = content.find('"', pos);
+            return end == std::string::npos ? std::string() : content.substr(pos, end - pos);
+        };
+        auto get_u64 = [&](const std::string& key) -> u64 {
+            auto marker = "\"" + key + "\":";
+            auto pos = content.find(marker);
+            if (pos == std::string::npos) return 0;
+            pos += marker.size();
+            while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) ++pos;
+            u64 val = 0;
+            while (pos < content.size() && content[pos] >= '0' && content[pos] <= '9') {
+                val = val * 10 + static_cast<u64>(content[pos] - '0');
+                ++pos;
+            }
+            return val;
+        };
+        sb.id              = get_str("id");
+        sb.super_root      = get_str("super_root");
+        sb.prev_super_root = get_str("prev_super_root");
+        sb.signature      = get_str("signature");
+        sb.created_at_us  = get_u64("created_at");
+        out.push_back(std::move(sb));
+    }
+    // 按创建时间降序排列（最新在前）
+    std::sort(out.begin(), out.end(),
+              [](const SuperBatch& a, const SuperBatch& b) {
+                  return a.created_at_us > b.created_at_us;
+              });
+    // 截取最近 n 条
+    if (out.size() > n) out.resize(n);
+    return out;
+}
 
 }  // namespace af::chain

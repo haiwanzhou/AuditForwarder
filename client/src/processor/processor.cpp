@@ -1,9 +1,11 @@
 #include "auditforwarder/processor.h"
 
 #include "auditforwarder/logger.h"
+#include "auditforwarder/log_meta.h"
 
 #include <algorithm>
 #include <cctype>
+#include <initializer_list>
 #include <regex>
 #include <sstream>
 
@@ -186,6 +188,92 @@ bool PIIMasker::process(AuditEvent& ev) {
     for (auto& [k, v] : ev.attrs) {
         v = std::regex_replace(v, *re, "$1=***REDACTED***");
     }
+    return true;
+}
+
+// =====================================================================
+// Normalizer（数据清洗与标准化）
+// =====================================================================
+namespace {
+std::string norm_lower(std::string s) {
+    for (auto& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+// 小写匹配：文本是否包含任一关键词
+bool norm_contains_any(const std::string& text, std::initializer_list<const char*> kws) {
+    auto low = norm_lower(text);
+    for (auto kw : kws) {
+        if (low.find(kw) != std::string::npos) return true;
+    }
+    return false;
+}
+}  // namespace
+
+bool Normalizer::process(AuditEvent& ev) {
+    // 1. 时间规整：ts_micros 为 0 时从 timestamp 补算微秒粒度
+    if (ev.ts_micros == 0) {
+        ev.ts_micros = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+            ev.timestamp.time_since_epoch()).count());
+    }
+    // timestamp 仍为空（time_since_epoch 为 0）→ 用当前时间补全
+    if (ev.ts_micros == 0) {
+        ev.timestamp = SysClock::now();
+        ev.ts_micros = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+            ev.timestamp.time_since_epoch()).count());
+    }
+
+    // 2. 来源标注：attrs[source] 缺失时标注为本机采集
+    auto sit = ev.attrs.find(logmeta::attr::kSource);
+    if (sit == ev.attrs.end() || sit->second.empty()) {
+        ev.attrs[logmeta::attr::kSource] = "agent";
+    }
+
+    // 3. 字段补全：command 与 message 互补
+    if (ev.command.empty() && !ev.message.empty()) {
+        ev.command = ev.message;
+    } else if (ev.message.empty() && !ev.command.empty()) {
+        ev.message = ev.command;
+    }
+
+    // 4. action 推断：仅当 Unknown 时按 message/command 关键词推断
+    if (ev.action == EventAction::Unknown) {
+        const std::string& text = !ev.command.empty() ? ev.command : ev.message;
+        if      (norm_contains_any(text, {"logoff", "logout"}))                    ev.action = EventAction::Logout;
+        else if (norm_contains_any(text, {"login", "logon", "session open"}))      ev.action = EventAction::Login;
+        else if (norm_contains_any(text, {"auth", "denied", "reject", "refus", "password"}))   ev.action = EventAction::AuthFail;
+        else if (norm_contains_any(text, {"delete", "remove", "rm "}))             ev.action = EventAction::Delete;
+        else if (norm_contains_any(text, {"exec", "cmd", "command"}))              ev.action = EventAction::Execute;
+        else if (norm_contains_any(text, {"connect"}))                             ev.action = EventAction::Connect;
+        else if (norm_contains_any(text, {"write", "modify", "insert", "update"})) ev.action = EventAction::Write;
+        else if (norm_contains_any(text, {"read"}))                                ev.action = EventAction::Read;
+        // 其余保留 Unknown
+    }
+
+    // 5. outcome 标准化：Unknown 时按关键词判定成功/失败
+    if (ev.outcome == EventOutcome::Unknown) {
+        const std::string& text = !ev.message.empty() ? ev.message : ev.command;
+        if (norm_contains_any(text, {"fail", "denied", "error", "refus", "reject"}))
+            ev.outcome = EventOutcome::Failure;
+        else
+            ev.outcome = EventOutcome::Success;
+    }
+
+    // 6. severity 推断：Info（默认值）时按 outcome/action 提升
+    //    注意：syslog 已显式设置 severity（非 Info），不会被覆盖
+    if (ev.severity == Severity::Info) {
+        if (ev.outcome == EventOutcome::Failure || ev.outcome == EventOutcome::Denied ||
+            ev.action == EventAction::AuthFail ||
+            ev.action == EventAction::PrivilegeEsc) {
+            ev.severity = Severity::Warning;
+        } else if (ev.action == EventAction::Delete ||
+                   ev.action == EventAction::Block ||
+                   ev.action == EventAction::Quarantine ||
+                   ev.action == EventAction::Kill) {
+            ev.severity = Severity::Notice;
+        }
+    }
+
     return true;
 }
 

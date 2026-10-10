@@ -37,6 +37,18 @@ client/src/collector/
 负责采集 Windows/Linux 系统事件、文件事件、进程事件、网络事件等。
 
 ```text
+client/src/collector/adapters/
+```
+
+安全产品适配器（M2 新增）：对接异构安全产品日志源并统一转为 `AuditEvent`。包含三类适配器实现：
+
+- `syslog_adapter.cpp/.h`：UDP 514 监听，按 RFC 3164/5424 解析 Syslog 报文。
+- `db_audit_adapter.cpp/.h`：JSON Lines 增量轮询数据库审计日志。
+- `bastion_adapter.cpp/.h`：REST API 游标轮询堡垒机操作记录。
+
+适配器在 `client/src/core/agent.cpp` 中按配置注册到采集流水线，产出事件与系统采集器事件走同一条链签名路径。
+
+```text
 client/src/processor/
 ```
 
@@ -102,7 +114,7 @@ shared/src/common/
 shared/src/crypto/
 ```
 
-SHA-256、HMAC、AES-GCM、Ed25519、事件链和批次存证逻辑。
+SHA-256、HMAC、AES-GCM、Ed25519、事件链和批次存证逻辑。M1 在 `chain.cpp` 中新增 `build_super_batch` / `persist_super_batch` 实现，`flush()` 尾部触发超级批次聚合。
 
 ```text
 shared/src/detector/
@@ -110,9 +122,33 @@ shared/src/detector/
 
 规则引擎实现。当前主要由客户端 Agent 使用，后续服务端做集中分析时也可复用。
 
+```text
+shared/src/ml/
+```
+
+机器学习推理与行为特征工程（M3 新增）：
+
+- `onnx_inference.cpp`：`OnnxModel` 实现，PIMPL 封装 ONNX Runtime，条件编译 `AF_HAVE_ONNXRUNTIME`，无运行时时优雅降级。
+- `feature_extractor.cpp`：`FeatureExtractor` 实现，从聚合事件集合 + 行为画像提取固定 20 维 `BehaviorFeatures` 向量。
+
+```text
+shared/src/graph/
+```
+
+轻量级图算法模块（M4 新增）：
+
+- `behavior_graph.cpp`：`BehaviorGraph` 实现，纯 C++ 无外部依赖，包含度中心性、Louvain 社区检测、三角形计数、Jaccard 相似度四类算法，替代 GNN 行为图谱。
+
 ## include
 
-`include/auditforwarder/` 是公共头文件接口层。客户端、服务器端和共享模块都通过这里声明类型、接口和配置结构。
+`include/auditforwarder/` 是公共头文件接口层。客户端、服务器端和共享模块都通过这里声明类型、接口和配置结构。M1-M4 新增以下头文件：
+
+- `security_adapter.h`（M2）：`SecurityAdapter` 抽象基类，定义安全产品适配器统一接口。
+- `onnx_inference.h`（M3）：`OnnxModel` 类，PIMPL + 条件编译 + 优雅降级。
+- `feature_extractor.h`（M3）：`BehaviorFeatures` 20 维结构 + `FeatureExtractor` 类。
+- `behavior_graph.h`（M4）：`BehaviorGraph` 类 + `AnalysisResult` 结构，三类节点 `Operator` / `Asset` / `OpType`。
+
+`chain.h` 在 M1 中新增 `SuperBatch` 结构体、`set_super_batch_size` / `last_super_root` / `verify_super_batch` / `recent_super_batches` 等方法；`collusion.h` 在 M3/M4 中扩展 `EngineConfig`（`ml_*` / `graph_*` 字段）、`DetectionResult`（`ml_factor` / `graph_factor` / `ml_notes` / `graph_notes`）、`detect()` 签名（新增 `OnnxModel*` 与 `BehaviorGraph*` 参数）以及 `Engine` 私有成员（`onnx_if_` / `graph_baseline_`）。
 
 ## 数据库脚本
 

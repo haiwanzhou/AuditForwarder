@@ -14,9 +14,15 @@
 #include "auditforwarder/types.h"
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+// 前向声明（PIMPL，完整定义在 onnx_inference.h，实现在 .cpp 中引用）
+namespace af::ml { class OnnxModel; }
+// 前向声明（M4 措施4：轻量级图算法模块，替代 GNN 行为图谱）
+namespace af::graph { class BehaviorGraph; }
 
 namespace af::collusion {
 
@@ -48,6 +54,15 @@ struct EngineConfig {
     bool    emergency_mode     { false };            // 应急运维模式（等级自动降一级）
     u64     emergency_until_epoch { 0 };             // 应急模式截止时间（0 = 手动关闭前一直生效）
     bool    profile_enabled    { true };
+    // ---- ML 异常检测配置（M3 措施3，ONNX 推理）----
+    bool    ml_enabled         { false };  // ML 开关（默认关闭，模型就绪后开启）
+    float   ml_high_threshold { 0.7f };   // 异常分数高于此值时计入 ml_factor
+    int     ml_max_factor     { 30 };      // ML 因子上限（线索性质，不直接触发 HIGH）
+    std::string ml_model_path;              // ONNX 模型路径（models/isolation_forest.onnx）
+    // ---- 图算法配置（M4 措施4，轻量级图算法替代 GNN）----
+    bool    graph_enabled     { false };  // 图分析开关（默认关闭，基线就绪后开启）
+    float   graph_threshold   { 0.3f };   // 图异常分量阈值（任一超阈值即计入 graph_factor）
+    int     graph_max_factor  { 25 };      // 图因子上限（线索性质，不直接触发 HIGH）
     std::vector<AssetGroup>    asset_groups;
     std::vector<WhitelistGroup> whitelist_groups;
 };
@@ -119,9 +134,13 @@ struct ProfileSnapshot {
 struct DetectionResult {
     int  rule_factor    { 0 };
     int  profile_factor { 0 };
+    int  ml_factor      { 0 };                // ML 异常检测因子（M3 措施3）
+    int  graph_factor   { 0 };               // 图算法异常因子（M4 措施4）
     int  total_score    { 0 };
     std::vector<std::string> hit_rules;       // 命中的规则编号
     std::vector<std::string> profile_notes;   // 画像异常描述（线索）
+    std::vector<std::string> ml_notes;        // ML 推理说明（异常分数/降级提示）
+    std::vector<std::string> graph_notes;     // 图算法异常说明（社区/三角形/相似度线索）
     std::vector<std::string> score_notes;     // 其他评分说明（工单/白名单/应急）
     bool ticket_valid   { false };
     bool whitelisted    { false };
@@ -154,12 +173,16 @@ bool verify_work_order(const std::vector<WorkOrder>& registry, const WorkOrder& 
 bool in_whitelist(const std::vector<WhitelistGroup>& groups, const AggSet& set, u64 now_epoch);
 
 // 双路检测 + 风险评分（核心算法，见设计方案第 5/6 章与伪代码 10.4/10.5）
+//   onnx_model: 可选 ONNX 模型指针（M3 措施3）；非空且已加载时执行 ML 推理
+//   baseline_graph: 可选历史基线图指针（M4 措施4）；非空时执行图算法对比分析
 DetectionResult detect(const AggSet& set,
                        const EngineConfig& cfg,
                        const std::vector<Rule>& rules,
                        const ProfileSnapshot& profile,
                        const std::vector<WorkOrder>& workorders,
-                       u64 now_epoch);
+                       u64 now_epoch,
+                       af::ml::OnnxModel* onnx_model = nullptr,
+                       af::graph::BehaviorGraph* baseline_graph = nullptr);
 
 // ---------------- 风险事件（存储/处置闭环模型） ----------------
 
@@ -211,6 +234,7 @@ public:
 
 private:
     Engine() = default;
+    ~Engine();  // 需在 .cpp 定义（unique_ptr<OnnxModel> 完整类型在 .cpp 可见）
 
     void maybe_reload_locked(u64 now_ms);         // 配置/规则热更新（带节流）
     void flush_due_locked(u64 now_ms);            // 冲刷到期窗口 → 检测 → 告警/存储
@@ -236,6 +260,11 @@ private:
     std::map<std::string, AggSet> short_sets_;    // aggregate_key -> 集合
     std::map<std::string, AggSet> long_sets_;
     std::map<std::string, u64> last_alert_epoch_; // 告警降噪：aggregate_key -> 上次告警时间
+
+    // ---- ML 异常检测（M3 措施3，ONNX 推理）----
+    std::unique_ptr<af::ml::OnnxModel> onnx_if_;   // ONNX 模型实例（条件编译优雅降级）
+    // ---- 图算法基线（M4 措施4，历史行为图谱基线）----
+    std::unique_ptr<af::graph::BehaviorGraph> graph_baseline_;   // 历史基线图（空 = 无基线）
 };
 
 }  // namespace af::collusion
