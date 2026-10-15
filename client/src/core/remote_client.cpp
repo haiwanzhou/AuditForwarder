@@ -390,6 +390,7 @@ Result<void> RemoteAgentClient::start(Agent& agent) {
     running_.store(true);
     stopping_.store(false);
     worker_ = std::thread([this] { worker_loop(); });
+    audit_worker_ = std::thread([this] { audit_loop(); });
     AF_LOG_INFO("remote_client: started, servers=" << cfg_.server_urls.size()
                 << " host_id=" << cfg_.host_id);
     return Result<void>::ok();
@@ -399,7 +400,9 @@ void RemoteAgentClient::stop() {
     if (stopping_.exchange(true)) return;
     running_.store(false);
     cv_.notify_all();
+    audit_cv_.notify_all();
     if (worker_.joinable()) worker_.join();
+    if (audit_worker_.joinable()) audit_worker_.join();
 #ifdef AF_PLATFORM_WINDOWS
     WSACleanup();
 #endif
@@ -420,49 +423,59 @@ void RemoteAgentClient::enqueue_batch_summary(const chain::EventBatch& batch) {
         q.push_back(std::move(b));
         if (q.size() > 1000) q.erase(q.begin());
     }
-    if (high) cv_.notify_one();  // 唤醒紧急发送
+    if (high) audit_cv_.notify_one();  // 唤醒审计线程的紧急发送
 }
 
 void RemoteAgentClient::worker_loop() {
+    AF_LOG_INFO("remote_client: worker_loop started, heartbeat=" << cfg_.heartbeat_interval_sec
+                << "s command_poll=" << cfg_.command_poll_interval_sec
+                << "s audit_summary=" << cfg_.audit_summary_interval_sec << "s");
     auto last_heartbeat = Clock::now() - std::chrono::seconds(cfg_.heartbeat_interval_sec);
     auto last_command_poll = Clock::now() - std::chrono::seconds(cfg_.command_poll_interval_sec);
-    auto last_audit = Clock::now() - std::chrono::seconds(cfg_.audit_summary_interval_sec);
     while (running_.load()) {
         auto now = Clock::now();
         if (now - last_heartbeat >= std::chrono::seconds(cfg_.heartbeat_interval_sec)) {
             send_heartbeat();
-            last_heartbeat = now;
+            last_heartbeat = Clock::now();
         }
         if (now - last_command_poll >= std::chrono::seconds(cfg_.command_poll_interval_sec)) {
             poll_commands();
-            last_command_poll = now;
+            last_command_poll = Clock::now();
         }
+        send_pending_results();
+        // 500ms 周期；审计摘要发送已移至 audit_loop，本循环只做心跳/命令/结果回传
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait_for(lk, std::chrono::milliseconds(500), [this] { return !running_.load(); });
+    }
+}
+
+// 审计摘要独立发送线程：定时通道（先高后普通）+ 高优先级紧急通道。
+// 与心跳/命令轮询隔离，避免大体积 operation-logs 上传阻塞拖垮心跳周期。
+void RemoteAgentClient::audit_loop() {
+    auto last_audit = Clock::now() - std::chrono::seconds(cfg_.audit_summary_interval_sec);
+    while (running_.load()) {
+        auto now = Clock::now();
         if (now - last_audit >= std::chrono::seconds(cfg_.audit_summary_interval_sec)) {
             send_audit_summaries();  // 定时通道：先高后普通
             last_audit = Clock::now();
+            continue;
         }
-        send_pending_results();
-        // 等待 500ms 周期；若期间有高优先级批次入队，100ms 节流合并后立即走紧急通道
+        bool has_high = false;
         {
-            std::unique_lock<std::mutex> lk(mtx_);
-            cv_.wait_for(lk, std::chrono::milliseconds(500), [this] {
-                return !running_.load() || !hi_audit_queue_.empty();
-            });
+            std::lock_guard<std::mutex> lk(mtx_);
+            has_high = !hi_audit_queue_.empty();
         }
-        if (running_.load()) {
-            bool has_high = false;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                has_high = !hi_audit_queue_.empty();
-            }
-            if (has_high) {
-                // 合并 100ms 内到达的其他高优先级批次，再一次性发出
-                std::unique_lock<std::mutex> lk(mtx_);
-                cv_.wait_for(lk, std::chrono::milliseconds(100));
-                lk.unlock();
-                send_audit_summaries(true);
-            }
+        if (has_high) {
+            // 合并 100ms 内到达的其他高优先级批次，再一次性发出
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            send_audit_summaries(true);
+            continue;
         }
+        // 等待下一个检查点；高优先级批次入队会 notify 即时唤醒
+        std::unique_lock<std::mutex> lk(mtx_);
+        audit_cv_.wait_for(lk, std::chrono::milliseconds(200), [this] {
+            return !running_.load() || !hi_audit_queue_.empty();
+        });
     }
 }
 
@@ -564,12 +577,14 @@ std::string RemoteAgentClient::build_batch_summary_json(const chain::EventBatch&
 void RemoteAgentClient::send_heartbeat() {
     auto body = build_heartbeat_json();
     for (const auto& base : cfg_.server_urls) {
-        auto r = http_request("POST", endpoint(base, "/hosts/heartbeat"), body, "application/json");
+        auto url = endpoint(base, "/hosts/heartbeat");
+        auto r = http_request("POST", url, body, "application/json");
         if (r.ok) {
+            AF_LOG_INFO("remote_client: heartbeat ok -> " << url);
             (void)http_request("POST", endpoint(base, "/agent/metrics"), build_metrics_json(), "application/json");
             return;
         }
-        AF_LOG_WARN("remote_client: heartbeat failed: " << r.error);
+        AF_LOG_WARN("remote_client: heartbeat failed: " << url << " err=" << r.error << " status=" << r.status);
     }
 }
 
@@ -859,6 +874,17 @@ RemoteAgentClient::HttpResponse RemoteAgentClient::http_request(const std::strin
     if (fd < 0) {
         out.error = "connect failed";
         return out;
+    }
+
+    // 设置发送/接收超时，防止 recv() 永久阻塞
+    {
+#ifdef AF_PLATFORM_WINDOWS
+        DWORD tv = 10000;  // 10 秒
+#else
+        struct timeval tv { 10, 0 };
+#endif
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
     }
 
     SSL_CTX* ctx = nullptr;

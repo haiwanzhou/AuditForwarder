@@ -1926,6 +1926,10 @@ void SimpleHttpManager::stop() {
 }
 
 void SimpleHttpManager::accept_loop() {
+    // 限制最大并发连接数，防止高频请求导致线程耗尽
+    constexpr int kMaxConnections = 64;
+    std::atomic<int> active{0};
+
     while (running_.load()) {
         sockaddr_in cli{}; socklen_t cl = sizeof(cli);
         int cfd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&cli), &cl);
@@ -1933,16 +1937,24 @@ void SimpleHttpManager::accept_loop() {
             if (!running_.load()) return;
             continue;
         }
-        // 为简化，每个线程处理一个客户端（此处无线程池依赖）
-        std::thread([this, cfd] {
+        // 超过并发上限时拒绝连接（返回 503 并关闭）
+        if (active.load() >= kMaxConnections) {
+            const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void)send(cfd, busy, static_cast<int>(strlen(busy)), 0);
+            ::close(cfd);
+            continue;
+        }
+        ++active;
+        std::thread([this, cfd, &active] {
             SSL* ssl = nullptr;
             if (tls_ctx_) {
                 ssl = SSL_new(static_cast<SSL_CTX*>(tls_ctx_));
-                if (!ssl) { ::close(cfd); return; }
+                if (!ssl) { ::close(cfd); --active; return; }
                 SSL_set_fd(ssl, cfd);
                 if (SSL_accept(ssl) <= 0) {
                     SSL_free(ssl);
                     ::close(cfd);
+                    --active;
                     return;
                 }
             }
@@ -1952,6 +1964,7 @@ void SimpleHttpManager::accept_loop() {
                 SSL_free(ssl);
             }
             ::close(cfd);
+            --active;
         }).detach();
     }
 }

@@ -37,18 +37,23 @@ Result<void> SqliteDb::open(const std::string& path) {
                              nullptr);
     if (rc != SQLITE_OK) {
         last_error_ = sqlite3_errmsg(db_->handle ? db_->handle : nullptr);
-        close();
+        close_unlocked();
         return Result<void>(Error::Code::IoError, "sqlite3 open failed: " + last_error_);
     }
-    // 启用 WAL 模式 + 外键约束，提升并发与可靠性
-    exec("PRAGMA journal_mode=WAL;");
-    exec("PRAGMA foreign_keys=ON;");
-    exec("PRAGMA synchronous=NORMAL;");
+    // 启用 WAL 模式 + 外键约束，提升并发与可靠性。
+    // 注意：此处已持有 mtx_，必须走不重复加锁的内部版本，否则自死锁。
+    exec_unlocked("PRAGMA journal_mode=WAL;");
+    exec_unlocked("PRAGMA foreign_keys=ON;");
+    exec_unlocked("PRAGMA synchronous=NORMAL;");
     return Result<void>::ok();
 }
 
 void SqliteDb::close() {
     std::lock_guard<std::mutex> lk(mtx_);
+    close_unlocked();
+}
+
+void SqliteDb::close_unlocked() {
     if (db_ && db_->handle) {
         sqlite3_close_v2(db_->handle);
         db_->handle = nullptr;
@@ -57,6 +62,10 @@ void SqliteDb::close() {
 
 Result<void> SqliteDb::exec(const std::string& sql) {
     std::lock_guard<std::mutex> lk(mtx_);
+    return exec_unlocked(sql);
+}
+
+Result<void> SqliteDb::exec_unlocked(const std::string& sql) {
     if (!db_ || !db_->handle) {
         return Result<void>(Error::Code::InvalidArgument, "database not open");
     }

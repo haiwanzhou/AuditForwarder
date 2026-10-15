@@ -12,7 +12,7 @@ log:
   max_backups: 5
 
 chain:
-  batch_size: 10
+  batch_size: 256
   sign_batches: false
   auto_persist: true
   hmac_key: ""                      # 必须与服务端 manager 验签密钥一致（双方为空则跳过验签）

@@ -67,6 +67,8 @@ private:
     };
 
     void worker_loop();
+    // 审计摘要独立发送线程：避免 http_request 阻塞拖垮 worker_loop 的心跳周期
+    void audit_loop();
     void send_heartbeat();
     // high_only=true 时只发送高优先级队列（提权操作紧急通道，失败不降级）
     void send_audit_summaries(bool high_only = false);
@@ -92,8 +94,10 @@ private:
     std::atomic<bool> running_ { false };
     std::atomic<bool> stopping_ { false };
     std::thread worker_;
+    std::thread audit_worker_;                 // 审计摘要发送线程
     std::mutex mtx_;
     std::condition_variable cv_;
+    std::condition_variable audit_cv_;         // 高优先级摘要入队时唤醒 audit_worker_
     std::vector<chain::EventBatch> audit_queue_;       // 普通优先级
     std::vector<chain::EventBatch> hi_audit_queue_;    // 高优先级（提权操作），先于 audit_queue_ 发送
     std::vector<std::string> pending_results_;

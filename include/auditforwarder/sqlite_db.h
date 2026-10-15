@@ -40,6 +40,11 @@ private:
     std::unique_ptr<Impl> db_;
     std::string last_error_;
     std::mutex mtx_;
+
+    // 内部版本：假定 mtx_ 已被调用方持有。open() 在持锁期间调用它们，
+    // 避免对非递归 std::mutex 重复加锁造成自死锁。
+    Result<void> exec_unlocked(const std::string& sql);
+    void close_unlocked();
 };
 
 // 主机数据库管理器：为每个客户端主机维护一个独立的 SQLite 数据库。

@@ -260,6 +260,10 @@ void HttpsTransport::worker_loop() {
             std::this_thread::sleep_for(std::chrono::seconds(sleep_s));
             backoff = std::min(backoff * 2, cfg_.max_backoff_sec);
         }
+        // 节流：批次发送间隔最小 200ms，防止服务端过载
+        if (!high) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
         // batch 模式下普通发送仍受 interval 约束；高优先级不等间隔
         if (!high && cfg_.mode == "batch") {
             std::unique_lock<std::mutex> lk(mtx_);
