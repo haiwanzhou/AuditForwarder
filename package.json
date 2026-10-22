@@ -2,7 +2,7 @@
   "name": "auditforwarder",
   "version": "1.0.0",
   "private": true,
-  "description": "AuditForwarder enterprise security audit forwarding system",
+  "description": "AuditForwarder: multi-operator behavior audit and cross-operator collusion detection for managed systems (agent collectors + centralized risk scoring, correlation rules, operator graph and evidence reports)",
   "scripts": {
     "configure": "cmake -S . -B build -DBUILD_TESTING=ON",
     "build": "cmake --build build --config Release",
