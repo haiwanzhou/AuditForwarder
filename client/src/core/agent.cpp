@@ -159,6 +159,64 @@ Result<void> Agent::init(const AgentConfig& cfg) {
                 }
             }
             cfg_.privilege_detect_enabled = c.get_bool("privilege_detect.enabled", cfg_.privilege_detect_enabled);
+            // 采集器降噪过滤：collectors.filter.*（未配置项沿用内置默认值）
+            {
+                auto read_strs = [](const ConfigValue& v) {
+                    std::vector<std::string> out;
+                    for (const auto& e : v.as_list()) {
+                        auto s = e.as_string();
+                        if (!s.empty()) out.push_back(s);
+                    }
+                    return out;
+                };
+                auto read_ints = [](const ConfigValue& v) {
+                    std::vector<long long> out;
+                    for (const auto& e : v.as_list()) out.push_back(e.as_int());
+                    return out;
+                };
+                const auto& f = c.root().at("collectors").at("filter");
+                auto& fc = cfg_.collector_filter;
+
+                auto paths = read_strs(f.at("file").at("paths"));
+                if (!paths.empty()) fc.file.paths = paths;
+                auto inc = read_strs(f.at("file").at("include"));
+                if (!inc.empty()) fc.file.include = inc;
+                auto exc = read_strs(f.at("file").at("exclude"));
+                if (!exc.empty()) fc.file.exclude = exc;
+                auto coalesce = f.at("file").at("coalesce_ms").as_int(-1);
+                if (coalesce >= 0) fc.file.coalesce_ms = static_cast<u64>(coalesce);
+
+                auto pexc = read_strs(f.at("process").at("exclude_images"));
+                if (!pexc.empty()) fc.process.exclude_images = pexc;
+                fc.process.emit_exit = f.at("process").at("emit_exit").as_bool(fc.process.emit_exit);
+
+                fc.network.include_loopback = f.at("network").at("include_loopback").as_bool(fc.network.include_loopback);
+                fc.network.only_established = f.at("network").at("only_established").as_bool(fc.network.only_established);
+                fc.network.emit_only_new = f.at("network").at("emit_only_new").as_bool(fc.network.emit_only_new);
+                auto poll_ms = f.at("network").at("poll_ms").as_int(-1);
+                if (poll_ms > 0) fc.network.poll_ms = static_cast<int>(poll_ms);
+                auto ports = read_ints(f.at("network").at("exclude_remote_ports"));
+                if (!ports.empty()) {
+                    fc.network.exclude_remote_ports.clear();
+                    for (auto p : ports) {
+                        if (p > 0 && p <= 65535) fc.network.exclude_remote_ports.push_back(static_cast<u16>(p));
+                    }
+                }
+
+                auto eids = read_ints(f.at("etw").at("event_ids"));
+                if (!eids.empty()) {
+                    fc.etw.event_ids.clear();
+                    for (auto id : eids) fc.etw.event_ids.push_back(static_cast<int>(id));
+                }
+                auto lts = read_ints(f.at("etw").at("logon_types"));
+                if (!lts.empty()) {
+                    fc.etw.logon_types.clear();
+                    for (auto t : lts) fc.etw.logon_types.push_back(static_cast<int>(t));
+                }
+                fc.etw.skip_machine_accounts = f.at("etw").at("skip_machine_accounts").as_bool(fc.etw.skip_machine_accounts);
+                fc.etw.skip_system = f.at("etw").at("skip_system").as_bool(fc.etw.skip_system);
+                fc.etw.extract_command_line = f.at("etw").at("extract_command_line").as_bool(fc.etw.extract_command_line);
+            }
             cfg_.test_injection_enabled = c.get_bool("test_injection.enabled", cfg_.test_injection_enabled);
             cfg_.test_injection_interval_ms = static_cast<int>(
                 c.get_int("test_injection.interval_ms", cfg_.test_injection_interval_ms));
@@ -670,6 +728,15 @@ bool Agent::set_collector_enabled(const std::string& name, bool enabled) {
     }
     if (!found) AF_LOG_WARN("collector: 服务端要求开关的采集器不存在: " << name);
     return found;
+}
+
+// 某采集器是否正在运行（供采集器之间避免重复上报同一事件。
+// 例：command_win 与 process_win 都会看到进程启动，二者只保留一个）。
+bool Agent::collector_running(const std::string& name) const {
+    for (const auto& c : collectors_) {
+        if (c->name() == name) return c->is_running();
+    }
+    return false;
 }
 
 // 汇总全部采集器运行状态，供心跳上报与 collect_status 指令返回。

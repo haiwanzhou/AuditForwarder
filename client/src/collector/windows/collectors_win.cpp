@@ -2,18 +2,23 @@
 
 #include "auditforwarder/agent.h"
 #include "auditforwarder/collector_base.h"
+#include "auditforwarder/collector_filter.h"
 #include "auditforwarder/event.h"
 #include "auditforwarder/fs.h"
 #include "auditforwarder/log_meta.h"
 #include "auditforwarder/logger.h"
 #include "auditforwarder/process.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <map>
 #include <set>
 #include <sstream>
 #include <thread>
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -25,6 +30,7 @@
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <iphlpapi.h>
+#include <iprtrmib.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wevtapi.lib")
@@ -32,6 +38,7 @@
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace af::collector {
 
@@ -179,9 +186,19 @@ class WindowsFileCollector : public Collector {
 public:
     Result<void> start(Agent& agent) override {
         agent_ = &agent;
-        paths_ = {"C:\\Windows\\System32", "C:\\Program Files", "C:\\Users", "C:\\ProgramData"};
-        filter_.include({});
-        filter_.exclude({"*.tmp", "*.log", "*.dll"});
+        // 降噪：监控目录、排除模式、重复写合并窗口全部来自 collectors.filter.file。
+        const auto& fc = agent.collector_filter().file;
+        paths_ = fc.paths;
+        filter_.include(fc.include);
+        auto excludes = fc.exclude;
+        // 采集端自身数据目录必须排除，否则采集日志会写入被监控目录形成自采集回环。
+        if (!agent.data_dir().empty()) {
+            auto dir = agent.data_dir();
+            for (auto& ch : dir) if (ch == '/') ch = '\\';
+            excludes.push_back(dir + "\\*");
+        }
+        filter_.exclude(excludes);
+        coalescer_ = FileEventCoalescer(fc.coalesce_ms);
         src_ = make_file_watch_source();
         auto r = src_->open(paths_);
         if (r.is_err()) return r;
@@ -198,6 +215,8 @@ private:
         while (running_) {
             src_->poll([this](const std::string& p, const std::string& op, u64 ts) {
                 if (!filter_.allows(p)) return true;
+                // 编辑器/浏览器会连续多次写同一文件，窗口内的重复动作只保留首条。
+                if (!coalescer_.accept(p, op, ts)) return true;
                 AuditEvent ev;
                 ev.category = EventCategory::File;
                 ev.action   = op_to_action(op);
@@ -223,6 +242,7 @@ private:
     Agent* agent_ { nullptr };
     std::vector<std::string> paths_;
     PathFilter filter_;
+    FileEventCoalescer coalescer_;
     std::unique_ptr<FileWatchSource> src_;
     std::thread thr_;
     bool running_ { false };
@@ -245,19 +265,25 @@ public:
     EventCategory category() const override { return EventCategory::Process; }
     bool         is_running() const override { return running_; }
 private:
-    using PidSet = std::set<u32>;
-    static PidSet snapshot() {
-        PidSet out;
+    // pid -> 父进程 pid（同时保留进程名，进程已退出时仍能过滤）
+    struct ProcInfo { u32 ppid { 0 }; std::string image; };
+    using PidMap = std::map<u32, ProcInfo>;
+    static PidMap snapshot() {
+        PidMap out;
         HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap == INVALID_HANDLE_VALUE) return out;
         PROCESSENTRY32 pe{sizeof(pe)};
         if (::Process32First(snap, &pe)) {
-            do { out.insert(pe.th32ProcessID); } while (::Process32Next(snap, &pe));
+            do {
+                out[pe.th32ProcessID] = ProcInfo{ pe.th32ParentProcessID, pe.szExeFile };
+            } while (::Process32Next(snap, &pe));
         }
         ::CloseHandle(snap);
         return out;
     }
-    void emit(u32 pid, EventAction act) {
+    void emit(u32 pid, u32 ppid, EventAction act, const std::string& image_hint) {
+        const auto& pc = agent_ ? agent_->collector_filter().process : default_collector_filter().process;
+        if (!process_image_allowed(pc, image_hint)) return;   // 系统管道进程降噪
         auto info = proc::get_process(pid);
         AuditEvent ev;
         ev.category = EventCategory::Process;
@@ -266,8 +292,13 @@ private:
         if (info.is_ok()) {
             ev.actor.name = info.value().name;
             ev.actor.path = info.value().exe;
+        } else if (!image_hint.empty()) {
+            ev.actor.name = image_hint;
         }
-        ev.message = std::string(to_string(act)) + " pid=" + std::to_string(pid);
+        if (!process_image_allowed(pc, ev.actor.name)) return;
+        if (ppid > 0) ev.attrs[logmeta::attr::kParentPid] = std::to_string(ppid);
+        ev.message = std::string(to_string(act)) + " pid=" + std::to_string(pid)
+                   + (ev.actor.name.empty() ? "" : " image=" + ev.actor.name);
         logmeta::tag_collector(ev, logmeta::collector::kProcessWin);
         // 仅对「新启动」进程做提权令牌检测（退出事件无意义），Agent 内带 TTL 缓存
         if (agent_ && act == EventAction::Spawn) {
@@ -279,16 +310,27 @@ private:
     void loop() {
         while (running_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const auto& pc = agent_ ? agent_->collector_filter().process : default_collector_filter().process;
             auto cur = snapshot();
-            for (auto p : cur) if (last_snapshot_.find(p) == last_snapshot_.end()) emit(p, EventAction::Spawn);
-            for (auto p : last_snapshot_) if (cur.find(p) == cur.end()) emit(p, EventAction::Exit);
+            for (const auto& kv : cur) {
+                if (last_snapshot_.find(kv.first) == last_snapshot_.end()) {
+                    emit(kv.first, kv.second.ppid, EventAction::Spawn, kv.second.image);
+                }
+            }
+            if (pc.emit_exit) {
+                for (const auto& kv : last_snapshot_) {
+                    if (cur.find(kv.first) == cur.end()) {
+                        emit(kv.first, kv.second.ppid, EventAction::Exit, kv.second.image);
+                    }
+                }
+            }
             last_snapshot_ = cur;
         }
     }
     Agent* agent_ { nullptr };
     std::thread thr_;
     bool running_ { false };
-    PidSet last_snapshot_;
+    PidMap last_snapshot_;
 };
 
 // =========================================================================
@@ -314,33 +356,67 @@ private:
         return buf;
     }
     void loop() {
+        // 借鉴 Zeek conn.log：一条连接只记录一次（首次出现或状态变化），
+        // 不再每轮把整张 TCP 表重复上报。
+        constexpr int kStateEstablished = 5;
         while (running_) {
+            const auto& nf = agent_ ? agent_->collector_filter().network
+                                    : default_collector_filter().network;
             DWORD sz = 0;
-            ::GetTcpTable2(nullptr, &sz, FALSE);
+            ::GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
             std::vector<char> buf(sz);
-            auto* tab = reinterpret_cast<MIB_TCPTABLE2*>(buf.data());
-            if (::GetTcpTable2(tab, &sz, FALSE) == NO_ERROR) {
+            auto* tab = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+            std::vector<std::string> alive;
+            if (sz > 0 &&
+                ::GetExtendedTcpTable(tab, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+                alive.reserve(tab->dwNumEntries);
                 for (DWORD i = 0; i < tab->dwNumEntries; ++i) {
-                    auto& r = tab->table[i];
+                    const auto& r = tab->table[i];
+                    const std::string local_ip  = fmt_ip(r.dwLocalAddr);
+                    const std::string remote_ip = fmt_ip(r.dwRemoteAddr);
+                    // dwLocalPort/dwRemotePort 低 16 位是网络字节序，需 ntohs 还原
+                    const auto local_port  = ::ntohs(static_cast<u16>(r.dwLocalPort));
+                    const auto remote_port = ::ntohs(static_cast<u16>(r.dwRemotePort));
+                    const int  state = static_cast<int>(r.dwState);
+                    const bool established = (state == kStateEstablished);
+                    const std::string key = local_ip + ":" + std::to_string(local_port) + "->" +
+                                            remote_ip + ":" + std::to_string(remote_port);
+                    alive.push_back(key);
+
+                    const bool changed = differ_.accept(key, state);
+                    if (nf.emit_only_new && !changed) continue;
+                    if (!network_event_allowed(nf, local_ip, remote_ip, remote_port, established)) continue;
+
                     AuditEvent ev;
                     ev.category = EventCategory::Network;
                     ev.action   = EventAction::Connect;
-                    ev.target.address  = fmt_ip(r.dwRemoteAddr);
-                    ev.target.port     = static_cast<u16>(r.dwRemotePort);
+                    ev.target.address  = remote_ip;
+                    ev.target.port     = remote_port;
                     ev.target.protocol = "tcp";
-                    ev.message = "tcp " + fmt_ip(r.dwLocalAddr) + ":" + std::to_string(r.dwLocalPort)
-                                 + " -> " + fmt_ip(r.dwRemoteAddr) + ":" + std::to_string(r.dwRemotePort)
-                                 + " state=" + std::to_string(r.dwState);
+                    ev.actor.pid = static_cast<u32>(r.dwOwningPid);
+                    if (ev.actor.pid > 0) {
+                        auto info = proc::get_process(ev.actor.pid);
+                        if (info.is_ok()) ev.actor.name = info.value().name;
+                    }
+                    ev.attrs["net.local_addr"] = local_ip;
+                    ev.attrs["net.local_port"] = std::to_string(local_port);
+                    ev.attrs["net.tcp_state"]  = std::to_string(state);
+                    ev.message = "tcp " + local_ip + ":" + std::to_string(local_port)
+                                 + " -> " + remote_ip + ":" + std::to_string(remote_port)
+                                 + " state=" + std::to_string(state)
+                                 + (ev.actor.name.empty() ? "" : " proc=" + ev.actor.name);
                     logmeta::tag_collector(ev, logmeta::collector::kNetworkWin);
                     if (agent_) agent_->submit(ev);
                 }
             }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (nf.emit_only_new) differ_.sweep(alive);
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(500, nf.poll_ms)));
         }
     }
     Agent* agent_ { nullptr };
     std::thread thr_;
     bool running_ { false };
+    NetworkSnapshotDiffer differ_;
 };
 
 // =========================================================================
@@ -360,7 +436,18 @@ public:
     bool         is_running() const override { return running_; }
 private:
     void loop() {
+        // 与 process_win 重叠：两者都能看到进程启动。process_win 已运行时，
+        // command_win 不再重复上报，避免同一启动事件落两条。
+        bool overlap_logged = false;
         while (running_) {
+            if (agent_ && agent_->collector_running(logmeta::collector::kProcessWin)) {
+                if (!overlap_logged) {
+                    AF_LOG_INFO("command_win: process_win 已启用，跳过重复的进程启动上报");
+                    overlap_logged = true;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
             HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snap != INVALID_HANDLE_VALUE) {
                 PROCESSENTRY32 pe{sizeof(pe)};
@@ -370,6 +457,12 @@ private:
                         if (seen_pids_.count(pe.th32ProcessID)) continue;
                         seen_pids_.insert(pe.th32ProcessID);
                         std::string name = pe.szExeFile;
+                        // 与 process_win 共用降噪排除表
+                        if (!process_image_allowed(agent_ ? agent_->collector_filter().process
+                                                          : default_collector_filter().process,
+                                                   name)) {
+                            continue;
+                        }
                         // 启发式：任何看起来像 shell / 脚本宿主的进程
                         if (name.find("cmd.exe") != std::string::npos ||
                             name.find("powershell") != std::string::npos ||
@@ -472,10 +565,20 @@ class WindowsEtwCollector : public Collector {
 public:
     Result<void> start(Agent& agent) override {
         agent_ = &agent;
-        // 订阅安全事件日志
-        EVT_HANDLE sub = ::EvtSubscribe(nullptr, nullptr, L"Security",
-            L"*[System/EventID=4624 or System/EventID=4625 or System/EventID=4688 or System/EventID=4689]",
-            nullptr, nullptr, nullptr, EvtSubscribeToFutureEvents);
+        // 事件 ID 白名单可配置：只订阅有检测价值的安全事件，减少无关日志。
+        const auto& ec = agent.collector_filter().etw;
+        std::wstring query = L"*[";
+        for (std::size_t i = 0; i < ec.event_ids.size(); ++i) {
+            if (i) query += L" or ";
+            query += L"System/EventID=" + std::to_wstring(ec.event_ids[i]);
+        }
+        query += L"]";
+        if (ec.event_ids.empty()) {
+            AF_LOG_INFO("etw: 事件白名单为空，ETW 采集器不启动");
+            return Result<void>::ok();
+        }
+        EVT_HANDLE sub = ::EvtSubscribe(nullptr, nullptr, L"Security", query.c_str(),
+                                        nullptr, nullptr, nullptr, EvtSubscribeToFutureEvents);
         if (!sub) {
             AF_LOG_WARN("etw: failed to subscribe to Security log");
             return Result<void>(Error::Code::PermissionDenied, "EvtSubscribe");
@@ -527,29 +630,68 @@ private:
                         ev.category = EventCategory::Auth;    ev.action = EventAction::AuthFail;
                     }
 
+                    const auto& ec = agent_ ? agent_->collector_filter().etw
+                                            : default_collector_filter().etw;
+
+                    // 登录事件：只保留有操作员语义的登录类型，跳过机器账户与 SYSTEM。
+                    std::string user, domain, logon_id, sid, new_process;
+                    int logon_type = 0;
+                    if (eid == "4624" || eid == "4625") {
+                        user   = etw_data_field(xml, "TargetUserName");
+                        domain = etw_data_field(xml, "TargetDomainName");
+                        logon_id = etw_data_field(xml, "TargetLogonId");
+                        sid    = etw_data_field(xml, "TargetUserSid");
+                        logon_type = std::atoi(etw_data_field(xml, "LogonType").c_str());
+                        if (user.empty()) user = etw_data_field(xml, "SubjectUserName");
+                        if (sid.empty())  sid  = etw_data_field(xml, "SubjectUserSid");
+                        if (logon_id.empty()) logon_id = etw_data_field(xml, "SubjectLogonId");
+                        if (!etw_event_allowed(ec, std::atoi(eid.c_str()), logon_type, user, sid)) {
+                            ::EvtClose(events[i]);
+                            continue;
+                        }
+                    } else {
+                        // 4688/4689：进程维度的字段
+                        user   = etw_data_field(xml, "SubjectUserName");
+                        domain = etw_data_field(xml, "SubjectDomainName");
+                        logon_id = etw_data_field(xml, "SubjectLogonId");
+                        sid    = etw_data_field(xml, "SubjectUserSid");
+                        new_process = etw_data_field(xml, "NewProcessName");
+                        // 系统管道进程降噪（与 process_win 共用同一份排除表）
+                        if (!new_process.empty() &&
+                            !process_image_allowed(agent_ ? agent_->collector_filter().process
+                                                          : default_collector_filter().process,
+                                                   new_process)) {
+                            ::EvtClose(events[i]);
+                            continue;
+                        }
+                    }
+
                     // 来源标识：etw_win 采集器 + etw_security 唯一来源
                     logmeta::tag_collector(ev, logmeta::collector::kEtwWin);
                     ev.attrs[logmeta::attr::kSource   ] = logmeta::source::kEtwSecurity;
                     ev.attrs[logmeta::attr::kEventId  ] = eid;
 
                     // 结构化详情（宽松保留：不做 256 字符截断）
-                    auto subject_user   = etw_data_field(xml, "SubjectUserName");
-                    auto subject_domain = etw_data_field(xml, "SubjectDomainName");
-                    auto logon_id       = etw_data_field(xml, "SubjectLogonId");
-                    auto new_process    = etw_data_field(xml, "NewProcessName");
-                    if (!subject_user.empty())   { ev.attrs[logmeta::attr::kSubjectUser]   = subject_user;   ev.actor.user = subject_user; }
-                    if (!subject_domain.empty())   ev.attrs[logmeta::attr::kSubjectDomain] = subject_domain;
-                    if (!logon_id.empty())         ev.attrs[logmeta::attr::kLogonId]       = logon_id;
+                    if (!user.empty())     { ev.attrs[logmeta::attr::kSubjectUser]   = user;   ev.actor.user = user; }
+                    if (!domain.empty())     ev.attrs[logmeta::attr::kSubjectDomain] = domain;
+                    if (!logon_id.empty())   ev.attrs[logmeta::attr::kLogonId]       = logon_id;
                     if (!new_process.empty()) {
                         ev.attrs[logmeta::attr::kProcessName] = new_process;
                         ev.actor.path = new_process;
                         auto slash = new_process.find_last_of("\\/");
                         ev.actor.name = slash == std::string::npos ? new_process : new_process.substr(slash + 1);
                     }
+                    if (eid == "4688" && ec.extract_command_line) {
+                        auto cmd = etw_data_field(xml, "CommandLine");
+                        if (!cmd.empty()) ev.attrs[logmeta::attr::kCommandLine] = cmd;
+                        auto ppid = etw_data_field(xml, "ProcessId");
+                        auto parent = etw_data_field(xml, "ParentProcessId");
+                        if (!parent.empty()) ev.attrs[logmeta::attr::kParentPid] = parent;
+                        (void)ppid;
+                    }
                     // 高权限标注：SubjectUserSid=S-1-5-18 为 SYSTEM；
                     // 4688 的 TokenElevationType=%%1842（Full）为 UAC 完全提权。
                     if (agent_ && agent_->privilege_detect_enabled()) {
-                        const auto sid = etw_data_field(xml, "SubjectUserSid");
                         const auto elev_type = etw_data_field(xml, "TokenElevationType");
                         if (sid == "S-1-5-18") {
                             logmeta::mark_privileged(ev, logmeta::priv::kSystem);
@@ -560,8 +702,9 @@ private:
                     ev.attrs[logmeta::attr::kRawXml] = xml.substr(0, kEtwRawMaxLen);
 
                     ev.message = "etw event_id=" + eid
-                               + (subject_user.empty() ? "" : " user=" + subject_domain + "\\" + subject_user)
-                               + (new_process.empty()  ? "" : " proc=" + ev.actor.name);
+                               + (user.empty() ? "" : " user=" + domain + "\\" + user)
+                               + (new_process.empty() ? "" : " proc=" + ev.actor.name)
+                               + (logon_type ? " logon_type=" + std::to_string(logon_type) : "");
                     if (agent_) agent_->submit(ev);
                 }
                 ::EvtClose(events[i]);

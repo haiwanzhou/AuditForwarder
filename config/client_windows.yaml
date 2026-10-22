@@ -64,6 +64,29 @@ manager:
 
 collectors:
   enabled: true
+  # 采集器降噪（借鉴 Sysmon 的 Include/Exclude、osquery 的事件白名单、Zeek conn.log 单次记录）：
+  # 所有列表留空则使用内置默认值，默认值已按「无检测价值的背景噪声」调优。
+  filter:
+    file:
+      paths: []              # 空 = 用户桌面/文档/下载（Windows）或 主目录+/etc（Linux）
+      include: []            # 允许模式（空 = 全部允许）
+      exclude: []            # 排除模式（空 = 内置：构建目录/缓存/临时/日志/采集端 data 目录）
+      coalesce_ms: 2000      # 同一文件同一动作的重复写合并窗口，0 = 不去重
+    process:
+      exclude_images: []     # 空 = 内置系统管道进程表（conhost/svchost/searchhost...）
+      emit_exit: false       # 是否上报进程退出（分析合谋一般不需要）
+    network:
+      include_loopback: false   # 排除 127.0.0.1 / ::1 等本机回环连接
+      only_established: true    # 只保留 ESTABLISHED，排除 LISTEN/TIME_WAIT 等状态
+      emit_only_new: true       # 同一连接只上报一次（新连接或状态变化）
+      poll_ms: 2000             # 连接表轮询间隔
+      exclude_remote_ports: []  # 例：[137, 138, 139] 排除 NetBIOS 噪声
+    etw:
+      event_ids: [4624, 4625, 4688]   # 登录成功/失败/进程创建
+      logon_types: [2, 10, 11]        # 保留交互式/远程交互/缓存交互，排除服务账户(3/5)
+      skip_machine_accounts: true     # 跳过以 $ 结尾的机器账户
+      skip_system: true               # 跳过 SYSTEM
+      extract_command_line: true      # 4688 提取命令行（需开启进程创建审计策略）
   # M5-3 本地 HTTP 代理行为采集：把浏览器代理指向 127.0.0.1:<listen_port>
   # 即可采集 operator 对受管系统的 HTTP 操作（method/host/uri/status_code/body_len）
   http_proxy:

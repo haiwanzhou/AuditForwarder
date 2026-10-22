@@ -1,6 +1,7 @@
 #pragma once
 // AuditForwarder - 核心代理，整合采集器、处理器、链和传输模块。
 
+#include "auditforwarder/collector_filter.h"
 #include "auditforwarder/event.h"
 #include "auditforwarder/chain.h"
 #include "auditforwarder/security_adapter.h"
@@ -104,6 +105,10 @@ struct AgentConfig {
     std::vector<std::string> http_proxy_target_hosts;  // 空 = 采集全部主机
     bool        http_proxy_capture_body { false };     // 请求体验存（下游 PIIMasker 脱敏）
 
+    // 采集器降噪过滤（collectors.filter.*，见 collector_filter.h）：
+    // 路径/进程/网络/ETW 四类过滤，未配置时使用内置默认值（已按噪声经验调优）。
+    collector::CollectorFilterConfig collector_filter = collector::default_collector_filter();
+
     // 高权限操作检测（Windows 提权令牌/SYSTEM，Linux uid=0）
     bool privilege_detect_enabled { true };
 
@@ -150,6 +155,15 @@ public:
 
     // 高权限检测开关（采集器据此决定是否标注提权事件）
     bool        privilege_detect_enabled() const { return cfg_.privilege_detect_enabled; }
+
+    // 数据目录（采集器用于排除自身落盘文件，避免自采集死循环）
+    const std::string& data_dir() const { return cfg_.data_dir; }
+
+    // 采集器降噪配置（采集器启动/运行中读取）
+    const collector::CollectorFilterConfig& collector_filter() const { return cfg_.collector_filter; }
+
+    // 某采集器当前是否在运行（用于避免多个采集器重复上报同一事件）
+    bool collector_running(const std::string& name) const;
 
     // 查询某 PID 的高权限级别（带 5 秒 TTL 缓存，避免重复令牌查询）。
     // 返回 "" 表示检测关闭；否则为 logmeta::priv 中的 system/elevated/root/none。

@@ -106,6 +106,7 @@ set(AF_CORE_SOURCES
 
     # 采集器基类
     client/src/collector/collector_base.cpp
+    client/src/collector/collector_filter.cpp
 
     # 安全产品适配器（Syslog/DB审计/堡垒机）
     client/src/collector/adapters/syslog_adapter.cpp

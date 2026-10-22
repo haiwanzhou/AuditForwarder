@@ -13,6 +13,7 @@
 #endif
 
 #include "auditforwarder/agent.h"
+#include "auditforwarder/collector_filter.h"
 #include "auditforwarder/asset_profile.h"
 #include "auditforwarder/build_config.h"
 #include "auditforwarder/chain.h"
@@ -2447,6 +2448,128 @@ void test_collusion_graph_integration() {
     }
 }
 
+void test_collector_filter() {
+    using namespace af::collector;
+    AF_LOG_INFO("=== test_collector_filter ===");
+
+    // ---- 通配符：大小写不敏感，支持 * ? ----
+    {
+        AF_EXPECT(filter_glob_match("*.tmp", "C:\\Users\\a\\x.TMP"));
+        AF_EXPECT(filter_glob_match("*\\build\\*", "C:\\proj\\build\\out.exe"));
+        AF_EXPECT(filter_glob_match("*", "anything"));
+        AF_EXPECT(!filter_glob_match("*.tmp", "C:\\Users\\a\\x.txt"));
+    }
+
+    // ---- 文件过滤：exclude 优先、include 为空全放行 ----
+    {
+        FileFilterConfig c;
+        c.exclude = { "*.tmp", "*\\node_modules\\*", "*\\AppData\\Local\\Temp\\*" };
+        AF_EXPECT(file_event_allowed(c, "C:\\Users\\me\\Documents\\report.docx"));
+        AF_EXPECT(!file_event_allowed(c, "C:\\Users\\me\\AppData\\Local\\Temp\\a.dat"));
+        AF_EXPECT(!file_event_allowed(c, "D:\\proj\\node_modules\\x\\index.js"));
+        c.include = { "*\\Documents\\*" };
+        AF_EXPECT(file_event_allowed(c, "C:\\Users\\me\\Documents\\secret.docx"));
+        AF_EXPECT(!file_event_allowed(c, "C:\\Users\\me\\Desktop\\secret.docx"));
+        // exclude 优先于 include
+        c.exclude.push_back("*\\Documents\\secret*");
+        AF_EXPECT(!file_event_allowed(c, "C:\\Users\\me\\Documents\\secret.docx"));
+    }
+
+    // ---- 内置默认排除：构建目录/缓存/日志/采集端数据目录 ----
+    {
+        FileFilterConfig c;
+        c.exclude = default_file_excludes();
+        AF_EXPECT(file_event_allowed(c, "C:\\Users\\me\\Documents\\合同.docx"));
+        AF_EXPECT(!file_event_allowed(c, "C:\\proj\\build\\CMakeCache.txt"));
+        AF_EXPECT(!file_event_allowed(c, "C:\\Users\\me\\AppData\\Local\\Temp\\x.tmp"));
+        AF_EXPECT(!file_event_allowed(c, "C:\\data\\client\\queue.jsonl"));
+        AF_EXPECT(!file_event_allowed(c, "C:\\Users\\me\\.vscode\\x.log"));
+    }
+
+    // ---- 进程过滤：系统管道进程排除，命令宿主保留 ----
+    {
+        ProcessFilterConfig c;
+        c.exclude_images = default_process_excludes();
+        AF_EXPECT(!process_image_allowed(c, "C:\\Windows\\System32\\svchost.exe"));
+        AF_EXPECT(!process_image_allowed(c, "SVCHOST.EXE"));
+        AF_EXPECT(process_image_allowed(c, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        AF_EXPECT(process_image_allowed(c, "C:\\Windows\\System32\\cmd.exe"));
+        AF_EXPECT(process_image_allowed(c, ""));   // 取不到镜像名时放行，避免漏采
+    }
+
+    // ---- 回环判定 ----
+    {
+        AF_EXPECT(is_loopback_ip("127.0.0.1"));
+        AF_EXPECT(is_loopback_ip("127.8.9.10"));
+        AF_EXPECT(is_loopback_ip("::1"));
+        AF_EXPECT(is_loopback_ip("0.0.0.0"));
+        AF_EXPECT(!is_loopback_ip("192.168.1.10"));
+        AF_EXPECT(!is_loopback_ip("10.0.0.5"));
+    }
+
+    // ---- 网络过滤：回环/未建立/端口排除 ----
+    {
+        NetworkFilterConfig c;   // only_established=true, include_loopback=false
+        AF_EXPECT(network_event_allowed(c, "192.168.1.10", "93.184.216.34", 443, true));
+        AF_EXPECT(!network_event_allowed(c, "127.0.0.1", "127.0.0.1", 5000, true));
+        AF_EXPECT(!network_event_allowed(c, "192.168.1.10", "10.0.0.1", 445, false));
+        AF_EXPECT(!network_event_allowed(c, "192.168.1.10", "10.0.0.1", 0, true));
+        c.exclude_remote_ports = { 137, 139 };
+        AF_EXPECT(!network_event_allowed(c, "192.168.1.10", "10.0.0.1", 139, true));
+        c.include_loopback = true;
+        AF_EXPECT(network_event_allowed(c, "127.0.0.1", "127.0.0.1", 5000, true));
+    }
+
+    // ---- ETW 过滤：登录类型/机器账户/SYSTEM，仅作用于 4624 ----
+    {
+        EtwFilterConfig c;   // logon_types={2,10,11}
+        AF_EXPECT(etw_event_allowed(c, 4624, 2, "alice", "S-1-5-21-1"));
+        AF_EXPECT(etw_event_allowed(c, 4624, 10, "alice", "S-1-5-21-1"));
+        AF_EXPECT(!etw_event_allowed(c, 4624, 3, "alice", "S-1-5-21-1"));   // 网络登录噪声
+        AF_EXPECT(!etw_event_allowed(c, 4624, 5, "alice", "S-1-5-21-1"));   // 服务登录噪声
+        AF_EXPECT(!etw_event_allowed(c, 4624, 2, "PC-01$", "S-1-5-21-1"));  // 机器账户
+        AF_EXPECT(!etw_event_allowed(c, 4624, 2, "SYSTEM", "S-1-5-18"));    // SYSTEM
+        // 失败登录不做账户/类型过滤，全部保留用于暴力破解检测
+        AF_EXPECT(etw_event_allowed(c, 4625, 3, "PC-01$", "S-1-5-18"));
+        AF_EXPECT(etw_event_allowed(c, 4688, 0, "PC-01$", "S-1-5-18"));
+    }
+
+    // ---- 文件重复写合并 ----
+    {
+        FileEventCoalescer co(2000);   // 2 秒
+        af::u64 t = 1000000ull;
+        AF_EXPECT(co.accept("C:\\a.txt", "write", t));
+        AF_EXPECT(!co.accept("C:\\a.txt", "write", t + 500000ull));   // 窗口内重复
+        AF_EXPECT(co.accept("C:\\a.txt", "delete", t + 500000ull));   // 不同动作
+        AF_EXPECT(co.accept("C:\\b.txt", "write", t + 500000ull));    // 不同文件
+        AF_EXPECT(co.accept("C:\\a.txt", "write", t + 2500000ull));   // 超出窗口
+        co.clear();
+        AF_EXPECT_EQ(co.size(), std::size_t(0));
+    }
+
+    // ---- 网络快照差分：同连接只报一次，状态变化才再报 ----
+    {
+        NetworkSnapshotDiffer d;
+        AF_EXPECT(d.accept("1.1.1.1:100->2.2.2.2:443", 3));   // 首次（SYN_SENT）
+        AF_EXPECT(!d.accept("1.1.1.1:100->2.2.2.2:443", 3));  // 无变化
+        AF_EXPECT(d.accept("1.1.1.1:100->2.2.2.2:443", 5));   // 变为 ESTABLISHED
+        AF_EXPECT(!d.accept("1.1.1.1:100->2.2.2.2:443", 5));
+        AF_EXPECT_EQ(d.size(), std::size_t(1));
+        d.sweep({});
+        AF_EXPECT_EQ(d.size(), std::size_t(0));
+    }
+
+    // ---- 默认配置组装：路径非空、含内置排除 ----
+    {
+        auto cfg = default_collector_filter();
+        AF_EXPECT(!cfg.file.paths.empty());
+        AF_EXPECT(!cfg.file.exclude.empty());
+        AF_EXPECT(!cfg.process.exclude_images.empty());
+        AF_EXPECT(cfg.network.emit_only_new);
+        AF_EXPECT(!cfg.etw.event_ids.empty());
+    }
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // 无缓冲输出：崩溃时也能看到最后一条断言
     std::printf("AuditForwarder unit tests\n");
@@ -2489,6 +2612,7 @@ int main() {
     test_behavior_graph_similarity();
     test_operator_graph();
     test_collusion_graph_integration();
+    test_collector_filter();
 
     std::printf("\nResults: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

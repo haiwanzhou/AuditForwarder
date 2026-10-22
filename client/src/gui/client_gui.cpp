@@ -219,6 +219,28 @@ manager:
 
 collectors:
   enabled: true
+  # 采集器降噪（留空列表 = 内置默认值）
+  filter:
+    file:
+      paths: []
+      include: []
+      exclude: []
+      coalesce_ms: 2000
+    process:
+      exclude_images: []
+      emit_exit: false
+    network:
+      include_loopback: false
+      only_established: true
+      emit_only_new: true
+      poll_ms: 2000
+      exclude_remote_ports: []
+    etw:
+      event_ids: [4624, 4625, 4688]
+      logon_types: [2, 10, 11]
+      skip_machine_accounts: true
+      skip_system: true
+      extract_command_line: true
   # M5-3 本地 HTTP 代理行为采集（默认关闭）
   http_proxy:
     enabled: false
