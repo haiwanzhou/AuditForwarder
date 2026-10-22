@@ -219,6 +219,13 @@ manager:
 
 collectors:
   enabled: true
+  # M5-3 本地 HTTP 代理行为采集（默认关闭）
+  http_proxy:
+    enabled: false
+    bind: 127.0.0.1
+    listen_port: 8888
+    capture_body: false
+    target_hosts: []
 
 privilege_detect:
   enabled: true

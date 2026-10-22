@@ -10,7 +10,7 @@
 
 | 阶段 | 主题 | 状态 |
 |------|------|------|
-| M5 | 采集与身份贯通 | 主体已完成，剩余采集器与 Web 页面 |
+| M5 | 采集与身份贯通 | 已完成 |
 | M6 | 事件模型与危害规则 | 未开始 |
 | M7 | 合谋图谱增强 | 未开始 |
 | M8 | 模拟与演示 | 未开始 |
@@ -41,23 +41,27 @@
 
 **验证**：349 个单元测试全部通过；端到端冒烟（心跳登记 → 日志登记 → 手工注册 → SQLite operator 列写入）全部通过。
 
-### 5.2 待做
+### 5.2 已完成（M5-3 HTTP 采集器）
 
-#### 任务 1：本地 HTTP 代理行为采集 collector（M5-3，高优先级）
+#### 任务 1：本地 HTTP 代理行为采集 collector（M5-3）
 
-- **目标**：采集本机操作员对目标系统（如图书管理系统）的 HTTP 操作行为
-- **字段**：对齐 Zeek http.log 子集——`method` / `host` / `uri` / `user_agent` / `status_code` / `request_body_len`
-- **要点**：
-  - 新建 `http_proxy` collector（Windows/Linux 各一份或共用骨架），注册到 `logmeta::collector` 常量表
-  - 事件 category 映射 network，action 按 method 推断（GET=read / POST=create / DELETE=delete 等）
-  - 生产模式要求对请求体 PII 脱敏（复用 PIIMasker）
-  - 配置段 `collectors.http_proxy: { enabled, listen_port, target_hosts }`，未配置时默认关闭
-- **验收**：浏览器访问示例系统后，服务端操作日志能按 operator_id 检索到带 method/uri 的记录
+- 实现：`client/src/collector/http_proxy_collector.{h,cpp}`（跨平台，WinSock/POSIX 共用骨架）
+- 形态：本机回环正向代理；普通 HTTP 解析绝对 URL/Host 并转发，CONNECT 走盲隧道（HTTPS 仅记录 host:port）
+- 字段：`http.method/host/uri/user_agent/status_code/request_body_len`，`capture_body` 开启时额外留 `http.request_body`（下游 PIIMasker 脱敏）
+- 映射：category=network；GET/HEAD=read、POST=create、PUT/PATCH=write、DELETE=delete、CONNECT=connect
+- 配置：`collectors.http_proxy: { enabled, bind, listen_port, capture_body, target_hosts }`，未配置默认关闭；`target_hosts` 支持通配子域
+- 验证：新增单测（映射/URL/主机过滤 + 真实转发端到端）；本机冒烟确认事件带 `operator_id` 且 `password=***REDACTED***`
 
-#### 任务 2：Web 控制台操作员台账页面（M5-4，中优先级）
+### 5.3 已完成（M5-4 Web 台账页）
 
-- **目标**：控制台展示 `GET /operators` 数据（操作员 ID、显示名、绑定主机、在线状态、最近上报）
-- **要点**：仿现有「主机管理」页风格；显示绑定变更告警入口
+#### 任务 2：Web 控制台操作员台账页面（M5-4）
+
+- 侧边栏新增「操作员台账」视图（`server/web/index.html#operators`），风格对齐主机管理页
+- 展示 `GET /operators`：操作员 ID / 显示名 / 绑定主机 / 在线状态 / 最近上报 / 注册时间 / 客户端 IP
+- 支持按关键词与状态（在线 / 离线 / 禁用）筛选，顶部统计总数、在线、已绑定、未绑定
+- 手工登记/更新表单对接 `POST /operators/register`，支持绑定主机下拉（取 `/hosts`）与启用/禁用
+- 绑定变更告警：浏览器本地保存绑定基线，检测换机/换绑并列出 `旧主机 → 新主机`，可联跳到对应主机数据库
+- 验证：本机启动服务端，浏览器实测登录 → 建两台主机 → 登记操作员 → 换绑 → 刷新，告警正确出现；JS 语法检查通过
 
 ---
 

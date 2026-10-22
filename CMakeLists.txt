@@ -110,6 +110,9 @@ set(AF_CORE_SOURCES
     client/src/collector/adapters/db_audit_adapter.cpp
     client/src/collector/adapters/bastion_adapter.cpp
 
+    # 本机 HTTP 代理行为采集器（M5-3，跨平台）
+    client/src/collector/http_proxy_collector.cpp
+
     # ML 异常检测模块（M3 措施3：ONNX 推理 + 行为特征工程）
     shared/src/ml/onnx_inference.cpp
     shared/src/ml/feature_extractor.cpp

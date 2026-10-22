@@ -17,6 +17,8 @@
 #include "collector/adapters/syslog_adapter.h"
 #include "collector/adapters/db_audit_adapter.h"
 #include "collector/adapters/bastion_adapter.h"
+// M5-3 本地 HTTP 代理行为采集器
+#include "collector/http_proxy_collector.h"
 
 #ifdef AF_PLATFORM_LINUX
 #  include "auditforwarder/platform_linux.h"
@@ -141,6 +143,21 @@ Result<void> Agent::init(const AgentConfig& cfg) {
             cfg_.self_protect_enabled = c.get_bool("self_protect.enabled", cfg_.self_protect_enabled);
             cfg_.rules_path = c.get_string("detector.rules_path", cfg_.rules_path);
             cfg_.collectors_enabled = c.get_bool("collectors.enabled", cfg_.collectors_enabled);
+            // M5-3 本地 HTTP 代理采集配置（未配置时默认关闭）
+            cfg_.http_proxy_enabled = c.get_bool("collectors.http_proxy.enabled", cfg_.http_proxy_enabled);
+            cfg_.http_proxy_bind = c.get_string("collectors.http_proxy.bind", cfg_.http_proxy_bind);
+            cfg_.http_proxy_listen_port = static_cast<int>(
+                c.get_int("collectors.http_proxy.listen_port", cfg_.http_proxy_listen_port));
+            cfg_.http_proxy_capture_body = c.get_bool("collectors.http_proxy.capture_body",
+                                                      cfg_.http_proxy_capture_body);
+            const auto& target_hosts = c.root().at("collectors").at("http_proxy").at("target_hosts").as_list();
+            if (!target_hosts.empty()) {
+                cfg_.http_proxy_target_hosts.clear();
+                for (const auto& h : target_hosts) {
+                    auto value = h.as_string();
+                    if (!value.empty()) cfg_.http_proxy_target_hosts.push_back(value);
+                }
+            }
             cfg_.privilege_detect_enabled = c.get_bool("privilege_detect.enabled", cfg_.privilege_detect_enabled);
             cfg_.test_injection_enabled = c.get_bool("test_injection.enabled", cfg_.test_injection_enabled);
             cfg_.test_injection_interval_ms = static_cast<int>(
@@ -362,9 +379,22 @@ Result<void> Agent::start() {
 #elif defined(AF_PLATFORM_WINDOWS)
         create_windows_collectors(collectors_, *this);
 #endif
+        // M5-3：HTTP 代理行为采集器为跨平台实现，统一在此注册；
+        // 是否默认启动由配置 collectors.http_proxy.enabled 决定（未配置=关闭）。
+        HttpProxyConfig hp_cfg;
+        hp_cfg.enabled      = cfg_.http_proxy_enabled;
+        hp_cfg.bind_addr    = cfg_.http_proxy_bind;
+        hp_cfg.listen_port  = static_cast<u16>(cfg_.http_proxy_listen_port);
+        hp_cfg.target_hosts = cfg_.http_proxy_target_hosts;
+        hp_cfg.capture_body = cfg_.http_proxy_capture_body;
+        collectors_.push_back(std::make_unique<HttpProxyCollector>(std::move(hp_cfg)));
     }
     if (cfg_.collectors_enabled) {
         for (auto& c : collectors_) {
+            if (c->name() == logmeta::collector::kHttpProxy && !cfg_.http_proxy_enabled) {
+                AF_LOG_INFO("collector: http_proxy 未配置启用（默认关闭，可由服务端远程开启）");
+                continue;
+            }
             auto r = c->start(*this);
             if (r.is_err()) AF_LOG_ERROR("collector: " << c->name() << " start failed: " << r.error().message());
             else AF_LOG_INFO("collector: " << c->name() << " started");

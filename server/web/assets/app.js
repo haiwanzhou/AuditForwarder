@@ -148,6 +148,25 @@ const els = {
   dbPrevPage: $("dbPrevPage"),
   dbNextPage: $("dbNextPage"),
   dbPageInfo: $("dbPageInfo"),
+  // 操作员台账（M5-4）
+  refreshOperatorsBtn: $("refreshOperatorsBtn"),
+  operatorCount: $("operatorCount"),
+  operatorSearch: $("operatorSearch"),
+  operatorStatusFilter: $("operatorStatusFilter"),
+  operatorTotal: $("operatorTotal"),
+  operatorOnline: $("operatorOnline"),
+  operatorBound: $("operatorBound"),
+  operatorUnbound: $("operatorUnbound"),
+  operatorId: $("operatorId"),
+  operatorName: $("operatorName"),
+  operatorHostSelect: $("operatorHostSelect"),
+  operatorStatus: $("operatorStatus"),
+  saveOperatorBtn: $("saveOperatorBtn"),
+  resetOperatorFormBtn: $("resetOperatorFormBtn"),
+  operatorStoragePath: $("operatorStoragePath"),
+  operatorList: $("operatorList"),
+  operatorBindingSummary: $("operatorBindingSummary"),
+  operatorBindingList: $("operatorBindingList"),
 };
 
 const validationRules = {
@@ -164,6 +183,8 @@ const validationRules = {
   tokenInput: { label: "管理 Token", max: 256, optional: true },
   loginUsername: { label: "账号", required: true, min: 2, max: 64, pattern: /^[A-Za-z0-9_.@-]+$/, message: "账号只能包含字母、数字、点、下划线、短横线或 @。" },
   loginPassword: { label: "密码", required: true, min: 6, max: 128 },
+  operatorId: { label: "操作员 ID", required: true, pattern: /^[A-Za-z0-9_-]{2,64}$/, message: "操作员 ID 只能包含字母、数字、短横线和下划线，长度为 2 到 64 个字符。" },
+  operatorName: { label: "显示名", max: 80, optional: true },
 };
 
 function authHeaders(extra = {}) {
@@ -1088,6 +1109,7 @@ const loadedViews = new Set();
 const VIEW_LOADERS = {
   "#database": () => loadDbHosts(),
   "#connection-requests": () => loadConnectionRequests({ silent: true }),
+  "#operators": () => loadOperators({ silent: true }),
 };
 
 function knownViews() {
@@ -1230,6 +1252,227 @@ async function openHostDatabase(hostId) {
     await queryDatabase(0);
   } catch (err) {
     showNotice(err.message, "error");
+  }
+}
+
+// ---------------- 操作员台账（M5-4） ----------------
+
+// 操作员绑定基线：用于识别换机/换绑（首次登记只建基线，不算变更）
+const operatorState = {
+  list: [],
+  bindings: parseJson(localStorage.getItem("af.operatorBindings") || "{}", {}),
+  changes: parseJson(localStorage.getItem("af.operatorBindingChanges") || "[]", []),
+};
+
+function filteredOperators(operators) {
+  const keyword = String(els.operatorSearch?.value || "").trim().toLowerCase();
+  const status = els.operatorStatusFilter?.value || "all";
+  return operators.filter((op) => {
+    if (status === "online" && !op.online) return false;
+    if (status === "offline" && (op.online || op.status === "disabled")) return false;
+    if (status === "disabled" && op.status !== "disabled") return false;
+    if (!keyword) return true;
+    const haystack = [
+      op.operator_id,
+      op.display_name,
+      op.bound_host_id,
+      op.last_client_ip,
+    ].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(keyword);
+  });
+}
+
+function renderOperatorHostOptions(selected = "") {
+  if (!els.operatorHostSelect) return;
+  const options = ['<option value="">不指定 / 不修改</option>'];
+  let found = !selected;
+  state.hosts.forEach((host) => {
+    const value = host.id || "";
+    if (!value) return;
+    if (value === selected) found = true;
+    options.push(`<option value="${escapeHtml(value)}">${escapeHtml(host.name || value)}（${escapeHtml(value)}）</option>`);
+  });
+  if (!found) {
+    options.push(`<option value="${escapeHtml(selected)}">${escapeHtml(selected)}（当前绑定）</option>`);
+  }
+  els.operatorHostSelect.innerHTML = options.join("");
+  els.operatorHostSelect.value = selected;
+}
+
+function trackOperatorBindings(operators) {
+  const detectedAt = new Date().toISOString();
+  const next = {};
+  operators.forEach((op) => {
+    const id = op.operator_id;
+    if (!id) return;
+    const host = op.bound_host_id || "";
+    next[id] = host;
+    if (!Object.prototype.hasOwnProperty.call(operatorState.bindings, id)) return;
+    const prev = operatorState.bindings[id] || "";
+    if (prev === host) return;
+    operatorState.changes.unshift({
+      operator_id: id,
+      display_name: op.display_name || "",
+      from: prev,
+      to: host,
+      detected_at: detectedAt,
+    });
+  });
+  operatorState.changes = operatorState.changes.slice(0, 50);
+  operatorState.bindings = next;
+  localStorage.setItem("af.operatorBindings", JSON.stringify(next));
+  localStorage.setItem("af.operatorBindingChanges", JSON.stringify(operatorState.changes));
+  renderOperatorBindings();
+}
+
+function renderOperatorBindings() {
+  if (!els.operatorBindingList) return;
+  const changes = operatorState.changes || [];
+  els.operatorBindingSummary.textContent = changes.length
+    ? `最近 ${changes.length} 次变更`
+    : "未检测到绑定变更";
+  if (changes.length === 0) {
+    els.operatorBindingList.innerHTML = `
+      <div class="empty-state">
+        <strong>暂无绑定变更</strong>
+        <p>操作员首次登记会建立基线；后续换机或换绑将在此显示，便于审计复核。</p>
+      </div>
+    `;
+    return;
+  }
+  els.operatorBindingList.innerHTML = changes.map((item) => `
+    <article class="security-item warning">
+      <div class="security-item-head">
+        <strong>${escapeHtml(item.operator_id)} 绑定变更：${escapeHtml(item.from || "未绑定")} → ${escapeHtml(item.to || "未绑定")}</strong>
+        <span class="severity warning">warning</span>
+      </div>
+      <p>${escapeHtml(formatLocalTime(item.detected_at))} · ${escapeHtml(item.display_name || "--")}</p>
+    </article>
+  `).join("");
+}
+
+function renderOperators(data) {
+  const operators = Array.isArray(data.operators) ? data.operators : operatorState.list;
+  operatorState.list = operators;
+  const visible = filteredOperators(operators);
+  const onlineCount = operators.filter((op) => op.online).length;
+  const boundCount = operators.filter((op) => op.bound_host_id).length;
+  els.operatorCount.textContent = visible.length === operators.length
+    ? `${operators.length} 名操作员，${onlineCount} 名在线`
+    : `显示 ${visible.length} / ${operators.length} 名操作员，${onlineCount} 名在线`;
+  if (els.operatorTotal) els.operatorTotal.textContent = String(operators.length);
+  if (els.operatorOnline) els.operatorOnline.textContent = String(onlineCount);
+  if (els.operatorBound) els.operatorBound.textContent = String(boundCount);
+  if (els.operatorUnbound) els.operatorUnbound.textContent = String(operators.length - boundCount);
+  if (data.storage_path && els.operatorStoragePath) {
+    els.operatorStoragePath.textContent = `台账文件：${data.storage_path}`;
+  }
+
+  if (operators.length === 0) {
+    els.operatorList.innerHTML = `<tr><td colspan="8" class="empty-cell">暂无操作员记录。客户端心跳/操作日志上报 operator_id 后会自动登记，也可在上方手工登记。</td></tr>`;
+    return;
+  }
+  if (visible.length === 0) {
+    els.operatorList.innerHTML = `<tr><td colspan="8" class="empty-cell">没有匹配的操作员，请调整搜索关键字或状态筛选。</td></tr>`;
+    return;
+  }
+  els.operatorList.innerHTML = visible.map((op) => {
+    const disabled = op.status === "disabled";
+    const statusPill = disabled
+      ? `<span class="pill unknown">已禁用</span>`
+      : `<span class="pill ${op.online ? "ok" : "error"}">${op.online ? "在线" : "离线"}</span>`;
+    const dbAction = op.bound_host_id
+      ? `<button class="button ghost small" type="button" data-operator-action="db" data-host-id="${escapeHtml(op.bound_host_id)}">查看主机库</button>`
+      : "";
+    return `
+      <tr>
+        <td><code>${escapeHtml(op.operator_id || "--")}</code></td>
+        <td>${escapeHtml(op.display_name || "--")}</td>
+        <td>${escapeHtml(op.bound_host_id || "未绑定")}</td>
+        <td>${statusPill}</td>
+        <td>${escapeHtml(op.last_seen ? formatLocalTime(op.last_seen) : "--")}</td>
+        <td>${escapeHtml(op.registered_at ? formatLocalTime(op.registered_at) : "--")}</td>
+        <td>${escapeHtml(op.last_client_ip || "--")}</td>
+        <td class="section-actions">
+          <button class="button ghost small" type="button" data-operator-action="edit" data-operator-id="${escapeHtml(op.operator_id || "")}">编辑</button>
+          ${dbAction}
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+async function loadOperators(options = {}) {
+  if (!els.operatorList) return;
+  try {
+    const text = await request("/operators", { timeoutMs: 8000 });
+    const data = parseJson(text, { operators: [] });
+    trackOperatorBindings(data.operators || []);
+    renderOperators(data);
+    renderOperatorHostOptions(els.operatorHostSelect?.value || "");
+  } catch (err) {
+    els.operatorCount.textContent = "加载失败";
+    els.operatorList.innerHTML = `<tr><td colspan="8" class="empty-cell">加载操作员台账失败：${escapeHtml(err.message)}</td></tr>`;
+    if (!options.silent) showNotice(err.message, "error");
+  }
+}
+
+function fillOperatorForm(op) {
+  if (!op) return;
+  els.operatorId.value = op.operator_id || "";
+  els.operatorName.value = op.display_name || "";
+  els.operatorStatus.value = op.status === "disabled" ? "disabled" : "active";
+  renderOperatorHostOptions(op.bound_host_id || "");
+  els.operatorId.focus();
+}
+
+function resetOperatorForm() {
+  els.operatorId.value = "";
+  els.operatorName.value = "";
+  els.operatorStatus.value = "active";
+  renderOperatorHostOptions("");
+}
+
+async function saveOperator() {
+  const errors = validateFields(["operatorId", "operatorName"]);
+  if (errors.length) {
+    showNotice(errors[0], "error");
+    return;
+  }
+  const operatorId = els.operatorId.value.trim();
+  const hostId = els.operatorHostSelect?.value || "";
+  const payload = {
+    operator_id: operatorId,
+    display_name: els.operatorName.value.trim(),
+    host_id: hostId,
+    status: els.operatorStatus.value,
+  };
+  const done = setLoading(els.saveOperatorBtn, "保存中...");
+  try {
+    await request("/operators/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    showNotice(`操作员 ${operatorId} 已保存。`);
+    recordOperation({
+      object: `操作员 ${operatorId}`,
+      type: "operator_register",
+      details: `绑定主机：${hostId || "未指定"}；状态：${payload.status}`,
+      status: "success",
+    });
+    await loadOperators({ silent: true });
+  } catch (err) {
+    showNotice(err.message, "error");
+    recordOperation({
+      object: `操作员 ${operatorId}`,
+      type: "operator_register",
+      details: `绑定主机：${hostId || "未指定"}；状态：${payload.status}`,
+      status: "failure",
+      error: err,
+    });
+  } finally {
+    done();
   }
 }
 
@@ -1768,6 +2011,7 @@ async function refreshAll(options = {}) {
     await loadCollusion({ silent });
     await loadLogPolicy({ silent });
     await loadConnectionRequests({ silent });
+    await loadOperators({ silent: true });
     if (!silent) showNotice("数据已刷新。");
     if (record) {
       recordOperation({
@@ -1810,6 +2054,7 @@ async function refreshLiveData() {
     await loadCollusion({ silent: true });
     await loadLogPolicy({ silent: true, skipProfiles: true });
     await loadConnectionRequests({ silent: true });
+    await loadOperators({ silent: true });
   } catch (err) {
     els.statusPill.textContent = "连接异常";
     els.statusPill.className = "pill error";
@@ -2064,6 +2309,23 @@ function init() {
   els.clearRecordsBtn.addEventListener("click", clearOperationRecords);
   // 连接请求与数据库管理
   if (els.refreshConnectionsBtn) els.refreshConnectionsBtn.addEventListener("click", () => loadConnectionRequests());
+  // 操作员台账（M5-4）
+  if (els.refreshOperatorsBtn) els.refreshOperatorsBtn.addEventListener("click", () => loadOperators());
+  if (els.saveOperatorBtn) els.saveOperatorBtn.addEventListener("click", saveOperator);
+  if (els.resetOperatorFormBtn) els.resetOperatorFormBtn.addEventListener("click", resetOperatorForm);
+  const updateOperatorFilter = debounce(() => renderOperators({ operators: operatorState.list }));
+  if (els.operatorSearch) els.operatorSearch.addEventListener("input", updateOperatorFilter);
+  if (els.operatorStatusFilter) els.operatorStatusFilter.addEventListener("change", updateOperatorFilter);
+  if (els.operatorList) els.operatorList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-operator-action]");
+    if (!button) return;
+    const action = button.getAttribute("data-operator-action");
+    if (action === "edit") {
+      const operatorId = button.getAttribute("data-operator-id");
+      fillOperatorForm(operatorState.list.find((item) => item.operator_id === operatorId));
+    }
+    if (action === "db") openHostDatabase(button.getAttribute("data-host-id"));
+  });
   if (els.refreshDbHostsBtn) els.refreshDbHostsBtn.addEventListener("click", () => loadDbHosts());
   if (els.dbQueryBtn) els.dbQueryBtn.addEventListener("click", () => queryDatabase(0));
   if (els.dbExportBtn) els.dbExportBtn.addEventListener("click", exportDatabase);

@@ -33,6 +33,9 @@ constexpr const char* kSyslog    = "syslog";     // Syslog UDP 适配器
 constexpr const char* kDbAudit   = "db_audit";   // 数据库审计适配器
 constexpr const char* kBastion   = "bastion";    // 堡垒机适配器
 
+// 本机 HTTP 代理行为采集器（M5-3）
+constexpr const char* kHttpProxy = "http_proxy";
+
 constexpr const char* kLegacy  = "legacy";   // 服务端迁移的旧记录
 constexpr const char* kUnknown = "unknown";  // 无采集器字段时的兜底
 }  // namespace collector
@@ -75,6 +78,14 @@ constexpr const char* kRawXml        = "raw_xml";
 constexpr const char* kInjected      = "injected";     // 测试注入标记
 constexpr const char* kOperatorId    = "operator_id";   // 操作员 ID（M5 身份贯通）
 constexpr const char* kOperatorName  = "operator_name"; // 操作员显示名
+// —— HTTP 代理行为字段（对齐 Zeek http.log 子集，M5-3）——
+constexpr const char* kHttpMethod      = "http.method";
+constexpr const char* kHttpHost        = "http.host";
+constexpr const char* kHttpUri         = "http.uri";
+constexpr const char* kHttpUserAgent   = "http.user_agent";
+constexpr const char* kHttpStatusCode  = "http.status_code";
+constexpr const char* kHttpReqBodyLen  = "http.request_body_len";
+constexpr const char* kHttpReqBody     = "http.request_body"; // 仅 capture_body 开启时留存(经 PIIMasker 脱敏)
 }  // namespace attr
 
 // 当前 Unix 毫秒时间戳。

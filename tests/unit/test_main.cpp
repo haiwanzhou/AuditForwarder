@@ -31,6 +31,7 @@
 #include "collector/adapters/syslog_adapter.h"
 #include "collector/adapters/db_audit_adapter.h"
 #include "collector/adapters/bastion_adapter.h"
+#include "collector/http_proxy_collector.h"
 #include "auditforwarder/processor.h"
 
 // M3: ML 异常检测
@@ -48,6 +49,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -1047,6 +1049,170 @@ void test_bastion_adapter() {
 
 }  // namespace
 
+// M5-3 本地 HTTP 代理行为采集器：映射/URL/主机过滤 + 真实转发端到端
+void test_http_proxy_collector() {
+    using namespace af;
+    namespace hp = af::http_proxy_detail;
+
+    // method → action
+    AF_EXPECT(hp::action_for_method("GET") == EventAction::Read);
+    AF_EXPECT(hp::action_for_method("head") == EventAction::Read);
+    AF_EXPECT(hp::action_for_method("POST") == EventAction::Create);
+    AF_EXPECT(hp::action_for_method("PUT") == EventAction::Write);
+    AF_EXPECT(hp::action_for_method("PATCH") == EventAction::Write);
+    AF_EXPECT(hp::action_for_method("DELETE") == EventAction::Delete);
+    AF_EXPECT(hp::action_for_method("CONNECT") == EventAction::Connect);
+    AF_EXPECT(hp::action_for_method("BREW") == EventAction::Unknown);
+
+    // 绝对 URL 解析
+    {
+        auto u = hp::parse_absolute_url("http://books.local:8080/api/books?id=7");
+        AF_EXPECT(u.ok);
+        AF_EXPECT_EQ(u.host, std::string("books.local"));
+        AF_EXPECT_EQ(u.port, u16(8080));
+        AF_EXPECT_EQ(u.path, std::string("/api/books?id=7"));
+    }
+    {
+        auto u = hp::parse_absolute_url("http://books.local");
+        AF_EXPECT(u.ok);
+        AF_EXPECT_EQ(u.port, u16(80));
+        AF_EXPECT_EQ(u.path, std::string("/"));
+    }
+    AF_EXPECT(!hp::parse_absolute_url("https://books.local/api").ok);
+
+    // target_hosts 过滤（大小写不敏感 + 子域后缀）
+    {
+        std::vector<std::string> targets{"books.local", "*.example.com", "http://api.other.com:8080"};
+        AF_EXPECT(hp::host_allowed(targets, "books.local"));
+        AF_EXPECT(hp::host_allowed(targets, "BOOKS.local"));
+        AF_EXPECT(hp::host_allowed(targets, "catalog.example.com"));
+        AF_EXPECT(hp::host_allowed(targets, "api.other.com"));
+        AF_EXPECT(!hp::host_allowed(targets, "evil.com"));
+        AF_EXPECT(!hp::host_allowed(targets, "example.com.evil.com"));
+        AF_EXPECT(hp::host_allowed({}, "anything.local"));
+    }
+
+    // ---- 端到端：本机 mini HTTP 服务 ← 代理转发 ----
+#ifdef AF_PLATFORM_WINDOWS
+    using TSock = SOCKET;
+    const TSock kBadSock = INVALID_SOCKET;
+    WSADATA wsa;
+    ::WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    using TSock = int;
+    const TSock kBadSock = -1;
+#endif
+    auto close_ts = [](TSock s) {
+#ifdef AF_PLATFORM_WINDOWS
+        ::closesocket(s);
+#else
+        ::close(s);
+#endif
+    };
+
+    TSock srv = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in saddr{};
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    saddr.sin_port = 0;
+    bool srv_ok = srv != kBadSock &&
+                  ::bind(srv, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr)) == 0 &&
+                  ::listen(srv, 4) == 0;
+    AF_EXPECT(srv_ok);
+    u16 srv_port = 0;
+    if (srv_ok) {
+        sockaddr_in actual{};
+#ifdef AF_PLATFORM_WINDOWS
+        int alen = static_cast<int>(sizeof(actual));
+#else
+        socklen_t alen = sizeof(actual);
+#endif
+        ::getsockname(srv, reinterpret_cast<sockaddr*>(&actual), &alen);
+        srv_port = ntohs(actual.sin_port);
+    }
+
+    std::thread server([&] {
+        if (!srv_ok) return;
+        TSock c = ::accept(srv, nullptr, nullptr);
+        if (c == kBadSock) return;
+        std::string req;
+        char buf[2048];
+        while (req.find("\r\n\r\n") == std::string::npos) {
+            int n = ::recv(c, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            req.append(buf, static_cast<std::size_t>(n));
+        }
+        const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+        close_ts(c);
+    });
+
+    HttpProxyConfig cfg;
+    cfg.enabled = true;
+    cfg.listen_port = 0;  // 系统分配
+    std::mutex mtx;
+    AuditEvent captured;
+    std::atomic<int> events{0};
+    HttpProxyEngine engine(cfg, [&](const AuditEvent& ev) {
+        std::lock_guard<std::mutex> lk(mtx);
+        captured = ev;
+        events.fetch_add(1);
+    });
+    auto start_r = engine.start();
+    AF_EXPECT(start_r.is_ok());
+    u16 proxy_port = engine.bound_port();
+    AF_EXPECT(proxy_port != 0);
+
+    if (proxy_port != 0 && srv_ok) {
+        TSock cli = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in paddr{};
+        paddr.sin_family = AF_INET;
+        paddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        paddr.sin_port = htons(proxy_port);
+        bool connected = cli != kBadSock &&
+                         ::connect(cli, reinterpret_cast<sockaddr*>(&paddr), sizeof(paddr)) == 0;
+        AF_EXPECT(connected);
+        if (connected) {
+            std::string request =
+                "GET http://127.0.0.1:" + std::to_string(srv_port) +
+                "/books?id=7 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(srv_port) +
+                "\r\nUser-Agent: af-unit-test\r\n\r\n";
+            ::send(cli, request.data(), static_cast<int>(request.size()), 0);
+            std::string resp;
+            char buf[2048];
+            int n = ::recv(cli, buf, sizeof(buf), 0);
+            if (n > 0) resp.append(buf, static_cast<std::size_t>(n));
+            AF_EXPECT(resp.find("200 OK") != std::string::npos);
+            close_ts(cli);
+        }
+    }
+
+    for (int i = 0; i < 60 && events.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    AF_EXPECT_EQ(events.load(), 1);
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        AF_EXPECT(captured.category == EventCategory::Network);
+        AF_EXPECT(captured.action == EventAction::Read);
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kCollector], std::string("http_proxy"));
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kHttpMethod], std::string("GET"));
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kHttpHost], std::string("127.0.0.1"));
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kHttpUri], std::string("/books?id=7"));
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kHttpUserAgent], std::string("af-unit-test"));
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kHttpStatusCode], std::string("200"));
+        AF_EXPECT_EQ(captured.attrs[logmeta::attr::kHttpReqBodyLen], std::string("0"));
+    }
+
+    engine.stop();
+    server.join();
+    if (srv != kBadSock) close_ts(srv);
+#ifdef AF_PLATFORM_WINDOWS
+    ::WSACleanup();
+#endif
+    std::printf("[info]  http_proxy collector: 转发与字段采集验证通过\n");
+}
+
 void test_normalizer() {
     using namespace af;
     processor::Normalizer nz;
@@ -1589,6 +1755,7 @@ int main() {
     test_syslog_adapter();
     test_db_audit_adapter();
     test_bastion_adapter();
+    test_http_proxy_collector();
     test_normalizer();
     test_feature_extractor();
     test_onnx_inference();

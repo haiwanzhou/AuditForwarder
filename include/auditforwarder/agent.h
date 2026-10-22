@@ -97,6 +97,13 @@ struct AgentConfig {
     // 是否启动本机采集器。服务端单独运行时应关闭采集器，只保留管理接口。
     bool collectors_enabled { true };
 
+    // 本地 HTTP 代理行为采集（M5-3）：未配置时默认关闭，可被服务端远程开启。
+    bool        http_proxy_enabled { false };
+    std::string http_proxy_bind { "127.0.0.1" };
+    int         http_proxy_listen_port { 8888 };
+    std::vector<std::string> http_proxy_target_hosts;  // 空 = 采集全部主机
+    bool        http_proxy_capture_body { false };     // 请求体验存（下游 PIIMasker 脱敏）
+
     // 高权限操作检测（Windows 提权令牌/SYSTEM，Linux uid=0）
     bool privilege_detect_enabled { true };
 

@@ -50,6 +50,7 @@
         <a href="#config" class="nav-link">配置中心</a>
         <a href="#batches" class="nav-link">证据批次</a>
         <a href="#hosts" class="nav-link">主机管理</a>
+        <a href="#operators" class="nav-link">操作员台账</a>
         <a href="#enroll" class="nav-link">主机接入</a>
         <a href="#collector-control" class="nav-link">采集器控制</a>
         <a href="#security-monitor" class="nav-link">日志与告警</a>
@@ -291,6 +292,115 @@
             <span class="muted" id="hostHistoryTitle">请选择主机查看集中历史数据</span>
           </div>
           <pre id="hostHistoryOutput" class="text-output">可查看资源指标、审计摘要和命令执行结果。</pre>
+        </div>
+      </section>
+
+      <section id="operators" class="section">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Operators</p>
+            <h3>操作员台账与主机绑定</h3>
+          </div>
+          <div class="section-actions">
+            <button id="refreshOperatorsBtn" class="button ghost small">刷新台账</button>
+            <span class="muted" id="operatorCount">--</span>
+          </div>
+        </div>
+        <div class="panel filter-panel">
+          <label class="field">
+            <span>操作员搜索</span>
+            <input id="operatorSearch" type="search" placeholder="按操作员 ID、显示名、绑定主机或 IP 搜索">
+          </label>
+          <label class="field">
+            <span>在线状态</span>
+            <select id="operatorStatusFilter">
+              <option value="all">全部操作员</option>
+              <option value="online">仅在线</option>
+              <option value="offline">仅离线</option>
+              <option value="disabled">仅禁用</option>
+            </select>
+          </label>
+        </div>
+        <div class="panel analytics-panel">
+          <article class="analytics-card">
+            <span>操作员总数</span>
+            <strong id="operatorTotal">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>在线操作员</span>
+            <strong id="operatorOnline">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>已绑定主机</span>
+            <strong id="operatorBound">--</strong>
+          </article>
+          <article class="analytics-card">
+            <span>未绑定主机</span>
+            <strong id="operatorUnbound">--</strong>
+          </article>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <strong>手工登记 / 更新操作员</strong>
+            <span class="muted">客户端心跳与操作日志携带 operator_id 时也会自动登记</span>
+          </div>
+          <div class="host-form">
+            <label class="field">
+              <span>操作员 ID</span>
+              <input id="operatorId" placeholder="例如：op_zhang">
+            </label>
+            <label class="field">
+              <span>显示名</span>
+              <input id="operatorName" placeholder="例如：张三">
+            </label>
+            <label class="field">
+              <span>绑定主机</span>
+              <select id="operatorHostSelect">
+                <option value="">不绑定主机</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>状态</span>
+              <select id="operatorStatus">
+                <option value="active">active（启用）</option>
+                <option value="disabled">disabled（禁用）</option>
+              </select>
+            </label>
+            <div class="form-actions">
+              <button id="saveOperatorBtn" class="button primary small">保存操作员</button>
+              <button id="resetOperatorFormBtn" class="button ghost small">清空表单</button>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted" id="operatorTableTitle">操作员台账</span>
+            <span class="muted" id="operatorStoragePath"></span>
+          </div>
+          <div class="records-table-wrap">
+            <table class="records-table">
+              <thead>
+                <tr>
+                  <th>操作员 ID</th>
+                  <th>显示名</th>
+                  <th>绑定主机</th>
+                  <th>在线状态</th>
+                  <th>最近上报</th>
+                  <th>注册时间</th>
+                  <th>客户端 IP</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="operatorList"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <span class="muted">绑定变更告警（操作员换机 / 换绑是审计关注点）</span>
+            <span class="muted" id="operatorBindingSummary">等待检测</span>
+          </div>
+          <div id="operatorBindingList" class="security-list"></div>
         </div>
       </section>
 

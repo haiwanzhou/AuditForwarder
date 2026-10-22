@@ -64,6 +64,14 @@ manager:
 
 collectors:
   enabled: true
+  # M5-3 本地 HTTP 代理行为采集：把浏览器代理指向 127.0.0.1:<listen_port>
+  # 即可采集 operator 对受管系统的 HTTP 操作（method/host/uri/status_code/body_len）
+  http_proxy:
+    enabled: false          # 未配置时默认关闭
+    bind: 127.0.0.1         # 仅本机回环
+    listen_port: 8888
+    capture_body: false     # 开启后请求体存入 attrs（经 PIIMasker 脱敏）
+    target_hosts: []        # 空=采集全部主机；示例：["books.local", "*.example.com"]
 
 privilege_detect:
   enabled: true
