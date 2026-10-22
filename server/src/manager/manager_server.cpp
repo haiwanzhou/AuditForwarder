@@ -3557,7 +3557,7 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
 
         // 各表固定列名（与 sqlite_db.cpp 建表语句保持一致），用于前端渲染与导出
         static const std::map<std::string, std::vector<std::string>> kTableColumns = {
-            {"events", {"id","timestamp","collector","priority","operation_type","event_type","message","raw_json","checksum"}},
+            {"events", {"id","timestamp","collector","operator","priority","operation_type","event_type","message","raw_json","checksum"}},
             {"metrics", {"id","timestamp","metric_name","metric_value","raw_json"}},
             {"alerts", {"id","timestamp","severity","rule_id","message","evidence","raw_json"}},
             {"audit", {"id","timestamp","actor","action","detail","raw_json"}},
@@ -3619,7 +3619,7 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             return "{\n  \"error\": \"invalid table\"\n}";
         }
         static const std::map<std::string, std::vector<std::string>> kTableColumns = {
-            {"events", {"id","timestamp","collector","priority","operation_type","event_type","message","raw_json","checksum"}},
+            {"events", {"id","timestamp","collector","operator","priority","operation_type","event_type","message","raw_json","checksum"}},
             {"metrics", {"id","timestamp","metric_name","metric_value","raw_json"}},
             {"alerts", {"id","timestamp","severity","rule_id","message","evidence","raw_json"}},
             {"audit", {"id","timestamp","actor","action","detail","raw_json"}},

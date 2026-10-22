@@ -63,6 +63,31 @@
 - 绑定变更告警：浏览器本地保存绑定基线，检测换机/换绑并列出 `旧主机 → 新主机`，可联跳到对应主机数据库
 - 验证：本机启动服务端，浏览器实测登录 → 建两台主机 → 登记操作员 → 换绑 → 刷新，告警正确出现；JS 语法检查通过
 
+### 5.4 M5 阶段收尾验收记录（2026-10-22）
+
+**环境**：本机 Windows；服务端 `127.0.0.1:18443`（独立临时数据目录）；客户端节点 `accept-node`（操作员 `op_accept`）；受管系统用本地 mock HTTP `127.0.0.1:18080` 模拟。
+
+**用例与结果**
+
+| # | 验证项 | 结果 |
+|---|--------|------|
+| 1 | 单元测试全量回归 | 387 项全部通过 |
+| 2 | 客户端 http_proxy 监听并转发 | 监听 `127.0.0.1:18888`；经代理 `POST /books?id=7` 成功转发，上游收到 origin-form 请求，返回 200 |
+| 3 | 服务端操作日志落盘 | `operation_logs/accept-node/http_proxy.jsonl` 单条含 `operator_id` / `operator_name` / `collector=http_proxy` / `http.method=POST` / `http.host` / `http.uri=/books?id=7` / `http.status_code=200` / `http.request_body_len=31` |
+| 4 | 请求体 PII 脱敏 | `http.request_body` 中密码落盘为 `***REDACTED***` |
+| 5 | SQLite events 表写入 | `operator` 列为 `op_accept`；`GET /db/query?...&search=POST 127.0.0.1:18080` 命中目标记录 |
+| 6 | 操作员自动登记 | `GET /operators` 中 `op_accept` 绑定 `accept-node` 且在线 |
+| 7 | 控制台检索 | 「操作员台账」可见登记信息；「数据库管理」选择 accept-node/events 可按关键词命中该 HTTP 操作，列头含 `operator` |
+
+**结论**：M5 全链路（采集 → 身份贯通 → 落库 → 台账与控制台检索）验收通过。
+
+**观察项（不阻塞）**
+
+- 同一次 HTTP 操作在 events 表出现 2 条（ingest 批量通道与 operation-logs 通道各写一份），跨通道未去重。
+- 仅用 `operator_id` 作关键词检索时，结果会被主机文件采集噪音占满分页；需叠加 `collector` 或 URI 关键词缩小范围。建议 M6 为 `/db/query` 增加 `collector` 过滤参数。
+- 手工登记操作员会刷新 `last_seen`，新登记的操作员会短暂显示在线。
+- 修复：`/db/query` 与 `/db/export` 的 events 列表头此前漏了 `operator` 列，已补上，避免表头与数据列错位。
+
 ---
 
 ## M6：事件模型与危害规则
