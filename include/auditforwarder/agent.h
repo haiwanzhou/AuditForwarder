@@ -30,6 +30,11 @@ struct AgentConfig {
     std::string data_dir;
     std::string config_path;
 
+    // 操作员身份贯通（M5）：本机操作员标识与显示名，随心跳/事件/日志上报，
+    // 服务端据此登记「操作员 ↔ 主机」绑定关系（operators 台账）。
+    std::string operator_id;
+    std::string operator_name;
+
     // 日志配置
     Severity    log_level { Severity::Info };
     std::string log_file;

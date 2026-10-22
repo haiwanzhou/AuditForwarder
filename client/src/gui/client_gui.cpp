@@ -41,6 +41,7 @@
 #define IDC_RETRY_COUNT     107
 #define IDC_AUTO_CONNECT    108
 #define IDC_AGENT_ID        109
+#define IDC_OPERATOR_ID     110
 
 // 定时器 ID
 #define IDT_CONNECT_TIMER   1
@@ -65,6 +66,7 @@ struct GuiState {
     HWND connect_btn = nullptr;
     HWND retry_edit = nullptr;
     HWND agent_id_edit = nullptr;
+    HWND operator_id_edit = nullptr;   // 操作员标识（M5 身份贯通）
     std::string config_path = "config/client_windows.yaml";
     std::thread worker_thread;
 };
@@ -151,11 +153,17 @@ bool SaveConfig() {
     }
 
     // 写入 YAML 文件
+    std::string operator_utf8 = WideToUtf8(GetEditText(g_state.operator_id_edit));
     std::string yaml = R"(# AuditForwarder 客户端配置（由 GUI 自动生成）
 agent:
   id: ")" + agent_utf8 + R"("
   data_dir: data/client
-  config_path: ")" + g_state.config_path + R"("
+  config_path: ")" + g_state.config_path + R"(
+
+# 操作员身份（M5 身份贯通）：随心跳/事件上报，服务端登记到操作员台账
+operator:
+  id: ")" + operator_utf8 + R"("
+  name: ""
 
 log:
   level: info
@@ -294,6 +302,8 @@ void AgentWorker() {
     g_state.cfg.manager_enabled = false;
     g_state.cfg.remote_enabled = true;
     g_state.cfg.collectors_enabled = true;
+    // 操作员身份贯通（M5）：GUI 输入的操作员标识直接写入运行时配置
+    g_state.cfg.operator_id = WideToUtf8(GetEditText(g_state.operator_id_edit));
 
     // 解析最大重试次数
     int max_retries = 5;
@@ -383,6 +393,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                               20 + label_w + gap, y, edit_w, h, hwnd, (HMENU)IDC_AGENT_ID, nullptr, nullptr);
         y += h + gap;
 
+        // 操作员标识（M5 身份贯通：上报到服务端操作员台账）
+        CreateWindowW(L"STATIC", L"操作员标识:", WS_CHILD | WS_VISIBLE,
+                      20, y, label_w, h, hwnd, nullptr, nullptr, nullptr);
+        g_state.operator_id_edit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                                 20 + label_w + gap, y, edit_w, h, hwnd, (HMENU)IDC_OPERATOR_ID, nullptr, nullptr);
+        y += h + gap;
+
         // 重试次数
         CreateWindowW(L"STATIC", L"最大重试:", WS_CHILD | WS_VISIBLE,
                       20, y, label_w, h, hwnd, nullptr, nullptr, nullptr);
@@ -453,6 +470,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+    // 将工作目录切换到项目根目录（exe 位于 build/ 下，取其上一级），
+    // 保证 config/、data/ 等相对路径无论从何处启动都能正确解析
+    {
+        char exe_path[MAX_PATH];
+        if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+            std::string dir(exe_path);
+            size_t pos = dir.find_last_of("\\/");
+            if (pos != std::string::npos) dir = dir.substr(0, pos);  // build/
+            pos = dir.find_last_of("\\/");
+            if (pos != std::string::npos) dir = dir.substr(0, pos);  // 项目根
+            SetCurrentDirectoryA(dir.c_str());
+        }
+    }
+    // 某些启动器（脚本宿主/IDE 工具）会以 SW_HIDE 拉起子进程，主窗口必须可见
+    if (nCmdShow == SW_HIDE) nCmdShow = SW_SHOW;
     // 注册窗口类
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;

@@ -73,6 +73,8 @@ constexpr const char* kLogonId       = "logon_id";
 constexpr const char* kProcessName   = "process_name";
 constexpr const char* kRawXml        = "raw_xml";
 constexpr const char* kInjected      = "injected";     // 测试注入标记
+constexpr const char* kOperatorId    = "operator_id";   // 操作员 ID（M5 身份贯通）
+constexpr const char* kOperatorName  = "operator_name"; // 操作员显示名
 }  // namespace attr
 
 // 当前 Unix 毫秒时间戳。

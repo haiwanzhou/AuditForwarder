@@ -504,6 +504,26 @@ struct ValidationIssue {
     std::string message;
 };
 
+// 操作员台账记录（M5 身份贯通）：一个操作员绑定一台主机（单机单操作员模型），
+// 由客户端心跳/操作日志自动登记，也可通过 POST /operators/register 手工维护。
+struct OperatorRecord {
+    std::string operator_id;      // 操作员唯一标识
+    std::string display_name;     // 显示名（可空）
+    std::string bound_host_id;    // 绑定的主机 ID
+    std::string status;           // active | disabled
+    u64 registered_at { 0 };      // 注册时间（秒级 epoch）
+    u64 last_seen_epoch { 0 };    // 最近一次上报时间（秒级 epoch）
+    std::string last_client_ip;   // 最近上报来源 IP
+};
+
+bool is_valid_operator_id(const std::string& id) {
+    if (id.size() < 2 || id.size() > 64) return false;
+    for (char c : id) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_')) return false;
+    }
+    return true;
+}
+
 bool is_valid_host_id(const std::string& id) {
     if (id.empty()) return true;
     if (id.size() < 2 || id.size() > 64) return false;
@@ -1654,6 +1674,141 @@ Result<void> remove_command_from_queue(const ManagerConfig& cfg,
     return Result<void>::ok();
 }
 
+// ============================================================================
+// 操作员台账（M5 身份贯通）：存储于 <data_dir>/operators.json
+// ============================================================================
+std::string operators_path(const ManagerConfig& cfg) {
+    return fs::join(cfg.data_dir.empty() ? "data" : cfg.data_dir, "operators.json");
+}
+
+OperatorRecord operator_from_json(const std::string& json) {
+    OperatorRecord op;
+    op.operator_id = json_string_field(json, "operator_id");
+    if (op.operator_id.empty()) op.operator_id = json_string_field(json, "id");
+    op.display_name = json_string_field(json, "display_name");
+    if (op.display_name.empty()) op.display_name = json_string_field(json, "name");
+    op.bound_host_id = json_string_field(json, "bound_host_id");
+    op.status = json_string_field(json, "status");
+    if (op.status.empty()) op.status = "active";
+    op.registered_at = json_u64_field(json, "registered_at_epoch", 0);
+    if (op.registered_at == 0) op.registered_at = json_u64_field(json, "registered_at", 0);
+    op.last_seen_epoch = json_u64_field(json, "last_seen_epoch", 0);
+    op.last_client_ip = json_string_field(json, "last_client_ip");
+    return op;
+}
+
+std::string operator_to_json(const OperatorRecord& op, bool trailing_comma, u64 now, u64 timeout_sec) {
+    bool online = op.status != "disabled" && op.last_seen_epoch > 0 &&
+                  now >= op.last_seen_epoch && now - op.last_seen_epoch <= timeout_sec;
+    std::ostringstream o;
+    o << "    {\n"
+      << "      \"operator_id\": \"" << json_escape(op.operator_id) << "\",\n"
+      << "      \"display_name\": \"" << json_escape(op.display_name) << "\",\n"
+      << "      \"bound_host_id\": \"" << json_escape(op.bound_host_id) << "\",\n"
+      << "      \"status\": \"" << json_escape(op.status) << "\",\n"
+      << "      \"online\": " << (online ? "true" : "false") << ",\n"
+      << "      \"registered_at_epoch\": " << op.registered_at << ",\n"
+      << "      \"registered_at\": \"" << (op.registered_at ? iso_time(op.registered_at) : "") << "\",\n"
+      << "      \"last_seen_epoch\": " << op.last_seen_epoch << ",\n"
+      << "      \"last_seen\": \"" << (op.last_seen_epoch ? iso_time(op.last_seen_epoch) : "") << "\",\n"
+      << "      \"last_client_ip\": \"" << json_escape(op.last_client_ip) << "\"\n"
+      << "    }" << (trailing_comma ? ",\n" : "\n");
+    return o.str();
+}
+
+Result<std::vector<OperatorRecord>> load_operators(const ManagerConfig& cfg) {
+    std::vector<OperatorRecord> ops;
+    auto path = operators_path(cfg);
+    if (!fs::exists(path)) return ops;
+    auto content = read_text_file(path);
+    if (content.is_err()) return Result<std::vector<OperatorRecord>>(content.error());
+    for (const auto& obj : json_object_array_field(content.value(), "operators")) {
+        ops.push_back(operator_from_json(obj));
+    }
+    return ops;
+}
+
+Result<void> save_operators(const ManagerConfig& cfg, const std::vector<OperatorRecord>& ops) {
+    auto dir = cfg.data_dir.empty() ? "data" : cfg.data_dir;
+    auto cr = fs::create_directories(dir);
+    if (cr.is_err()) return cr;
+    std::ofstream out(operators_path(cfg), std::ios::binary | std::ios::trunc);
+    if (!out) return Result<void>(Error::Code::IoError, "无法写入操作员台账文件");
+    auto now = epoch_seconds();
+    out << "{\n"
+        << "  \"version\": 1,\n"
+        << "  \"updated_at\": \"" << iso_time(now) << "\",\n"
+        << "  \"operators\": [\n";
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        out << operator_to_json(ops[i], i + 1 < ops.size(), now, cfg.status_timeout_seconds);
+    }
+    out << "  ]\n"
+        << "}\n";
+    return Result<void>::ok();
+}
+
+std::string operators_response_json(const std::vector<OperatorRecord>& ops, const ManagerConfig& cfg) {
+    auto now = epoch_seconds();
+    std::ostringstream o;
+    o << "{\n"
+      << "  \"storage_path\": \"" << json_escape(operators_path(cfg)) << "\",\n"
+      << "  \"status_timeout_seconds\": " << cfg.status_timeout_seconds << ",\n"
+      << "  \"operators\": [\n";
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        o << operator_to_json(ops[i], i + 1 < ops.size(), now, cfg.status_timeout_seconds);
+    }
+    o << "  ]\n"
+      << "}";
+    return o.str();
+}
+
+// 上报登记（upsert）：心跳/操作日志携带 operator_id 时自动登记台账并绑定主机。
+// 锁约定：调用方需持有 host_store_mutex()。
+void upsert_operator_locked(const ManagerConfig& cfg,
+                            const std::string& operator_id,
+                            const std::string& display_name,
+                            const std::string& host_id,
+                            const std::string& client_ip) {
+    if (operator_id.empty() || !is_valid_operator_id(operator_id)) return;
+    auto lr = load_operators(cfg);
+    if (lr.is_err()) {
+        AF_LOG_WARN("operators: cannot load registry: " << lr.error().message());
+        return;
+    }
+    auto ops = lr.value();
+    auto now = epoch_seconds();
+    for (auto& op : ops) {
+        if (op.operator_id == operator_id) {
+            // 已登记：刷新显示名/绑定主机/最近上报
+            if (!display_name.empty()) op.display_name = display_name;
+            // 绑定变更时记录日志（操作员换机是审计关注点）
+            if (!host_id.empty() && !op.bound_host_id.empty() && op.bound_host_id != host_id) {
+                AF_LOG_INFO("operators: operator " << operator_id << " rebound host "
+                            << op.bound_host_id << " -> " << host_id);
+            }
+            if (!host_id.empty()) op.bound_host_id = host_id;
+            op.last_seen_epoch = now;
+            if (!client_ip.empty()) op.last_client_ip = client_ip;
+            (void)save_operators(cfg, ops);
+            return;
+        }
+    }
+    if (ops.size() >= 4096) {
+        AF_LOG_WARN("operators: registry full, reject new operator " << operator_id);
+        return;
+    }
+    OperatorRecord op;
+    op.operator_id = operator_id;
+    op.display_name = display_name;
+    op.bound_host_id = host_id;
+    op.status = "active";
+    op.registered_at = now;
+    op.last_seen_epoch = now;
+    op.last_client_ip = client_ip;
+    ops.push_back(std::move(op));
+    (void)save_operators(cfg, ops);
+}
+
 Result<std::vector<HostRecord>> load_hosts(const ManagerConfig& cfg) {
     std::vector<HostRecord> hosts;
     auto path = hosts_path(cfg);
@@ -2644,6 +2799,90 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
           << "}";
         return o.str();
     }
+    // GET /operators — 操作员台账列表（M5 身份贯通）
+    if (path == "/operators" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        std::lock_guard<std::mutex> lk(host_store_mutex());
+        auto ops = load_operators(cfg_);
+        if (ops.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"cannot load operators\"\n}";
+        }
+        return operators_response_json(ops.value(), cfg_);
+    }
+    // POST /operators/register — 注册/更新操作员并绑定主机（手工维护入口；
+    // 客户端心跳/操作日志携带 operator_id 时也会自动登记）
+    if (path == "/operators/register" && method == "POST") {
+        content_type = "application/json; charset=utf-8";
+        auto operator_id = json_string_field(body, "operator_id");
+        auto display_name = json_string_field(body, "display_name");
+        if (display_name.empty()) display_name = json_string_field(body, "name");
+        auto host_id = json_string_field(body, "host_id");
+        auto op_status = json_string_field(body, "status");
+        if (operator_id.empty() || !is_valid_operator_id(operator_id)) {
+            status = 422;
+            return validation_error_json({{"operator_id", "format",
+                "操作员 ID 只能包含字母、数字、短横线和下划线，长度为 2 到 64 个字符"}});
+        }
+        if (!host_id.empty() && !is_valid_host_id(host_id)) {
+            status = 422;
+            return validation_error_json({{"host_id", "format", "主机 ID 格式不正确"}});
+        }
+        if (!op_status.empty() && op_status != "active" && op_status != "disabled") {
+            status = 422;
+            return validation_error_json({{"status", "format", "状态只能为 active 或 disabled"}});
+        }
+        std::lock_guard<std::mutex> lk(host_store_mutex());
+        auto ops_r = load_operators(cfg_);
+        if (ops_r.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"cannot load operators\"\n}";
+        }
+        auto ops = ops_r.value();
+        auto now = epoch_seconds();
+        bool found = false;
+        for (auto& op : ops) {
+            if (op.operator_id == operator_id) {
+                if (!display_name.empty()) op.display_name = display_name;
+                if (!host_id.empty()) op.bound_host_id = host_id;
+                if (!op_status.empty()) op.status = op_status;
+                op.last_seen_epoch = now;
+                if (!client_ip.empty()) op.last_client_ip = client_ip;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (ops.size() >= 4096) {
+                status = 409;
+                return "{\n  \"error\": \"operator registry full\"\n}";
+            }
+            OperatorRecord op;
+            op.operator_id = operator_id;
+            op.display_name = display_name;
+            op.bound_host_id = host_id;
+            op.status = op_status.empty() ? "active" : op_status;
+            op.registered_at = now;
+            op.last_seen_epoch = now;
+            op.last_client_ip = client_ip;
+            ops.push_back(std::move(op));
+        }
+        auto saved = save_operators(cfg_, ops);
+        if (saved.is_err()) {
+            status = 500;
+            return "{\n  \"error\": \"cannot save operators\"\n}";
+        }
+        status = 200;
+        std::ostringstream o;
+        o << "{\n"
+          << "  \"registered\": true,\n"
+          << "  \"operator_id\": \"" << json_escape(operator_id) << "\",\n"
+          << "  \"display_name\": \"" << json_escape(display_name) << "\",\n"
+          << "  \"bound_host_id\": \"" << json_escape(host_id) << "\",\n"
+          << "  \"status\": \"" << json_escape(op_status.empty() ? "active" : op_status) << "\"\n"
+          << "}";
+        return o.str();
+    }
     if ((path == "/hosts/heartbeat" || path == "/hosts/register") && method == "POST") {
         content_type = "application/json; charset=utf-8";
         if (!enrollment_key_valid(cfg_, body)) {
@@ -2662,7 +2901,14 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             status = 422;
             return validation_error_json(issues);
         }
+        // 操作员身份贯通（M5）：心跳携带 operator_id 时登记操作员台账并绑定主机
+        auto heartbeat_operator_id = json_string_field(body, "operator_id");
+        auto heartbeat_operator_name = json_string_field(body, "operator_name");
         std::lock_guard<std::mutex> lk(host_store_mutex());
+        if (!heartbeat_operator_id.empty()) {
+            upsert_operator_locked(cfg_, heartbeat_operator_id, heartbeat_operator_name,
+                                   incoming.id, client_ip);
+        }
         auto hosts = load_hosts(cfg_);
         if (hosts.is_err()) {
             status = 500;
@@ -2833,6 +3079,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         if (objects.empty()) objects.push_back(body);
         std::size_t accepted = 0;
         std::string first_host;
+        std::string first_operator;        // 批次首个操作员（M5 身份贯通，批次内统一 upsert 一次）
+        std::string first_operator_name;
         // 收集需在锁外做违规规则复查与合谋检测的条目，缩短全局锁临界区
         std::vector<std::pair<std::string, std::string>> pending_rule_eval;
         std::string response_body;
@@ -2846,6 +3094,13 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                 return validation_error_json({{"host_id", "format", "操作日志必须包含合法主机 ID"}});
             }
             if (first_host.empty()) first_host = host_id;
+            // 操作员身份贯通（M5）：日志条目携带 operator_id 时登记台账并绑定主机
+            if (first_operator.empty()) {
+                first_operator = json_string_field(raw_item, "operator_id");
+                if (first_operator.empty()) first_operator = json_string_field(body, "operator_id");
+                first_operator_name = json_string_field(raw_item, "operator_name");
+                if (first_operator_name.empty()) first_operator_name = json_string_field(body, "operator_name");
+            }
             // 补全 host_id（旧客户端只在外层信封携带）+ 服务端接收时间戳
             std::string item = raw_item;
             if (json_string_field(item, "host_id").empty())
@@ -2879,9 +3134,10 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                 auto db_r = host_db_mgr_->host_db(host_id);
                 if (db_r.is_ok()) {
                     std::ostringstream sql;
-                    sql << "INSERT INTO events(timestamp,collector,priority,operation_type,event_type,message,raw_json,checksum) VALUES("
+                    sql << "INSERT INTO events(timestamp,collector,operator,priority,operation_type,event_type,message,raw_json,checksum) VALUES("
                         << "'" << sql_escape(iso_time(epoch_seconds())) << "',"
                         << "'" << sql_escape(collector) << "',"
+                        << "'" << sql_escape(json_string_field(item, "operator_id")) << "',"
                         << "'" << sql_escape(prio) << "',"
                         << "'" << sql_escape(json_string_field(item, "operation_type")) << "',"
                         << "'" << sql_escape(json_string_field(item, "event_type")) << "',"
@@ -2895,6 +3151,11 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
                 }
             }
             ++accepted;
+        }
+        // 批次统一登记操作员台账（M5 身份贯通）
+        if (!first_operator.empty()) {
+            upsert_operator_locked(cfg_, first_operator, first_operator_name,
+                                   first_host, client_ip);
         }
         std::ostringstream o;
         o << "{\n"

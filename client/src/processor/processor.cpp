@@ -97,8 +97,10 @@ bool Deduper::process(AuditEvent& ev) {
 // =====================================================================
 // Enricher
 // =====================================================================
-Enricher::Enricher(std::string host, std::string agent_id)
-    : host_(std::move(host)), agent_id_(std::move(agent_id)) {}
+Enricher::Enricher(std::string host, std::string agent_id,
+                   std::string operator_id, std::string operator_name)
+    : host_(std::move(host)), agent_id_(std::move(agent_id)),
+      operator_id_(std::move(operator_id)), operator_name_(std::move(operator_name)) {}
 
 bool Enricher::process(AuditEvent& ev) {
     if (ev.host.empty())     ev.host = host_;
@@ -109,6 +111,13 @@ bool Enricher::process(AuditEvent& ev) {
 #else
         if (char* l = std::getenv("USER"); l) ev.actor.user = l;
 #endif
+    }
+    // 操作员身份贯通：本机采集的全部操作归属配置的操作员（M5）。
+    if (!operator_id_.empty() && ev.attrs.find(logmeta::attr::kOperatorId) == ev.attrs.end()) {
+        ev.attrs[logmeta::attr::kOperatorId] = operator_id_;
+    }
+    if (!operator_name_.empty() && ev.attrs.find(logmeta::attr::kOperatorName) == ev.attrs.end()) {
+        ev.attrs[logmeta::attr::kOperatorName] = operator_name_;
     }
     return true;
 }

@@ -54,12 +54,16 @@ private:
 // 用主机名 / agent_id / OS 信息增强事件。
 class Enricher : public Processor {
 public:
-    Enricher(std::string host, std::string agent_id);
+    // operator_id/name 非空时写入事件 attrs（操作员身份贯通，M5）。
+    Enricher(std::string host, std::string agent_id,
+             std::string operator_id = {}, std::string operator_name = {});
     bool process(AuditEvent& ev) override;
     std::string name() const override { return "enricher"; }
 private:
     std::string host_;
     std::string agent_id_;
+    std::string operator_id_;
+    std::string operator_name_;
 };
 
 // 将重复的低严重性事件聚合为单个摘要事件。

@@ -149,6 +149,7 @@ Result<SqliteDb*> HostDbManager::host_db(const std::string& host_id) {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
             collector TEXT,
+            operator TEXT,
             priority TEXT DEFAULT 'normal',
             operation_type TEXT,
             event_type TEXT,
@@ -159,6 +160,9 @@ Result<SqliteDb*> HostDbManager::host_db(const std::string& host_id) {
     )");
     if (r1.is_err()) return Result<SqliteDb*>(r1.error());
 
+    // 旧库迁移：events 表补 operator 列（M5 身份贯通）。列已存在时静默忽略错误。
+    (void)db->exec("ALTER TABLE events ADD COLUMN operator TEXT");
+
     auto r2 = exec_or_fail(R"(
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
     )");
@@ -168,6 +172,9 @@ Result<SqliteDb*> HostDbManager::host_db(const std::string& host_id) {
         CREATE INDEX IF NOT EXISTS idx_events_collector ON events(collector);
     )");
     if (r3.is_err()) return Result<SqliteDb*>(r3.error());
+
+    // 操作员维度查询索引（按操作员检索其全部操作）
+    (void)db->exec("CREATE INDEX IF NOT EXISTS idx_events_operator ON events(operator)");
 
     auto r4 = exec_or_fail(R"(
         CREATE TABLE IF NOT EXISTS metrics (

@@ -516,6 +516,8 @@ std::string RemoteAgentClient::build_heartbeat_json() {
     std::ostringstream o;
     o << "{"
       << "\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
+      << "\"operator_id\":\"" << json_escape(cfg_.operator_id) << "\","
+      << "\"operator_name\":\"" << json_escape(cfg_.operator_name) << "\","
       << "\"name\":\"" << json_escape(proc::hostname()) << "\","
       << "\"ip_address\":\"" << json_escape(first_local_ipv4()) << "\","
       << "\"hardware\":\"" << json_escape(hardware.str()) << "\","
@@ -544,6 +546,7 @@ std::string RemoteAgentClient::build_batch_summary_json(const chain::EventBatch&
     std::ostringstream o;
     o << "{"
       << "\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
+      << "\"operator_id\":\"" << json_escape(cfg_.operator_id) << "\","
       << "\"timestamp\":\"" << iso_time(epoch_seconds()) << "\","
       << "\"batch_id\":\"" << json_escape(batch.id) << "\","
       << "\"event_count\":" << batch.events.size() << ","
@@ -632,8 +635,16 @@ void RemoteAgentClient::send_audit_summaries(bool high_only) {
         std::string ts = iso_time(batch_sec);
         for (const auto& ev : batch.events) {
             if (log_count) logs_body << ",";
+            // 操作员身份：优先取事件 attrs 中由 Enricher 注入的 operator_id，
+            // 缺失时回退到客户端配置的操作员（M5 身份贯通）。
+            std::string op_id = attr_str(ev, logmeta::attr::kOperatorId, "");
+            if (op_id.empty()) op_id = cfg_.operator_id;
+            std::string op_name = attr_str(ev, logmeta::attr::kOperatorName, "");
+            if (op_name.empty()) op_name = cfg_.operator_name;
             logs_body << "{"
                       << "\"host_id\":\"" << json_escape(cfg_.host_id) << "\","
+                      << "\"operator_id\":\"" << json_escape(op_id) << "\","
+                      << "\"operator_name\":\"" << json_escape(op_name) << "\","
                       << "\"timestamp\":\"" << ts << "\","
                       << "\"batch_id\":\"" << json_escape(batch.id) << "\","
                       << "\"seq\":" << ev.seq << ","

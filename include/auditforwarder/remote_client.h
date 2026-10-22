@@ -22,6 +22,9 @@ struct RemoteClientConfig {
     std::string auth_token;
     std::string host_id;
     std::string data_dir;
+    // 操作员身份贯通（M5）：心跳/批次摘要/操作日志上报时携带，服务端登记到操作员台账。
+    std::string operator_id;
+    std::string operator_name;
     // 请求级完整性签名密钥：非空时，客户端对 POST/PUT 请求体计算 HMAC-SHA256
     // 并放入 X-Signature 头；服务端用同一密钥验签，防止传输篡改。
     std::string hmac_key;

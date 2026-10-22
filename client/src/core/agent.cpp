@@ -80,6 +80,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
             cfg_.agent_id = c.get_string("agent.id", cfg_.agent_id);
             cfg_.data_dir = c.get_string("agent.data_dir", cfg_.data_dir);
             cfg_.config_path = c.get_string("agent.config_path", cfg_.config_path);
+            cfg_.operator_id = c.get_string("operator.id", cfg_.operator_id);
+            cfg_.operator_name = c.get_string("operator.name", cfg_.operator_name);
             cfg_.log_level = severity_from_string(c.get_string("log.level", to_string(cfg_.log_level)));
             cfg_.log_file = c.get_string("log.file", cfg_.log_file);
             cfg_.log_max_bytes = static_cast<std::size_t>(c.get_int("log.max_bytes", static_cast<long long>(cfg_.log_max_bytes)));
@@ -193,7 +195,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     });
 
     // 构建默认处理器链
-    processors_.emplace_back(std::make_unique<processor::Enricher>(proc::hostname(), cfg_.agent_id));
+    processors_.emplace_back(std::make_unique<processor::Enricher>(proc::hostname(), cfg_.agent_id,
+                                                                   cfg_.operator_id, cfg_.operator_name));
     // 数据清洗与标准化：在增强（补 host/agent_id）之后、去重之前统一字段格式
     processors_.emplace_back(std::make_unique<processor::Normalizer>());
     processors_.emplace_back(std::make_unique<processor::PIIMasker>());
@@ -273,6 +276,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
     rc.client_key = cfg_.client_key;
     rc.enrollment_key = cfg_.remote_enrollment_key;
     rc.allowed_commands = cfg_.remote_allowed_commands;
+    rc.operator_id = cfg_.operator_id;
+    rc.operator_name = cfg_.operator_name;
     remote_client_ = std::make_unique<RemoteAgentClient>(rc);
 
     // Self protect
