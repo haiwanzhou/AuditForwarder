@@ -286,4 +286,126 @@ bool Normalizer::process(AuditEvent& ev) {
     return true;
 }
 
+// =====================================================================
+// SchemaMapper（OCSF 子集映射，M6-1）
+// =====================================================================
+namespace {
+// 读取 attrs 值，缺失时返回空串。
+std::string get_attr(const AuditEvent& ev, const char* key) {
+    auto it = ev.attrs.find(key);
+    return it == ev.attrs.end() ? std::string() : it->second;
+}
+
+// 仅在缺失或为空时写入：保留采集器/适配器已显式设置的映射字段。
+void set_attr_if_empty(AuditEvent& ev, const char* key, std::string value) {
+    if (value.empty()) return;
+    auto it = ev.attrs.find(key);
+    if (it == ev.attrs.end() || it->second.empty()) ev.attrs[key] = std::move(value);
+}
+
+// OCSF severity_id：0=Unknown 1=Informational 2=Low 3=Medium 4=High 5=Critical 6=Fatal
+int ocsf_severity_id(Severity s) {
+    switch (s) {
+        case Severity::Debug:     return 1;
+        case Severity::Info:      return 1;
+        case Severity::Notice:    return 2;
+        case Severity::Warning:   return 3;
+        case Severity::Error:     return 4;
+        case Severity::Critical:  return 5;
+        case Severity::Alert:     return 5;
+        case Severity::Emergency: return 6;
+    }
+    return 0;
+}
+
+// 最小 JSON 字符串转义（metadata 为内嵌 JSON 文本）。
+std::string schema_json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\b': o += "\\b";  break;
+            case '\f': o += "\\f";  break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    static const char* hex = "0123456789abcdef";
+                    o += "\\u00";
+                    o += hex[(c >> 4) & 0xF];
+                    o += hex[c & 0xF];
+                } else {
+                    o.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    return o;
+}
+
+// 受管系统标识：优取 HTTP Host（补端口），其次目标地址，兜底 local（本机）。
+std::string resolve_target_system(const AuditEvent& ev) {
+    std::string sys = get_attr(ev, logmeta::attr::kHttpHost);
+    if (sys.empty()) sys = ev.target.address;
+    if (sys.empty()) return "local";
+    if (ev.target.port != 0 && sys.find(':') == std::string::npos) {
+        sys += ":" + std::to_string(ev.target.port);
+    }
+    return sys;
+}
+
+// 对象标识：优先资源路径，其次 HTTP URI，再次目标地址。
+std::string resolve_object(const AuditEvent& ev) {
+    if (!ev.target.path.empty()) return ev.target.path;
+    std::string uri = get_attr(ev, logmeta::attr::kHttpUri);
+    if (!uri.empty()) return uri;
+    if (!ev.target.address.empty()) {
+        std::string obj = ev.target.address;
+        if (ev.target.port != 0) obj += ":" + std::to_string(ev.target.port);
+        return obj;
+    }
+    return {};
+}
+}  // namespace
+
+bool SchemaMapper::process(AuditEvent& ev) {
+    // 1. actor：操作员身份优先，其次登录用户，再次进程名（M7 图谱以操作员为主键）
+    std::string actor = get_attr(ev, logmeta::attr::kOperatorId);
+    if (actor.empty()) actor = ev.actor.user;
+    if (actor.empty()) actor = ev.actor.name;
+    set_attr_if_empty(ev, logmeta::attr::kSchemaActor, std::move(actor));
+
+    // 2. activity_name：复用 EventAction 规范名（read/create/delete...），与规则引擎口径一致
+    set_attr_if_empty(ev, logmeta::attr::kSchemaActivityName, to_string(ev.action));
+
+    // 3. object / target_system：规则与图谱将按资产画像解释这两个字段（M6-2）
+    set_attr_if_empty(ev, logmeta::attr::kSchemaObject, resolve_object(ev));
+    set_attr_if_empty(ev, logmeta::attr::kSchemaTargetSystem, resolve_target_system(ev));
+
+    // 4. outcome / severity_id：统一结果与数值严重度
+    set_attr_if_empty(ev, logmeta::attr::kSchemaOutcome, to_string(ev.outcome));
+    set_attr_if_empty(ev, logmeta::attr::kSchemaSeverityId,
+                      std::to_string(ocsf_severity_id(ev.severity)));
+
+    // 5. metadata：OCSF 风格元数据（JSON 文本），时间戳保持微秒粒度
+    std::ostringstream m;
+    m << "{\"version\":\"1.1.0\",\"product\":\"AuditForwarder\"";
+    auto add_str = [&](const char* key, const std::string& value) {
+        if (value.empty()) return;
+        m << ",\"" << key << "\":\"" << schema_json_escape(value) << '"';
+    };
+    add_str("collector",   get_attr(ev, logmeta::attr::kCollector));
+    add_str("source",      get_attr(ev, logmeta::attr::kSource));
+    add_str("host",        ev.host);
+    add_str("agent_id",    ev.agent_id);
+    add_str("operator_id", get_attr(ev, logmeta::attr::kOperatorId));
+    m << ",\"logged_time_us\":" << ev.ts_micros;
+    m << ",\"schema_ver\":" << ev.schema_ver << '}';
+    set_attr_if_empty(ev, logmeta::attr::kSchemaMetadata, m.str());
+
+    return true;
+}
+
 }  // namespace af::processor

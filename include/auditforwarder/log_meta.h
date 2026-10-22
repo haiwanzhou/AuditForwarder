@@ -86,6 +86,16 @@ constexpr const char* kHttpUserAgent   = "http.user_agent";
 constexpr const char* kHttpStatusCode  = "http.status_code";
 constexpr const char* kHttpReqBodyLen  = "http.request_body_len";
 constexpr const char* kHttpReqBody     = "http.request_body"; // 仅 capture_body 开启时留存(经 PIIMasker 脱敏)
+// —— OCSF 子集事件模型映射字段（M6-1）——
+// 由 SchemaMapper 在 Normalizer 之后写入，统一跨系统事件模型。
+// 全部仍存放在 attrs 中，不改 AuditEvent / EventBatch 结构，保持哈希链兼容。
+constexpr const char* kSchemaActor        = "ocsf.actor";          // 操作员（优先 operator_id）
+constexpr const char* kSchemaActivityName = "ocsf.activity_name";  // 动作规范名（read/create/delete...）
+constexpr const char* kSchemaObject       = "ocsf.object";         // 被操作对象（URI/路径/地址）
+constexpr const char* kSchemaOutcome      = "ocsf.outcome";        // success/failure/denied/unknown
+constexpr const char* kSchemaSeverityId   = "ocsf.severity_id";    // OCSF 数值严重度 1-6
+constexpr const char* kSchemaTargetSystem = "ocsf.target_system";  // 受管系统标识（host:port / local）
+constexpr const char* kSchemaMetadata     = "ocsf.metadata";       // JSON: 版本/产品/采集器/时间戳等
 }  // namespace attr
 
 // 当前 Unix 毫秒时间戳。

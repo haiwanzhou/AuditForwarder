@@ -216,6 +216,8 @@ Result<void> Agent::init(const AgentConfig& cfg) {
                                                                    cfg_.operator_id, cfg_.operator_name));
     // 数据清洗与标准化：在增强（补 host/agent_id）之后、去重之前统一字段格式
     processors_.emplace_back(std::make_unique<processor::Normalizer>());
+    // OCSF 子集 schema 映射（M6-1）：输出 actor/activity_name/object/... 到 attrs
+    processors_.emplace_back(std::make_unique<processor::SchemaMapper>());
     processors_.emplace_back(std::make_unique<processor::PIIMasker>());
     processors_.emplace_back(std::make_unique<processor::Deduper>());
 

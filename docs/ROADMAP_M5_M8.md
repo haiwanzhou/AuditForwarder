@@ -11,7 +11,7 @@
 | 阶段 | 主题 | 状态 |
 |------|------|------|
 | M5 | 采集与身份贯通 | 已完成 |
-| M6 | 事件模型与危害规则 | 未开始 |
+| M6 | 事件模型与危害规则 | 进行中（M6-1、M6-2 已完成） |
 | M7 | 合谋图谱增强 | 未开始 |
 | M8 | 模拟与演示 | 未开始 |
 
@@ -101,11 +101,59 @@
   - 保持现有 attrs 机制与哈希链兼容（不改 EventBatch 结构）
   - 时间戳一律微秒粒度（项目硬约束）
 
+#### M6-1 实施记录（2026-10-22）
+
+实现方式：新增独立处理器 `processor::SchemaMapper`（`name()=schema_mapper`），注册在 Normalizer 之后、PIIMasker 之前（`client/src/core/agent.cpp`）。所有映射字段写入 attrs 保留键，不改 `AuditEvent` / `EventBatch` 结构。
+
+| attrs 键 | 含义 | 映射来源 |
+|----------|------|----------|
+| `ocsf.actor` | 操作员（图谱主键口径） | `operator_id` → `actor.user` → `actor.name` |
+| `ocsf.activity_name` | 动作规范名 | `EventAction` 规范名（read/create/delete...） |
+| `ocsf.object` | 被操作对象 | `target.path` → `http.uri` → `target.address:port` |
+| `ocsf.outcome` | 执行结果 | `EventOutcome`（success/failure/denied/unknown） |
+| `ocsf.severity_id` | OCSF 数值严重度 | Info=1, Notice=2, Warning=3, Error=4, Critical/Alert=5, Emergency=6 |
+| `ocsf.target_system` | 受管系统标识 | `http.host`（补端口）→ `target.address:port` → `local` |
+| `ocsf.metadata` | 元数据 JSON 文本 | version/product/collector/source/host/agent_id/operator_id/logged_time_us/schema_ver |
+
+- 兼容性：映射字段仅进入 attrs（canonical JSON 已包含 attrs），哈希链与批次结构不变；已显式设置的映射字段不被覆盖（适配器可预置）
+- 时间：metadata 的 `logged_time_us` 直接取 `ts_micros`，保持微秒粒度
+- 脱敏：SchemaMapper 位于 PIIMasker 之前，映射出的元数据同样经过脱敏
+- 验证：新增单测 `test_schema_mapper`（完整映射 / actor 兜底 / object 兜底 / 不覆盖 / severity_id 逐级 / JSON 转义 / to_json 携带），全量 416 项通过
+
 ### 任务 2：资产画像 YAML（M6-2）
 
 - **目标**：每个受管系统一份画像配置，实现方案通用化（图书系统只是实例）
 - **字段**：系统标识、访问方式（HTTP/DB/终端）、资源类型枚举、敏感度分级、角色基线（哪些操作员角色可执行哪些 action）
 - **要点**：服务端加载，规则引擎与图谱按画像解释 `object` 与 `target_system`
+
+#### M6-2 实施记录（2026-10-22）
+
+实现方式：新增共享模块 `include/auditforwarder/asset_profile.h` + `shared/src/common/asset_profile.cpp`，服务端懒加载 `<data_dir>/asset_profiles/*.yaml`。
+
+**画像字段**
+
+| 字段 | 说明 |
+|------|------|
+| `system_id` / `display_name` | 系统标识（必填，唯一，重复加载覆盖）与展示名 |
+| `access_mode` | 访问方式：`http` / `db` / `terminal`（兼容 web/sql/ssh 等同义词） |
+| `target_systems` | 事件 `target_system` 别名（host / host:port，大小写不敏感） |
+| `resources` | 资源规则列表：`pattern`（`*`/`?` 通配）+ `type` + `sensitivity`，按顺序首个命中生效 |
+| `default_sensitivity` / `default_resource_type` | 未命中资源规则时的默认解释 |
+| `roles` | 角色基线：`allowed_actions` / `denied_actions`（`denied` 优先，支持通配） |
+| `operator_roles` | `operator_id -> role` 映射 |
+
+**资源类型枚举**：`data_record` / `table` / `backup` / `credential` / `config` / `log` / `system` / `other`
+**敏感度分级**：`public`(0) / `internal`(1) / `confidential`(2) / `secret`(3)
+
+**服务端接入**
+
+- `GET /asset-profiles`（`server/src/manager/manager_server.cpp`）：首次访问懒加载画像目录，返回全部画像 JSON；目录不存在时返回空列表，不影响启动
+- 违规规则复查 `evaluate_operation_log_rules`：按 `target_system`（回落 `http.host` / `target_host`）定位画像，按 `object`（回落 `http.uri` / `target_path`）匹配资源类型与敏感度，再按操作员角色判定动作；仅当「角色已登记 + 明确越权 + 敏感度 ≥ confidential」时写 `asset_role_violation` 告警（secret→high，confidential→medium）。画像未登记的角色不做判定，避免误报
+- 加载失败只记 WARN，不影响其他画像与主流程
+
+**示例配置**：`config/asset_profiles/book_system.yaml`（图书系统实例，含 reader/editor/admin 三角色基线）
+
+**验证**：新增单测 `test_asset_profile`（解析 / 通配符 / 注册表定位 / object 分类 / 角色基线 denied 优先 / 操作员判定 / 热加载覆盖 / JSON 输出 / 必填校验 / 目录加载容错），全量 473 项通过
 
 ### 任务 3：Sigma correlation 风格危害规则（M6-3）
 

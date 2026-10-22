@@ -75,6 +75,8 @@ set(AF_CORE_SOURCES
     shared/src/common/thread_pool.cpp
     shared/src/common/process.cpp
     shared/src/common/event.cpp
+    # 资产画像（M6-2）：受管系统画像加载与解释
+    shared/src/common/asset_profile.cpp
     shared/src/database/database.cpp
     shared/src/database/sqlite_db.cpp
 

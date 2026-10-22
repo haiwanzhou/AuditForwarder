@@ -13,6 +13,9 @@
 
 namespace af {
 
+// 资产画像注册表（M6-2），完整定义见 asset_profile.h
+namespace asset { class AssetProfileRegistry; }
+
 struct ManagerConfig {
     std::string listen       { "127.0.0.1:8443" };
     std::string auth_token;
@@ -53,6 +56,8 @@ private:
 
     bool is_session_token_valid(const std::string& token);
     std::string create_session_token(const std::string& username, const std::string& client_ip);
+    // 资产画像快照（懒加载，首次调用读 data_dir/asset_profiles/*.yaml）
+    std::shared_ptr<asset::AssetProfileRegistry> asset_profiles_snapshot();
 
     ManagerConfig       cfg_;
     std::atomic<bool>   running_ { false };
@@ -68,6 +73,10 @@ private:
 
     // 每主机独立 SQLite 数据库（数据隔离存储）
     std::unique_ptr<db::HostDbManager> host_db_mgr_;
+
+    // 资产画像注册表（M6-2）：懒加载 <data_dir>/asset_profiles/*.yaml
+    std::mutex                         asset_profile_mutex_;
+    std::shared_ptr<asset::AssetProfileRegistry> asset_profiles_;
 };
 
 }  // namespace af

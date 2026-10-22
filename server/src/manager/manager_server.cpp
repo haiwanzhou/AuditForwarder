@@ -4,6 +4,7 @@
 #include "auditforwarder/config.h"
 #include "auditforwarder/crypto.h"
 #include "auditforwarder/fs.h"
+#include "auditforwarder/asset_profile.h"   // M6-2 资产画像
 #include "auditforwarder/log_meta.h"
 #include "log_policy_util.h"
 #include "auditforwarder/logger.h"
@@ -1100,7 +1101,8 @@ bool string_contains_ci(std::string text, std::string needle) {
 
 void evaluate_operation_log_rules(const ManagerConfig& cfg,
                                   const std::string& host_id,
-                                  const std::string& body) {
+                                  const std::string& body,
+                                  const asset::AssetProfileRegistry* profiles) {
     auto rules = load_or_create_text(violation_rules_path(cfg), default_violation_rules_json());
     if (rules.is_err()) return;
     auto records = json_object_array_field(rules.value(), "rules");
@@ -1129,6 +1131,45 @@ void evaluate_operation_log_rules(const ManagerConfig& cfg,
         if (rule_message.empty()) rule_message = "检测到疑似违规操作";
         (void)append_alert(cfg, host_id, "violation_rule", severity, id, rule_message, body);
     }
+
+    // 资产画像解释（M6-2）：按 target_system 定位受管系统，按 object 匹配资源敏感度，
+    // 再按操作员角色基线判定动作是否越权（画像未登记的角色不做判定，不做惩罚）。
+    if (!profiles) return;
+    auto pick = [](std::initializer_list<std::string> values) {
+        for (const auto& v : values) {
+            if (!v.empty()) return v;
+        }
+        return std::string();
+    };
+    const std::string target_system = pick({
+        json_string_field(body, "target_system"),
+        json_string_field(body, "http.host"),
+        json_string_field(body, "target_host")});
+    const std::string object = pick({
+        json_string_field(body, "object"),
+        json_string_field(body, "http.uri"),
+        json_string_field(body, "target_path")});
+    const std::string action = pick({
+        json_string_field(body, "activity_name"),
+        json_string_field(body, "operation_type"),
+        json_string_field(body, "event_type")});
+    const std::string operator_id = json_string_field(body, "operator_id");
+    if (action.empty() || operator_id.empty()) return;
+    const asset::AssetProfile* profile = profiles->find_for_target(target_system);
+    if (!profile) return;
+    const auto resource = profiles->classify(*profile, object);
+    const auto verdict = profiles->check_operator_action(*profile, operator_id, action);
+    // 仅对「角色已登记且明确越权」且资源敏感度 ≥ confidential 的操作告警
+    if (verdict.verdict != asset::RoleVerdict::Denied) return;
+    if (resource.sensitivity < asset::Sensitivity::Confidential) return;
+    const char* severity = resource.sensitivity == asset::Sensitivity::Secret ? "high" : "medium";
+    std::string msg = "操作员 " + operator_id + "（角色 " + verdict.role + "）对 " +
+                      (object.empty() ? std::string("资源") : object) + " 执行 " + action +
+                      " 超出资产画像基线（" + profile->system_id + "，" +
+                      asset::to_string(resource.type) + "/" +
+                      asset::to_string(resource.sensitivity) + "）";
+    (void)append_alert(cfg, host_id, "asset_role_violation", severity,
+                       "asset-" + profile->system_id, msg, body);
 }
 
 std::vector<std::string> read_jsonl_filtered(const std::string& path,
@@ -1909,6 +1950,22 @@ Result<std::string> enqueue_host_command(const ManagerConfig& cfg,
 
 SimpleHttpManager::SimpleHttpManager(ManagerConfig cfg) : cfg_(std::move(cfg)) {}
 SimpleHttpManager::~SimpleHttpManager() { stop(); }
+
+// 懒加载资产画像（M6-2）：首次使用时读取 data_dir/asset_profiles 下全部 YAML。
+std::shared_ptr<asset::AssetProfileRegistry> SimpleHttpManager::asset_profiles_snapshot() {
+    std::lock_guard<std::mutex> lk(asset_profile_mutex_);
+    if (!asset_profiles_) {
+        asset_profiles_ = std::make_shared<asset::AssetProfileRegistry>();
+        const std::string dir = cfg_.data_dir.empty()
+                                    ? std::string("asset_profiles")
+                                    : cfg_.data_dir + "/asset_profiles";
+        std::vector<std::string> errors;
+        const auto n = asset_profiles_->load_directory(dir, &errors);
+        for (const auto& e : errors) AF_LOG_WARN("asset profile: " << e);
+        if (n > 0) AF_LOG_INFO("asset profile: loaded " << n << " from " << dir);
+    }
+    return asset_profiles_;
+}
 
 bool SimpleHttpManager::is_session_token_valid(const std::string& token) {
     if (token.empty()) return false;
@@ -2810,6 +2867,12 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         }
         return operators_response_json(ops.value(), cfg_);
     }
+    // GET /asset-profiles — 受管系统资产画像列表（M6-2，懒加载 data_dir/asset_profiles/*.yaml）
+    if (path == "/asset-profiles" && method == "GET") {
+        content_type = "application/json; charset=utf-8";
+        auto profiles = asset_profiles_snapshot();
+        return profiles->to_json();
+    }
     // POST /operators/register — 注册/更新操作员并绑定主机（手工维护入口；
     // 客户端心跳/操作日志携带 operator_id 时也会自动登记）
     if (path == "/operators/register" && method == "POST") {
@@ -3169,9 +3232,11 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         response_body = o.str();
         }
         // 锁外执行违规规则复查（写 alerts，不阻塞 /hosts 等接口）；
+        // 资产画像（M6-2）在其中按 target_system/object 解释资源与角色基线；
         // 合谋检测同步接入：清洗后进入资产组+时间窗口聚合（引擎内部自带锁，不改变原有入库流程）
+        auto asset_profiles = asset_profiles_snapshot();
         for (const auto& pr : pending_rule_eval) {
-            evaluate_operation_log_rules(cfg_, pr.first, pr.second);
+            evaluate_operation_log_rules(cfg_, pr.first, pr.second, asset_profiles.get());
             collusion::Engine::instance().ingest_json(pr.second);
         }
         return response_body;

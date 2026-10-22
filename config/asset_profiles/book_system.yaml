@@ -1,0 +1,52 @@
+# 资产画像示例：自建 HTTP 图书管理系统（M6-2）
+# 部署：复制到服务端 <data_dir>/asset_profiles/ 目录，服务端 GET /asset-profiles 可见。
+# 一个受管系统一份文件，文件名任意，system_id 必须唯一。
+
+system_id: book_system
+display_name: 自建图书管理系统
+access_mode: http
+
+# 事件 target_system 别名（大小写不敏感）：http.host 或 host:port
+target_systems:
+  - bookhost
+  - "bookhost:18080"
+
+# 未命中任何 resources 规则时的默认解释
+default_sensitivity: internal
+default_resource_type: data_record
+
+# 资源类型与敏感度分级（按顺序匹配，第一个命中生效；支持 * 与 ? 通配）
+resources:
+  - pattern: "/books*"
+    type: data_record
+    sensitivity: internal
+  - pattern: "/admin/*"
+    type: config
+    sensitivity: confidential
+  - pattern: "*backup*"
+    type: backup
+    sensitivity: secret
+  - pattern: "*credential*"
+    type: credential
+    sensitivity: secret
+
+# 角色基线：allowed_actions 支持通配，denied_actions 优先级更高
+roles:
+  - role: reader
+    allowed_actions:
+      - read
+  - role: editor
+    allowed_actions:
+      - read
+      - create
+      - write
+  - role: admin
+    allowed_actions:
+      - "*"
+    denied_actions:
+      - delete_backup
+
+# 操作员 -> 角色（operator_id 与客户端配置的 operator.id 一致）
+operator_roles:
+  op_sjg: admin
+  op_guest: reader

@@ -103,4 +103,14 @@ public:
     std::string name() const override { return "normalizer"; }
 };
 
+// 事件模型 Schema 映射（M6-1）：把通用审计事件映射为 OCSF 子集字段。
+// 输出 actor / activity_name / object / outcome / severity_id / target_system / metadata，
+// 全部写入 attrs 保留键（logmeta::attr::kSchema*），不改 AuditEvent / EventBatch 结构。
+// 部署位置：Normalizer 之后、PIIMasker 之前，使脱敏能覆盖映射出的元数据。
+class SchemaMapper : public Processor {
+public:
+    bool process(AuditEvent& ev) override;
+    std::string name() const override { return "schema_mapper"; }
+};
+
 }  // namespace af::processor

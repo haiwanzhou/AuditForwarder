@@ -13,6 +13,7 @@
 #endif
 
 #include "auditforwarder/agent.h"
+#include "auditforwarder/asset_profile.h"
 #include "auditforwarder/build_config.h"
 #include "auditforwarder/chain.h"
 #include "auditforwarder/collusion.h"
@@ -1327,6 +1328,272 @@ void test_normalizer() {
     }
 }
 
+// ==================== M6-1: OCSF 子集 schema 映射测试 ====================
+
+void test_schema_mapper() {
+    using namespace af;
+    processor::SchemaMapper sm;
+
+    // 完整映射：操作员身份 + HTTP 事件
+    {
+        AuditEvent ev;
+        ev.ts_micros = 1700000000000123ULL;
+        ev.category  = EventCategory::Network;
+        ev.action    = EventAction::Create;
+        ev.outcome   = EventOutcome::Success;
+        ev.severity  = Severity::Warning;
+        ev.host      = "client-node-SJG";
+        ev.agent_id  = "agent-001";
+        ev.target.kind     = "http";
+        ev.target.address  = "bookhost";
+        ev.target.port     = 18080;
+        ev.target.protocol = "tcp";
+        ev.target.path     = "/books?id=7";
+        ev.attrs[logmeta::attr::kCollector]   = logmeta::collector::kHttpProxy;
+        ev.attrs[logmeta::attr::kOperatorId]  = "op_sjg";
+        ev.attrs[logmeta::attr::kOperatorName] = "SJG";
+        ev.attrs[logmeta::attr::kHttpHost]    = "bookhost";
+
+        AF_EXPECT(sm.process(ev));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaActor], std::string("op_sjg"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaActivityName], std::string("create"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaObject], std::string("/books?id=7"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaOutcome], std::string("success"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaSeverityId], std::string("3"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaTargetSystem], std::string("bookhost:18080"));
+
+        // metadata 携带版本、采集器、操作员与微秒时间戳
+        const std::string& meta = ev.attrs[logmeta::attr::kSchemaMetadata];
+        AF_EXPECT(meta.find("\"version\":\"1.1.0\"") != std::string::npos);
+        AF_EXPECT(meta.find("\"collector\":\"http_proxy\"") != std::string::npos);
+        AF_EXPECT(meta.find("\"operator_id\":\"op_sjg\"") != std::string::npos);
+        AF_EXPECT(meta.find("\"logged_time_us\":1700000000000123") != std::string::npos);
+
+        // attrs 进入 canonical JSON（to_json 携带映射字段，哈希链兼容）
+        const std::string j = ev.to_json();
+        AF_EXPECT(j.find("\"ocsf.actor\":\"op_sjg\"") != std::string::npos);
+        AF_EXPECT(j.find("\"ocsf.object\":\"/books?id=7\"") != std::string::npos);
+    }
+
+    // actor 兜底：无 operator_id 时依次取 actor.user、actor.name
+    {
+        AuditEvent ev;
+        ev.actor.user = "alice";
+        ev.target.path = "/tmp/a.txt";
+        sm.process(ev);
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaActor], std::string("alice"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaObject], std::string("/tmp/a.txt"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaTargetSystem], std::string("local"));
+    }
+    {
+        AuditEvent ev;
+        ev.actor.name = "cmd.exe";
+        sm.process(ev);
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaActor], std::string("cmd.exe"));
+    }
+
+    // object 兜底：target.path 为空时取 http.uri
+    {
+        AuditEvent ev;
+        ev.target.address = "bookhost";
+        ev.target.port    = 18080;
+        ev.attrs[logmeta::attr::kHttpUri] = "/books/9";
+        sm.process(ev);
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaObject], std::string("/books/9"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaTargetSystem], std::string("bookhost:18080"));
+    }
+
+    // 已显式设置的映射字段不被覆盖（适配器可预置 schema 字段）
+    {
+        AuditEvent ev;
+        ev.attrs[logmeta::attr::kSchemaActor] = "preset_op";
+        ev.attrs[logmeta::attr::kSchemaObject] = "preset_object";
+        ev.attrs[logmeta::attr::kOperatorId] = "other_op";
+        ev.target.path = "/other";
+        sm.process(ev);
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaActor], std::string("preset_op"));
+        AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaObject], std::string("preset_object"));
+    }
+
+    // severity_id 映射（OCSF：1=Informational ... 6=Fatal）
+    {
+        struct Case { Severity sev; const char* id; };
+        const Case cases[] = {
+            {Severity::Debug, "1"}, {Severity::Info, "1"}, {Severity::Notice, "2"},
+            {Severity::Warning, "3"}, {Severity::Error, "4"}, {Severity::Critical, "5"},
+            {Severity::Emergency, "6"},
+        };
+        for (const auto& c : cases) {
+            AuditEvent ev;
+            ev.severity = c.sev;
+            sm.process(ev);
+            AF_EXPECT_EQ(ev.attrs[logmeta::attr::kSchemaSeverityId], std::string(c.id));
+        }
+    }
+
+    // metadata JSON 转义：字段中的引号 / 反斜杠不会破坏内嵌 JSON
+    {
+        AuditEvent ev;
+        ev.host = "host\"x\\y";
+        ev.attrs[logmeta::attr::kCollector] = "file_win";
+        sm.process(ev);
+        const std::string& meta = ev.attrs[logmeta::attr::kSchemaMetadata];
+        AF_EXPECT(meta.find("\"host\":\"host\\\"x\\\\y\"") != std::string::npos);
+    }
+}
+
+// ==================== M6-2: 资产画像 YAML 测试 ====================
+
+void test_asset_profile() {
+    using namespace af;
+    using namespace af::asset;
+
+    const std::string yaml = R"(
+system_id: book_system
+display_name: 自建图书管理系统
+access_mode: http
+target_systems:
+  - bookhost
+  - "bookhost:18080"
+default_sensitivity: internal
+default_resource_type: data_record
+
+resources:
+  - pattern: "/books*"
+    type: data_record
+    sensitivity: internal
+  - pattern: "/admin/*"
+    type: config
+    sensitivity: confidential
+  - pattern: "*backup*"
+    type: backup
+    sensitivity: secret
+
+roles:
+  - role: reader
+    allowed_actions:
+      - read
+  - role: admin
+    allowed_actions:
+      - "*"
+    denied_actions:
+      - delete_backup
+
+operator_roles:
+  op_sjg: admin
+  op_guest: reader
+)";
+
+    // ---- 解析 ----
+    auto parsed = parse_asset_profile(yaml, "book_system.yaml");
+    AF_EXPECT(parsed.is_ok());
+    auto& p = parsed.value();
+    AF_EXPECT_EQ(p.system_id, std::string("book_system"));
+    AF_EXPECT_EQ(p.display_name, std::string("自建图书管理系统"));
+    AF_EXPECT(p.access_mode == AccessMode::Http);
+    AF_EXPECT_EQ(p.target_systems.size(), (std::size_t)2);
+    AF_EXPECT_EQ(p.resources.size(), (std::size_t)3);
+    AF_EXPECT_EQ(p.roles.size(), (std::size_t)2);
+    AF_EXPECT_EQ(p.operator_roles.size(), (std::size_t)2);
+    AF_EXPECT_EQ(p.role_of("op_sjg"), std::string("admin"));
+    AF_EXPECT(p.role_of("op_nobody").empty());
+
+    // ---- 通配符 ----
+    AF_EXPECT(wildcard_match("/books*", "/books?id=7"));
+    AF_EXPECT(wildcard_match("*backup*", "/var/data/Backup/db.tar"));
+    AF_EXPECT(wildcard_match("read?", "reads"));
+    AF_EXPECT(!wildcard_match("/admin/*", "/books?id=7"));
+    AF_EXPECT(!wildcard_match("read", "writer"));
+
+    // ---- 注册表 / 定位 ----
+    AssetProfileRegistry reg;
+    AF_EXPECT(reg.add_yaml(yaml, "book_system.yaml").is_ok());
+    AF_EXPECT_EQ(reg.size(), (std::size_t)1);
+    AF_EXPECT(reg.find_system("BOOK_SYSTEM") != nullptr);
+    AF_EXPECT(reg.find_system("unknown") == nullptr);
+    AF_EXPECT(reg.find_for_target("bookhost:18080") != nullptr);
+    AF_EXPECT(reg.find_for_target("BookHost") != nullptr);
+    AF_EXPECT(reg.find_for_target("otherhost") == nullptr);
+
+    // ---- object 解释：按资源规则顺序命中，未命中回落默认 ----
+    auto m = reg.classify(p, "/books?id=7");
+    AF_EXPECT(m.matched);
+    AF_EXPECT(m.type == ResourceType::DataRecord);
+    AF_EXPECT(m.sensitivity == Sensitivity::Internal);
+    AF_EXPECT_EQ(m.pattern, std::string("/books*"));
+
+    auto m_admin = reg.classify(p, "/admin/users");
+    AF_EXPECT(m_admin.matched);
+    AF_EXPECT(m_admin.type == ResourceType::Config);
+    AF_EXPECT(m_admin.sensitivity == Sensitivity::Confidential);
+
+    auto m_backup = reg.classify(p, "/var/backup/db.tar");
+    AF_EXPECT(m_backup.type == ResourceType::Backup);
+    AF_EXPECT(m_backup.sensitivity == Sensitivity::Secret);
+
+    auto m_default = reg.classify(p, "/misc/ping");
+    AF_EXPECT(!m_default.matched);
+    AF_EXPECT(m_default.type == ResourceType::DataRecord);
+    AF_EXPECT(m_default.sensitivity == Sensitivity::Internal);
+
+    // ---- 角色基线：denied 优先于 allowed（admin 允许 * 但禁止 delete_backup）----
+    auto v_admin_delete = reg.check_action(p, "admin", "delete");
+    AF_EXPECT(v_admin_delete.verdict == RoleVerdict::Allowed);
+    auto v_admin_backup = reg.check_action(p, "admin", "delete_backup");
+    AF_EXPECT(v_admin_backup.verdict == RoleVerdict::Denied);
+    AF_EXPECT(v_admin_backup.reason.find("denied_action") != std::string::npos);
+
+    auto v_reader_read = reg.check_action(p, "reader", "read");
+    AF_EXPECT(v_reader_read.verdict == RoleVerdict::Allowed);
+    auto v_reader_write = reg.check_action(p, "reader", "write");
+    AF_EXPECT(v_reader_write.verdict == RoleVerdict::Denied);
+    AF_EXPECT_EQ(v_reader_write.reason, std::string("not_in_allowed_actions"));
+
+    auto v_unknown = reg.check_action(p, "nobody", "read");
+    AF_EXPECT(v_unknown.verdict == RoleVerdict::UnknownRole);
+
+    // ---- 按操作员判定 ----
+    auto v_op_guest = reg.check_operator_action(p, "op_guest", "create");
+    AF_EXPECT(v_op_guest.verdict == RoleVerdict::Denied);
+    AF_EXPECT_EQ(v_op_guest.role, std::string("reader"));
+    auto v_op_missing = reg.check_operator_action(p, "op_missing", "read");
+    AF_EXPECT(v_op_missing.verdict == RoleVerdict::UnknownRole);
+    AF_EXPECT_EQ(v_op_missing.reason, std::string("unknown_operator_role"));
+
+    // ---- 同 system_id 覆盖（热加载语义）----
+    AF_EXPECT(reg.add_yaml(yaml, "book_system_v2.yaml").is_ok());
+    AF_EXPECT_EQ(reg.size(), (std::size_t)1);
+    AF_EXPECT_EQ(reg.profiles().front().source, std::string("book_system_v2.yaml"));
+
+    // ---- JSON 输出 ----
+    const std::string json = reg.to_json();
+    AF_EXPECT(json.find("\"count\":1") != std::string::npos);
+    AF_EXPECT(json.find("\"system_id\":\"book_system\"") != std::string::npos);
+    AF_EXPECT(json.find("\"access_mode\":\"http\"") != std::string::npos);
+    AF_EXPECT(json.find("\"sensitivity\":\"secret\"") != std::string::npos);
+    AF_EXPECT(json.find("\"op_sjg\":\"admin\"") != std::string::npos);
+
+    // ---- 必填校验 ----
+    auto missing = parse_asset_profile("display_name: 无标识\n");
+    AF_EXPECT(missing.is_err());
+
+    // ---- 目录加载：只认 .yaml/.yml，坏文件计入 errors 且不影响其他 ----
+    auto dir = fs::join(fs::temp_directory(), "af_asset_profile_test_" + crypto::random_hex(4));
+    (void)fs::create_directories(dir);
+    {
+        std::ofstream(dir + "/book_system.yaml") << yaml;
+        std::ofstream(dir + "/broken.yaml") << "display_name: 缺少 system_id\n";
+        std::ofstream(dir + "/notes.txt") << "ignored";
+    }
+    AssetProfileRegistry from_dir;
+    std::vector<std::string> errors;
+    auto loaded = from_dir.load_directory(dir, &errors);
+    AF_EXPECT_EQ(loaded, (std::size_t)1);
+    AF_EXPECT_EQ(errors.size(), (std::size_t)1);
+    AF_EXPECT(from_dir.find_system("book_system") != nullptr);
+    (void)fs::remove(dir, true);
+}
+
 // ==================== M3: ONNX 推理 + 行为特征工程 测试 ====================
 
 void test_feature_extractor() {
@@ -1757,6 +2024,8 @@ int main() {
     test_bastion_adapter();
     test_http_proxy_collector();
     test_normalizer();
+    test_schema_mapper();
+    test_asset_profile();
     test_feature_extractor();
     test_onnx_inference();
     test_collusion_ml_integration();
