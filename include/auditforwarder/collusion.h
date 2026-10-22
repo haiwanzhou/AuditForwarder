@@ -11,8 +11,10 @@
 //   - 不自动阻断：仅输出分级告警与完整证据链，人工处置闭环；
 //   - 所有配置 / 应急开关 / 处置操作均留审计日志。
 
+#include "auditforwarder/operator_graph.h"   // M7：操作员合谋图谱
 #include "auditforwarder/types.h"
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,8 +23,6 @@
 
 // 前向声明（PIMPL，完整定义在 onnx_inference.h，实现在 .cpp 中引用）
 namespace af::ml { class OnnxModel; }
-// 前向声明（M4 措施4：轻量级图算法模块，替代 GNN 行为图谱）
-namespace af::graph { class BehaviorGraph; }
 
 namespace af::collusion {
 
@@ -63,6 +63,10 @@ struct EngineConfig {
     bool    graph_enabled     { false };  // 图分析开关（默认关闭，基线就绪后开启）
     float   graph_threshold   { 0.3f };   // 图异常分量阈值（任一超阈值即计入 graph_factor）
     int     graph_max_factor  { 25 };      // 图因子上限（线索性质，不直接触发 HIGH）
+    // ---- 操作员合谋图谱配置（M7）----
+    u64     graph_window_us   { 15ull * 60ull * 1000000ull };  // 同对象共现/互补判定时间窗（微秒）
+    float   graph_density_threshold { 0.3f };                  // 时间窗稠密度阈值
+    std::vector<af::graph::ComplementPair> complement_pairs;   // 危险互补动作组合
     std::vector<AssetGroup>    asset_groups;
     std::vector<WhitelistGroup> whitelist_groups;
 };
@@ -81,6 +85,12 @@ struct Rule {
     int    min_operator_cnt { 2 };     // 最少不同操作员数
     int    base_score { 80 };          // 命中基础分
     std::vector<RuleStep> sequence;    // 操作子序列（按时间有序，非必须连续）
+    // ---- Sigma correlation 风格扩展（M6-3）----
+    // group_by = asset_group（默认，沿用资产组+时间窗口聚合集合）
+    //          / operator（同一操作员的跨事件序列）
+    //          / object（同一被操作对象的跨操作员序列）
+    std::string group_by { "asset_group" };
+    u64 timespan_us { 0 };             // 有序序列最大时间跨度（微秒，0 = 不限）
 };
 
 // ---------------- 工单结构（外部工单系统 API 的本地桩） ----------------
@@ -104,6 +114,7 @@ struct CleanEvent {
     std::string op_param;       // 操作参数（还原证据链用）
     std::string work_order_id;  // 运维工单编号，可为空
     std::string raw;            // 原始 JSON 单行（证据链留存，超长截断）
+    u64         ts_us { 0 };    // 微秒时间戳（M6-3 关联规则的 timespan 判定口径）
 };
 
 // ---------------- 聚合事件集合（资产组 + 时间窗口） ----------------
@@ -148,6 +159,19 @@ struct DetectionResult {
     std::string level;                        // HIGH / MID / LOW / NONE
 };
 
+// ---------------- 关联规则命中结果（M6-3 Sigma correlation） ----------------
+
+struct CorrelationMatch {
+    std::string rule_id;
+    std::string name;
+    std::string group_by;                     // operator / object / asset_group
+    std::string group_key;                    // 命中分组键（操作员 ID / 对象 / 资产组名）
+    u64 window_start_us { 0 };                // 序列首事件时间（微秒）
+    u64 window_end_us { 0 };                  // 序列末事件时间（微秒）
+    std::vector<std::string> operator_ids;    // 序列涉及的操作员（去重）
+    std::vector<CleanEvent> events;           // 按时间升序的命中事件（证据链）
+};
+
 // ---------------- 纯逻辑函数（独立于 IO，便于单元测试） ----------------
 
 // 通配符匹配：支持 * 与 ?，大小写不敏感
@@ -158,6 +182,16 @@ bool any_keyword_hit(const std::vector<std::string>& keywords, const std::string
 
 // 规则操作子序列匹配：sequence 各步骤依次匹配 events（时间有序、允许跳过无关事件）
 bool is_subsequence(const std::vector<RuleStep>& sequence, const std::vector<CleanEvent>& events);
+
+// 关联规则分组键：按 rule.group_by 计算事件所属分组；无法分组时返回空串
+std::string correlation_group_key(const std::string& group_by, const CleanEvent& e,
+                                  const std::vector<AssetGroup>& groups);
+
+// Sigma correlation 匹配：按 group_by 分组、timespan_us 时间窗、sequence 有序序列匹配。
+//   events 需为事件集合（内部按微秒时间戳升序稳定排序）；
+//   命中后填充 out（含分组键、时间窗与证据事件），并校验 min_operator_cnt。
+bool match_correlation_rule(const Rule& rule, const std::vector<CleanEvent>& events,
+                            const std::vector<AssetGroup>& groups, CorrelationMatch& out);
 
 // res_key 归属资产组；未命中任何组返回空串
 std::string match_asset_group(const std::vector<AssetGroup>& groups, const std::string& res_key);
@@ -183,6 +217,13 @@ DetectionResult detect(const AggSet& set,
                        u64 now_epoch,
                        af::ml::OnnxModel* onnx_model = nullptr,
                        af::graph::BehaviorGraph* baseline_graph = nullptr);
+
+// 危害定级报告（M8）：把风险事件 JSONL 汇总为 Markdown 证据链报告。
+//   lines     : 风险事件行（collusion_events.jsonl）
+//   days      : 统计最近天数（<=0 表示全量）
+//   now_epoch : 当前 Unix 秒
+std::string build_incident_report_markdown(const std::vector<std::string>& lines,
+                                           int days, u64 now_epoch);
 
 // ---------------- 风险事件（存储/处置闭环模型） ----------------
 
@@ -214,6 +255,8 @@ public:
     // ---- 查询 / 处置 API（返回 JSON 文本） ----
     std::string overview_json();
     std::string events_json(const std::string& level, const std::string& status, std::size_t limit);
+    // 危害定级报告（M8）：Markdown 证据链聚合，days<=0 表示全量
+    std::string incident_report_markdown(int days);
     std::string event_detail_json(const std::string& event_id);
     std::string export_event_json(const std::string& event_id);   // 证据链导出
     bool dispose_event(const std::string& event_id, const std::string& status,
@@ -239,6 +282,10 @@ private:
     void maybe_reload_locked(u64 now_ms);         // 配置/规则热更新（带节流）
     void flush_due_locked(u64 now_ms);            // 冲刷到期窗口 → 检测 → 告警/存储
     void evaluate_locked(const AggSet& set);
+    // ---- M6-3 Sigma correlation 关联规则 ----
+    void evaluate_correlation_locked(const CleanEvent& e);      // 滚动缓冲内匹配跨事件序列
+    void prune_correlation_locked();                            // 按最大 timespan 与容量裁剪
+    void persist_risk_locked(const std::string& event_line, const std::string& level);
     void update_profile_locked(const AggSet& set);
     void save_profile_locked();
     void load_profile_locked();
@@ -260,6 +307,9 @@ private:
     std::map<std::string, AggSet> short_sets_;    // aggregate_key -> 集合
     std::map<std::string, AggSet> long_sets_;
     std::map<std::string, u64> last_alert_epoch_; // 告警降噪：aggregate_key -> 上次告警时间
+    // ---- M6-3：Sigma correlation 滚动事件缓冲与告警降噪 ----
+    std::deque<CleanEvent> corr_events_;          // 按接入顺序的最近事件（匹配时按微秒排序）
+    std::map<std::string, u64> last_corr_alert_ms_; // 降噪：rule_id|group -> 上次告警毫秒
 
     // ---- ML 异常检测（M3 措施3，ONNX 推理）----
     std::unique_ptr<af::ml::OnnxModel> onnx_if_;   // ONNX 模型实例（条件编译优雅降级）

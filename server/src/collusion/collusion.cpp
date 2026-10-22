@@ -258,6 +258,14 @@ std::string default_config_json() {
   "graph_enabled": false,
   "graph_threshold_pct": 30,
   "graph_max_factor": 25,
+  "graph_window_minutes": 15,
+  "graph_density_threshold_pct": 30,
+  "complementary_action_pairs": [
+    { "label": "备份破坏", "first": ["delete_backup", "delete", "remove", "rm", "删除", "删备份"],
+      "second": ["unmount", "diskpart", "format", "卸载", "磁盘"] },
+    { "label": "提权外泄", "first": ["grant", "privilege", "elevat", "提权", "授权"],
+      "second": ["export", "download", "dump", "导出", "下载"] }
+  ],
   "asset_groups": [
     { "name": "backup-group",    "patterns": ["*backup*", "*snapshot*", "*快照*", "*.bak", "*备份*"] },
     { "name": "key-mgmt-group",  "patterns": ["*key*", "*secret*", "*cert*", "*.pem", "*密钥*"] },
@@ -312,6 +320,20 @@ std::string default_rules_json() {
         { "any_of": ["role", "useradd", "创建角色", "创建用户", "new-user"] },
         { "any_of": ["member", "assign", "加入", "添加"] },
         { "any_of": ["admin", "sensitive", "exec", "敏感", "提权"] }
+      ] },
+    { "rule_id": "R-006", "name": "同一操作员导出后清除", "enabled": true,
+      "group_by": "operator", "timespan_us": 600000000,
+      "min_operator_cnt": 1, "base_score": 80,
+      "op_sequence": [
+        { "any_of": ["export", "download", "dump", "导出", "下载"] },
+        { "any_of": ["clear", "clean", "purge", "清除", "清空"] }
+      ] },
+    { "rule_id": "R-007", "name": "同对象提权后外泄", "enabled": true,
+      "group_by": "object", "timespan_us": 300000000,
+      "min_operator_cnt": 2, "base_score": 82,
+      "op_sequence": [
+        { "any_of": ["privilege", "elevat", "grant", "提权", "授权"] },
+        { "any_of": ["export", "download", "dump", "导出", "下载"] }
       ] }
   ]
 }
@@ -362,7 +384,18 @@ std::string config_to_json(const EngineConfig& c) {
       << "  \"graph_enabled\": " << (c.graph_enabled ? "true" : "false") << ",\n"
       << "  \"graph_threshold_pct\": " << static_cast<int>(c.graph_threshold * 100) << ",\n"
       << "  \"graph_max_factor\": " << c.graph_max_factor << ",\n"
-      << "  \"asset_groups\": [\n";
+      << "  \"graph_window_minutes\": " << (c.graph_window_us / 60000000ull) << ",\n"
+      << "  \"graph_density_threshold_pct\": " << static_cast<int>(c.graph_density_threshold * 100) << ",\n"
+      << "  \"complementary_action_pairs\": [\n";
+    for (std::size_t i = 0; i < c.complement_pairs.size(); ++i) {
+        const auto& p = c.complement_pairs[i];
+        o << "    { \"label\": \"" << json_escape(p.label)
+          << "\", \"first\": " << json_array_of_strings(p.first)
+          << ", \"second\": " << json_array_of_strings(p.second) << " }";
+        if (i + 1 < c.complement_pairs.size()) o << ",";
+        o << "\n";
+    }
+    o << "  ],\n  \"asset_groups\": [\n";
     for (std::size_t i = 0; i < c.asset_groups.size(); ++i) {
         o << "    { \"name\": \"" << json_escape(c.asset_groups[i].name)
           << "\", \"patterns\": " << patterns_json(c.asset_groups[i].patterns) << " }";
@@ -380,6 +413,18 @@ std::string config_to_json(const EngineConfig& c) {
     }
     o << "  ]\n}\n";
     return o.str();
+}
+
+std::vector<af::graph::ComplementPair> default_complement_pairs() {
+    af::graph::ComplementPair backup;
+    backup.label = "备份破坏";
+    backup.first = { "delete_backup", "delete", "remove", "rm", "删除", "删备份" };
+    backup.second = { "unmount", "diskpart", "format", "卸载", "磁盘" };
+    af::graph::ComplementPair leak;
+    leak.label = "提权外泄";
+    leak.first = { "grant", "privilege", "elevat", "提权", "授权" };
+    leak.second = { "export", "download", "dump", "导出", "下载" };
+    return { backup, leak };
 }
 
 EngineConfig config_from_json(const std::string& j) {
@@ -415,6 +460,23 @@ EngineConfig config_from_json(const std::string& j) {
     int g_pct = static_cast<int>(logpolicy::json_size_field(j, "graph_threshold_pct", 30));
     c.graph_threshold = std::min(std::max(g_pct, 0), 100) / 100.f;
     c.graph_max_factor = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "graph_max_factor", 25)), 0), 50);
+    // ---- 操作员合谋图谱配置（M7）----
+    u64 gwin_min = static_cast<u64>(logpolicy::json_size_field(j, "graph_window_minutes", 15));
+    gwin_min = std::min<u64>(std::max<u64>(gwin_min, 1), 120);
+    c.graph_window_us = gwin_min * 60000000ull;
+    int gd_pct = static_cast<int>(logpolicy::json_size_field(j, "graph_density_threshold_pct", 30));
+    c.graph_density_threshold = std::min(std::max(gd_pct, 0), 100) / 100.f;
+    if (j.find("\"complementary_action_pairs\"") == std::string::npos) {
+        c.complement_pairs = default_complement_pairs();   // 旧配置文件缺省时使用内置组合
+    } else {
+        for (const auto& rec : logpolicy::json_object_array_field(j, "complementary_action_pairs")) {
+            af::graph::ComplementPair p;
+            p.label = logpolicy::json_string_field(rec, "label");
+            p.first = logpolicy::json_string_array_field(rec, "first");
+            p.second = logpolicy::json_string_array_field(rec, "second");
+            if (!p.first.empty() && !p.second.empty()) c.complement_pairs.push_back(std::move(p));
+        }
+    }
     for (const auto& rec : logpolicy::json_object_array_field(j, "asset_groups")) {
         AssetGroup g;
         g.name = logpolicy::json_string_field(rec, "name");
@@ -442,8 +504,10 @@ std::string rules_to_json(const std::vector<Rule>& rules) {
           << "\", \"name\": \"" << json_escape(r.name)
           << "\", \"enabled\": " << (r.enabled ? "true" : "false")
           << ", \"asset_group\": \"" << json_escape(r.asset_group)
-          << "\", \"min_operator_cnt\": " << r.min_operator_cnt
+          << ", \"min_operator_cnt\": " << r.min_operator_cnt
           << ", \"base_score\": " << r.base_score
+          << ", \"group_by\": \"" << json_escape(r.group_by) << "\""
+          << ", \"timespan_us\": " << r.timespan_us
           << ",\n      \"op_sequence\": [\n";
         for (std::size_t k = 0; k < r.sequence.size(); ++k) {
             o << "        { \"any_of\": " << json_array_of_strings(r.sequence[k].any_of) << " }";
@@ -469,7 +533,18 @@ std::vector<Rule> rules_from_json(const std::string& j) {
         r.enabled = json_bool_field(rec, "enabled", true);
         r.asset_group = logpolicy::json_string_field(rec, "asset_group");
         if (r.asset_group.empty()) r.asset_group = "*";
-        r.min_operator_cnt = std::max(2, static_cast<int>(logpolicy::json_size_field(rec, "min_operator_cnt", 2)));
+        // Sigma correlation 扩展（M6-3）：分组维度与微秒时间窗
+        auto group_by = to_lower_copy(logpolicy::json_string_field(rec, "group_by"));
+        if (group_by == "operator" || group_by == "object" || group_by == "asset_group") {
+            r.group_by = group_by;
+        } else if (!group_by.empty() && group_by != "assetgroup") {
+            r.group_by = "asset_group";   // 未识别的分组维度回落到资产组（兼容旧规则文件）
+        }
+        r.timespan_us = static_cast<u64>(logpolicy::json_size_field(rec, "timespan_us", 0));
+        // 按操作员分组的序列是单人多事件，允许 min_operator_cnt=1；其余默认 2
+        int min_op_def = (r.group_by == "operator") ? 1 : 2;
+        r.min_operator_cnt = std::max(1, static_cast<int>(
+            logpolicy::json_size_field(rec, "min_operator_cnt", static_cast<std::size_t>(min_op_def))));
         r.base_score = std::min(std::max(static_cast<int>(logpolicy::json_size_field(rec, "base_score", 80)), 1), 100);
         for (const auto& step : logpolicy::json_object_array_field(rec, "op_sequence")) {
             RuleStep s;
@@ -557,6 +632,68 @@ bool is_subsequence(const std::vector<RuleStep>& sequence, const std::vector<Cle
     return si == sequence.size();
 }
 
+std::string correlation_group_key(const std::string& group_by, const CleanEvent& e,
+                                  const std::vector<AssetGroup>& groups) {
+    if (group_by == "operator") return e.oper_id;
+    if (group_by == "object") return e.res_key;
+    return match_asset_group(groups, e.res_key);   // asset_group（默认）
+}
+
+bool match_correlation_rule(const Rule& rule, const std::vector<CleanEvent>& events,
+                            const std::vector<AssetGroup>& groups, CorrelationMatch& out) {
+    if (rule.sequence.empty()) return false;
+    const std::string group_by = rule.group_by.empty() ? "asset_group" : rule.group_by;
+
+    // 按微秒时间戳升序稳定排序，保证“有序序列”语义（乱序接入/跨主机时钟偏差可容忍）
+    std::vector<CleanEvent> sorted = events;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const CleanEvent& a, const CleanEvent& b) {
+        u64 au = a.ts_us ? a.ts_us : a.ts_ms * 1000;
+        u64 bu = b.ts_us ? b.ts_us : b.ts_ms * 1000;
+        return au < bu;
+    });
+
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+        const std::string gk = correlation_group_key(group_by, sorted[i], groups);
+        if (gk.empty()) continue;
+        const u64 start_us = sorted[i].ts_us ? sorted[i].ts_us : sorted[i].ts_ms * 1000;
+        std::size_t si = 0;
+        std::vector<CleanEvent> matched;
+        for (std::size_t j = i; j < sorted.size() && si < rule.sequence.size(); ++j) {
+            if (correlation_group_key(group_by, sorted[j], groups) != gk) continue;
+            const u64 ts_us = sorted[j].ts_us ? sorted[j].ts_us : sorted[j].ts_ms * 1000;
+            // timespan 从序列首事件起算；超窗即停止（后续事件更晚，无需继续）
+            if (rule.timespan_us > 0 && ts_us > start_us + rule.timespan_us) break;
+            const std::string searchable = sorted[j].op_type + " " + sorted[j].res_key + " " +
+                                           sorted[j].op_param;
+            if (!any_keyword_hit(rule.sequence[si].any_of, searchable)) continue;
+            matched.push_back(sorted[j]);
+            ++si;
+        }
+        if (si < rule.sequence.size()) continue;
+
+        // 最少操作员数校验（跨操作员规则依赖此项；operator 分组通常为 1）
+        std::vector<std::string> ops;
+        for (const auto& m : matched) {
+            if (std::find(ops.begin(), ops.end(), m.oper_id) == ops.end()) ops.push_back(m.oper_id);
+        }
+        if (static_cast<int>(ops.size()) < rule.min_operator_cnt) continue;
+
+        out = CorrelationMatch{};
+        out.rule_id = rule.rule_id;
+        out.name = rule.name;
+        out.group_by = group_by;
+        out.group_key = gk;
+        out.operator_ids = std::move(ops);
+        out.events = std::move(matched);
+        out.window_start_us = out.events.front().ts_us ? out.events.front().ts_us
+                                                       : out.events.front().ts_ms * 1000;
+        out.window_end_us = out.events.back().ts_us ? out.events.back().ts_us
+                                                    : out.events.back().ts_ms * 1000;
+        return true;
+    }
+    return false;
+}
+
 std::string match_asset_group(const std::vector<AssetGroup>& groups, const std::string& res_key) {
     if (res_key.empty()) return {};
     for (const auto& g : groups) {
@@ -579,7 +716,13 @@ bool clean_event_json(const std::string& json, CleanEvent& out) {
     out.ts_ms = static_cast<u64>(logpolicy::json_size_field(json, "event_timestamp", 0));
     if (out.ts_ms == 0) out.ts_ms = static_cast<u64>(logpolicy::json_size_field(json, "client_ts", 0));
     if (out.ts_ms == 0) out.ts_ms = static_cast<u64>(logpolicy::json_size_field(json, "server_ts", 0));
+    // 微秒时间戳优先取显式字段，缺失时由毫秒换算（M6-3 timespan 口径统一为微秒）
+    out.ts_us = static_cast<u64>(logpolicy::json_size_field(json, "event_timestamp_us", 0));
+    if (out.ts_us == 0) out.ts_us = static_cast<u64>(logpolicy::json_size_field(json, "logged_time_us", 0));
+    if (out.ts_us == 0) out.ts_us = static_cast<u64>(logpolicy::json_size_field(json, "ts_micros", 0));
+    if (out.ts_ms == 0 && out.ts_us > 0) out.ts_ms = out.ts_us / 1000;
     if (out.ts_ms == 0) return false;
+    if (out.ts_us == 0) out.ts_us = out.ts_ms * 1000;
 
     out.server_id = logpolicy::json_string_field(json, "server_id");
     if (out.server_id.empty()) out.server_id = logpolicy::json_string_field(json, "host_id");
@@ -703,6 +846,9 @@ DetectionResult detect(const AggSet& set,
         int extra = 0;
         for (const auto& r : rules) {
             if (!r.enabled) continue;
+            // 按操作员/对象分组的 Sigma correlation 规则由关联引擎单独评估（M6-3），
+            // 避免与资产组聚合集合的检测重复计分。
+            if (r.group_by != "asset_group") continue;
             if (r.asset_group != "*" && r.asset_group != set.asset_group) continue;
             if (set.distinct_op_count() < r.min_operator_cnt) continue;
             if (!is_subsequence(r.sequence, set.events)) continue;
@@ -792,41 +938,30 @@ DetectionResult detect(const AggSet& set,
         res.ml_factor = std::min(res.ml_factor, cfg.ml_max_factor);
     }
 
-    // ---- 图算法异常检测引擎（M4 措施4，轻量级图算法替代 GNN，因子上限 graph_max_factor）----
-    //   设计约束：图分析仅提供线索因子，不直接触发 HIGH 风险（后续硬约束会钳制）
+    // ---- 操作员合谋图谱（M7：节点从主机升级为操作员）----
+    //   边：同对象共现 + 角色互补；稠密度作为 graph_factor 输入；
+    //   异常分量复用 M4 图算法；仅提供线索因子，不直接触发 HIGH 风险。
     if (cfg.graph_enabled) {
-        // 从聚合事件集合构建当前行为图：操作员→资产、操作员→操作类型 边
-        af::graph::BehaviorGraph cur;
+        std::vector<af::graph::OperatorEvent> oevents;
+        oevents.reserve(set.events.size());
         for (const auto& ev : set.events) {
-            auto op_id  = cur.add_node(af::graph::NodeType::Operator, ev.oper_id);
-            auto ast_id = cur.add_node(af::graph::NodeType::Asset, ev.server_id);
-            auto t_id   = cur.add_node(af::graph::NodeType::OpType, ev.op_type);
-            cur.add_edge(op_id, ast_id);
-            cur.add_edge(op_id, t_id);
+            af::graph::OperatorEvent oe;
+            oe.oper_id = ev.oper_id;
+            oe.ts_us = ev.ts_us ? ev.ts_us : ev.ts_ms * 1000;
+            oe.object_key = ev.res_key;
+            oe.action = ev.op_type;
+            oe.target_system = ev.server_id;
+            oevents.push_back(std::move(oe));
         }
-        // 与历史基线对比分析（baseline_graph 为空时仅做度/社区/三角形分析）
-        af::graph::BehaviorGraph empty_baseline;
-        const auto& baseline = baseline_graph ? *baseline_graph : empty_baseline;
-        auto analysis = cur.analyze(baseline);
+        af::graph::OperatorGraphConfig gcfg;
+        gcfg.window_us = cfg.graph_window_us;
+        gcfg.density_threshold = cfg.graph_density_threshold;
+        gcfg.max_factor = cfg.graph_max_factor;
+        gcfg.complement_pairs = cfg.complement_pairs;
 
-        // 任一异常分量超阈值即贡献 graph_factor（按分量加权和，受 graph_max_factor 上限约束）
-        float graph_score = analysis.degree_anomaly + analysis.community_anomaly +
-                            analysis.triangle_anomaly + analysis.similarity_anomaly;
-        if (graph_score > cfg.graph_threshold) {
-            int add = static_cast<int>(graph_score * static_cast<float>(cfg.graph_max_factor));
-            res.graph_factor += std::min(add, cfg.graph_max_factor);
-            res.graph_notes.push_back("图异常综合分=" + std::to_string(graph_score) +
-                                     "（度=" + std::to_string(analysis.degree_anomaly) +
-                                     " 社区=" + std::to_string(analysis.community_anomaly) +
-                                     " 三角=" + std::to_string(analysis.triangle_anomaly) +
-                                     " 相似=" + std::to_string(analysis.similarity_anomaly) + "）");
-        } else if (!analysis.notes.empty()) {
-            res.graph_notes.push_back("图异常分 " + std::to_string(graph_score) +
-                                     " 未超阈值，不计入因子");
-        }
-        // 追加线索描述
+        auto analysis = af::graph::analyze_operator_graph(oevents, gcfg, baseline_graph);
+        res.graph_factor = std::min(analysis.graph_factor, cfg.graph_max_factor);
         for (const auto& n : analysis.notes) res.graph_notes.push_back(n);
-        res.graph_factor = std::min(res.graph_factor, cfg.graph_max_factor);
     }
 
     // ---- 风险评分：total = 规则+画像+ML+图 - 有效工单扣减，收敛 0~100 ----
@@ -859,6 +994,12 @@ Engine::~Engine() = default;  // unique_ptr<OnnxModel> 在此析构（完整类�
 void Engine::start(const std::string& data_dir) {
     std::lock_guard<std::mutex> lk(mutex_);
     data_dir_ = data_dir.empty() ? "data" : data_dir;
+    // 重置内存缓冲与降噪状态：避免切换数据目录/重入时残留上一轮事件
+    short_sets_.clear();
+    long_sets_.clear();
+    corr_events_.clear();
+    last_alert_epoch_.clear();
+    last_corr_alert_ms_.clear();
     (void)fs::create_directories(collusion_dir(data_dir_));
     (void)fs::create_directories(policy_dir(data_dir_));
 
@@ -1021,51 +1162,9 @@ void Engine::ingest_json(const std::string& event_json) {
     CleanEvent e;
     if (!clean_event_json(event_json, e)) return;
     auto ag = match_asset_group(cfg_.asset_groups, e.res_key);
-    if (ag.empty()) return;   // 未纳入任何资产组的资源不参与合谋聚合
-
-    auto add = [&](std::map<std::string, AggSet>& m, const char* kind) {
-        u64 win = (std::string(kind) == "short") ? cfg_.short_window_ms : cfg_.long_window_ms;
-        u64 ws = e.ts_ms - (e.ts_ms % win);
-        std::string key = ag + "|" + std::to_string(ws) + "|" + std::to_string(ws + win) + "|" + kind;
-        auto& s = m[key];
-        if (s.operator_ids.empty()) {
-            s.aggregate_key = key;
-            s.asset_group = ag;
-            s.window_kind = kind;
-            s.window_start_ms = ws;
-            s.window_end_ms = ws + win;
-        }
-        if (std::find(s.operator_ids.begin(), s.operator_ids.end(), e.oper_id) == s.operator_ids.end())
-            s.operator_ids.push_back(e.oper_id);
-        if (!e.work_order_id.empty() &&
-            std::find(s.work_order_ids.begin(), s.work_order_ids.end(), e.work_order_id) == s.work_order_ids.end())
-            s.work_order_ids.push_back(e.work_order_id);
-        s.events.push_back(e);
-    };
-    add(short_sets_, "short");
-    add(long_sets_, "long");
-
-    flush_due_locked(now);
-}
-
-int Engine::ingest_native_json(const std::string& body) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (!started_ || !cfg_.enabled) return 0;
-    u64 now = now_ms();
-    maybe_reload_locked(now);
-
-    int accepted = 0;
-    auto objects = logpolicy::json_object_array_field(body, "events");
-    if (objects.empty()) {
-        // 单对象或数组直接按事件清洗（要求 oper_id 可解析）
-        CleanEvent probe;
-        if (clean_event_json(body, probe)) objects.push_back(body);
-    }
-    for (const auto& obj : objects) {
-        CleanEvent e;
-        if (!clean_event_json(obj, e)) continue;
-        auto ag = match_asset_group(cfg_.asset_groups, e.res_key);
-        if (ag.empty()) continue;
+    // 未纳入任何资产组的资源不参与资产组合谋聚合；
+    // 但仍进入 M6-3 关联规则缓冲（group_by=operator/object 不依赖资产组）。
+    if (!ag.empty()) {
         auto add = [&](std::map<std::string, AggSet>& m, const char* kind) {
             u64 win = (std::string(kind) == "short") ? cfg_.short_window_ms : cfg_.long_window_ms;
             u64 ws = e.ts_ms - (e.ts_ms % win);
@@ -1087,6 +1186,53 @@ int Engine::ingest_native_json(const std::string& body) {
         };
         add(short_sets_, "short");
         add(long_sets_, "long");
+    }
+    evaluate_correlation_locked(e);
+
+    flush_due_locked(now);
+}
+
+int Engine::ingest_native_json(const std::string& body) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (!started_ || !cfg_.enabled) return 0;
+    u64 now = now_ms();
+    maybe_reload_locked(now);
+
+    int accepted = 0;
+    auto objects = logpolicy::json_object_array_field(body, "events");
+    if (objects.empty()) {
+        // 单对象或数组直接按事件清洗（要求 oper_id 可解析）
+        CleanEvent probe;
+        if (clean_event_json(body, probe)) objects.push_back(body);
+    }
+    for (const auto& obj : objects) {
+        CleanEvent e;
+        if (!clean_event_json(obj, e)) continue;
+        auto ag = match_asset_group(cfg_.asset_groups, e.res_key);
+        if (!ag.empty()) {
+            auto add = [&](std::map<std::string, AggSet>& m, const char* kind) {
+                u64 win = (std::string(kind) == "short") ? cfg_.short_window_ms : cfg_.long_window_ms;
+                u64 ws = e.ts_ms - (e.ts_ms % win);
+                std::string key = ag + "|" + std::to_string(ws) + "|" + std::to_string(ws + win) + "|" + kind;
+                auto& s = m[key];
+                if (s.operator_ids.empty()) {
+                    s.aggregate_key = key;
+                    s.asset_group = ag;
+                    s.window_kind = kind;
+                    s.window_start_ms = ws;
+                    s.window_end_ms = ws + win;
+                }
+                if (std::find(s.operator_ids.begin(), s.operator_ids.end(), e.oper_id) == s.operator_ids.end())
+                    s.operator_ids.push_back(e.oper_id);
+                if (!e.work_order_id.empty() &&
+                    std::find(s.work_order_ids.begin(), s.work_order_ids.end(), e.work_order_id) == s.work_order_ids.end())
+                    s.work_order_ids.push_back(e.work_order_id);
+                s.events.push_back(e);
+            };
+            add(short_sets_, "short");
+            add(long_sets_, "long");
+        }
+        evaluate_correlation_locked(e);
         ++accepted;
     }
     flush_due_locked(now);
@@ -1110,6 +1256,209 @@ void Engine::flush_due_locked(u64 now) {
         save_profile_locked();      // 画像周期性落盘（至少每分钟一次）
         profile_dirty_ = false;
         profile_save_ms_ = now;
+    }
+}
+
+void Engine::prune_correlation_locked() {
+    constexpr std::size_t kMaxCorrEvents = 4096;
+    if (corr_events_.size() > kMaxCorrEvents) {
+        corr_events_.erase(corr_events_.begin(),
+                          corr_events_.begin() + static_cast<std::ptrdiff_t>(
+                              corr_events_.size() - kMaxCorrEvents));
+    }
+    // 以所有启用关联规则的最大 timespan 作为缓冲保留上界
+    u64 max_span = 0;
+    for (const auto& r : rules_) {
+        if (r.enabled && r.group_by != "asset_group" && r.timespan_us > max_span)
+            max_span = r.timespan_us;
+    }
+    // 降噪表容量保护：超过上限时清理已过降噪窗口的条目，避免分组键无限累积
+    if (last_corr_alert_ms_.size() > 4096) {
+        u64 now_ms_v = now_ms();
+        for (auto it = last_corr_alert_ms_.begin(); it != last_corr_alert_ms_.end();) {
+            if (now_ms_v >= it->second + cfg_.alert_dedup_seconds * 1000) it = last_corr_alert_ms_.erase(it);
+            else ++it;
+        }
+    }
+    if (max_span == 0 || corr_events_.empty()) return;   // 0 = 不限，仅受容量上限约束
+    u64 newest = 0;
+    for (const auto& e : corr_events_) {
+        u64 ts = e.ts_us ? e.ts_us : e.ts_ms * 1000;
+        if (ts > newest) newest = ts;
+    }
+    while (!corr_events_.empty()) {
+        const auto& f = corr_events_.front();
+        u64 ts = f.ts_us ? f.ts_us : f.ts_ms * 1000;
+        if (newest <= ts + max_span) break;
+        corr_events_.pop_front();
+    }
+}
+
+void Engine::evaluate_correlation_locked(const CleanEvent& e) {
+    corr_events_.push_back(e);
+    prune_correlation_locked();
+
+    std::vector<const Rule*> active;
+    for (const auto& r : rules_) {
+        if (r.enabled && r.group_by != "asset_group") active.push_back(&r);
+    }
+    if (active.empty()) return;
+
+    std::vector<CleanEvent> events(corr_events_.begin(), corr_events_.end());
+    u64 now_ep = now_epoch();
+    u64 now_ms_v = now_ms();
+    bool emergency_active = cfg_.emergency_mode &&
+        (cfg_.emergency_until_epoch == 0 || now_ep <= cfg_.emergency_until_epoch);
+
+    for (const Rule* rule : active) {
+        CorrelationMatch m;
+        if (!match_correlation_rule(*rule, events, cfg_.asset_groups, m)) continue;
+
+        // 告警降噪：同一规则 + 同一分组在降噪窗口内只落一条风险事件
+        std::string dedup_key = "corr|" + rule->rule_id + "|" + m.group_by + "|" + m.group_key;
+        auto last_it = last_corr_alert_ms_.find(dedup_key);
+        if (last_it != last_corr_alert_ms_.end() &&
+            now_ms_v < last_it->second + cfg_.alert_dedup_seconds * 1000) {
+            continue;
+        }
+        last_corr_alert_ms_[dedup_key] = now_ms_v;
+
+        // 规则命中直接驱动危害定级（基础分按阈值映射等级）
+        int score = rule->base_score;
+        std::string level = score >= cfg_.score_high ? "HIGH"
+                          : (score >= cfg_.score_mid ? "MID" : "LOW");
+        std::vector<std::string> notes;
+        notes.push_back("Sigma 关联规则命中：group_by=" + m.group_by + " group=" + m.group_key);
+        notes.push_back("timespan_us=" + std::to_string(rule->timespan_us) +
+                        "（实际跨度 " + std::to_string(m.window_end_us - m.window_start_us) + "us）");
+        notes.push_back("有序序列步数=" + std::to_string(rule->sequence.size()) +
+                        "，涉及操作员数=" + std::to_string(m.operator_ids.size()));
+        if (emergency_active && level != "LOW") {
+            level = (level == "HIGH") ? "MID" : "LOW";
+            notes.push_back("应急运维模式生效：等级自动降一级");
+        }
+
+        std::string event_id = "ce-" + crypto::random_hex(8);
+        std::string alert_id = "alert-" + crypto::random_hex(8);
+        std::string created_iso = iso_time_epoch(now_ep);
+        std::string asset_group = match_asset_group(cfg_.asset_groups, m.events.front().res_key);
+        std::vector<std::string> matched_rules = { rule->rule_id + " " + rule->name };
+        std::vector<std::string> work_order_ids;
+        for (const auto& ev : m.events) {
+            if (ev.work_order_id.empty()) continue;
+            if (std::find(work_order_ids.begin(), work_order_ids.end(), ev.work_order_id) ==
+                work_order_ids.end()) {
+                work_order_ids.push_back(ev.work_order_id);
+            }
+        }
+
+        // 与资产组聚合风险事件保持同一存储结构，复用事件查询/处置/报表接口
+        std::ostringstream ev;
+        ev << "{"
+           << "\"event_id\": \"" << event_id << "\","
+           << "\"alert_id\": \"" << alert_id << "\","
+           << "\"created_at\": \"" << created_iso << "\","
+           << "\"created_epoch\": " << now_ep << ","
+           << "\"window_kind\": \"correlation\","
+           << "\"asset_group\": \"" << json_escape(asset_group) << "\","
+           << "\"aggregate_key\": \"" << json_escape(dedup_key) << "\","
+           << "\"group_by\": \"" << json_escape(m.group_by) << "\","
+           << "\"group_key\": \"" << json_escape(m.group_key) << "\","
+           << "\"window_start\": \"" << iso_time_ms(m.window_start_us / 1000) << "\","
+           << "\"window_end\": \"" << iso_time_ms(m.window_end_us / 1000) << "\","
+           << "\"window_span_us\": " << (m.window_end_us - m.window_start_us) << ","
+           << "\"risk_level\": \"" << level << "\","
+           << "\"risk_score\": " << score << ","
+           << "\"rule_factor\": " << score << ","
+           << "\"profile_factor\": 0,"
+           << "\"ml_factor\": 0,"
+           << "\"graph_factor\": 0,"
+           << "\"matched_rules\": " << json_array_of_strings(matched_rules) << ","
+           << "\"operators\": " << json_array_of_strings(m.operator_ids) << ","
+           << "\"operator_count\": " << m.operator_ids.size() << ","
+           << "\"work_order_ids\": " << json_array_of_strings(work_order_ids) << ","
+           << "\"profile_notes\": [],"
+           << "\"ml_notes\": [],"
+           << "\"graph_notes\": [],"
+           << "\"score_notes\": " << json_array_of_strings(notes) << ","
+           << "\"dispose\": { \"status\": \"待复核\", \"disposer\": \"\", \"note\": \"\", \"time\": \"\" },"
+           << "\"evidence_timeline\": [";
+        for (std::size_t i = 0; i < m.events.size(); ++i) {
+            const auto& ce = m.events[i];
+            ev << "{ \"ts\": \"" << iso_time_ms(ce.ts_us / 1000) << "\", \"ts_ms\": " << ce.ts_ms
+               << ", \"ts_us\": " << ce.ts_us
+               << ", \"oper_id\": \"" << json_escape(ce.oper_id)
+               << "\", \"server_id\": \"" << json_escape(ce.server_id)
+               << "\", \"op_type\": \"" << json_escape(ce.op_type)
+               << "\", \"res_key\": \"" << json_escape(ce.res_key)
+               << "\", \"op_param\": \"" << json_escape(ce.op_param) << "\" }";
+            if (i + 1 < m.events.size()) ev << ",";
+        }
+        ev << "]}";
+        persist_risk_locked(ev.str(), level);
+
+        // 平台告警（HIGH/MID 推送；LOW 仅留线索）
+        if (level == "HIGH" || level == "MID") {
+            std::string host = m.events.empty() ? "collusion" : m.events.front().server_id;
+            std::string severity = level == "HIGH" ? "critical" : "warning";
+            std::ostringstream msg;
+            msg << "关联规则" << (level == "HIGH" ? "高风险" : "中风险") << "事件 "
+                << level << "(" << score << "分) 规则=" << rule->rule_id << " "
+                << rule->name << " 分组=" << m.group_by << ":" << m.group_key
+                << " 操作员数=" << m.operator_ids.size();
+            std::ostringstream evidence;
+            evidence << "{\"event_id\":\"" << event_id << "\",\"group_by\":\""
+                     << json_escape(m.group_by) << "\",\"group_key\":\""
+                     << json_escape(m.group_key) << "\",\"operators\":"
+                     << json_array_of_strings(m.operator_ids) << ",\"matched_rules\":"
+                     << json_array_of_strings(matched_rules) << ",\"window\":\""
+                     << iso_time_ms(m.window_start_us / 1000) << "~"
+                     << iso_time_ms(m.window_end_us / 1000) << "\"}";
+            std::ostringstream aline;
+            aline << "{"
+                  << "\"alert_id\":\"" << alert_id << "\","
+                  << "\"timestamp\":\"" << created_iso << "\","
+                  << "\"host_id\":\"" << json_escape(host) << "\","
+                  << "\"source\":\"collusion\","
+                  << "\"severity\":\"" << severity << "\","
+                  << "\"rule_id\":\"" << json_escape(rule->rule_id + " " + rule->name) << "\","
+                  << "\"message\":\"" << json_escape(msg.str()) << "\","
+                  << "\"evidence\":\"" << json_escape(evidence.str()) << "\","
+                  << "\"status\":\"open\""
+                  << "}";
+            auto adir = fs::join(data_dir_.empty() ? "data" : data_dir_, "alerts");
+            (void)fs::create_directories(adir);
+            std::ofstream aout(fs::join(adir, host + ".jsonl"), std::ios::binary | std::ios::app);
+            if (aout) aout << aline.str() << "\n";
+            AF_LOG_WARN("collusion: " << msg.str() << " event_id=" << event_id);
+        } else {
+            AF_LOG_INFO("collusion: 关联规则低风险线索 event_id=" << event_id
+                        << " 规则=" << rule->rule_id);
+        }
+    }
+}
+
+void Engine::persist_risk_locked(const std::string& event_line, const std::string& level) {
+    // 存储分层：中高风险 180 天、低风险 90 天（按 created_epoch 秒过滤），行数上限保护
+    (void)fs::create_directories(collusion_dir(data_dir_));   // ofstream 不会自动建目录
+    auto lines = read_jsonl(events_path(data_dir_));
+    u64 now_ep = now_epoch();
+    u64 keep_sec = (level == "LOW") ? 90ull * 86400 : 180ull * 86400;
+    u64 cutoff_epoch = now_ep >= keep_sec ? now_ep - keep_sec : 0;
+    std::vector<std::string> kept;
+    kept.reserve(lines.size() + 1);
+    for (const auto& l : lines) {
+        u64 ce = static_cast<u64>(logpolicy::json_size_field(l, "created_epoch", 0));
+        if (ce < cutoff_epoch) continue;   // 超过保存周期的历史事件清除
+        kept.push_back(l);
+    }
+    kept.push_back(event_line);
+    if (kept.size() > kMaxStoredEvents) {
+        kept.erase(kept.begin(), kept.begin() + static_cast<std::ptrdiff_t>(kept.size() - kMaxStoredEvents));
+    }
+    std::ofstream out(events_path(data_dir_), std::ios::binary | std::ios::trunc);
+    if (out) {
+        for (const auto& l : kept) out << l << "\n";
     }
 }
 
@@ -1212,28 +1561,7 @@ void Engine::evaluate_locked(const AggSet& set) {
     }
     ev << "]}";
 
-    // 存储分层：中高风险 180 天、低风险 90 天（按 created_epoch 秒过滤），行数上限保护
-    (void)fs::create_directories(collusion_dir(data_dir_));   // 确保 JSONL 存储目录存在（ofstream 不会自动建目录）
-    auto lines = read_jsonl(events_path(data_dir_));
-    u64 keep_sec = (res.level == "LOW") ? 90ull * 86400 : 180ull * 86400;
-    u64 cutoff_epoch = now_ep >= keep_sec ? now_ep - keep_sec : 0;
-    std::vector<std::string> kept;
-    kept.reserve(lines.size() + 1);
-    for (const auto& l : lines) {
-        u64 ce = static_cast<u64>(logpolicy::json_size_field(l, "created_epoch", 0));
-        if (ce < cutoff_epoch) continue;   // 超过保存周期的历史事件清除
-        kept.push_back(l);
-    }
-    kept.push_back(ev.str());
-    if (kept.size() > kMaxStoredEvents) {
-        kept.erase(kept.begin(), kept.begin() + static_cast<std::ptrdiff_t>(kept.size() - kMaxStoredEvents));
-    }
-    {
-        std::ofstream out(events_path(data_dir_), std::ios::binary | std::ios::trunc);
-        if (out) {
-            for (const auto& l : kept) out << l << "\n";
-        }
-    }
+    persist_risk_locked(ev.str(), res.level);
 
     // 平台告警（复用现有 alerts/<host>.jsonl，可在“日志与告警”面板查看）：
     // HIGH/MID 推送；LOW 仅留存线索，不推送。
@@ -1579,6 +1907,203 @@ std::string Engine::report_json(int days) {
     }
     o << " }\n}";
     return o.str();
+}
+
+namespace {
+
+std::string md_cell(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 4);
+    for (char c : text) {
+        if (c == '|') out += "\\|";
+        else if (c == '\n' || c == '\r') out.push_back(' ');
+        else out.push_back(c);
+    }
+    return out;
+}
+
+int level_rank(const std::string& level) {
+    if (level == "HIGH") return 3;
+    if (level == "MID") return 2;
+    if (level == "LOW") return 1;
+    return 0;
+}
+
+std::string join_text(const std::vector<std::string>& values, const char* sep) {
+    std::string out;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i) out += sep;
+        out += values[i];
+    }
+    return out;
+}
+
+struct ReportEvent {
+    std::string line;
+    std::string event_id;
+    std::string rule;
+    std::string level;
+    int         score { 0 };
+    int         rule_factor { 0 };
+    int         profile_factor { 0 };
+    int         ml_factor { 0 };
+    int         graph_factor { 0 };
+};
+
+}  // namespace
+
+std::string build_incident_report_markdown(const std::vector<std::string>& lines,
+                                           int days, u64 now_epoch) {
+    const u64 keep_sec = days > 0 ? static_cast<u64>(days) * 86400ull : 0;
+    const u64 cutoff = (keep_sec > 0 && now_epoch > keep_sec) ? now_epoch - keep_sec : 0;
+
+    std::vector<ReportEvent> events;
+    int count_high = 0, count_mid = 0, count_low = 0, count_other = 0;
+    for (const auto& line : lines) {
+        if (line.find('{') == std::string::npos) continue;
+        const u64 created = static_cast<u64>(logpolicy::json_size_field(line, "created_epoch", 0));
+        if (cutoff > 0 && created > 0 && created < cutoff) continue;
+
+        ReportEvent ev;
+        ev.line = line;
+        ev.event_id = logpolicy::json_string_field(line, "event_id");
+        ev.level = logpolicy::json_string_field(line, "risk_level");
+        ev.score = static_cast<int>(logpolicy::json_size_field(line, "risk_score", 0));
+        ev.rule_factor = static_cast<int>(logpolicy::json_size_field(line, "rule_factor", 0));
+        ev.profile_factor = static_cast<int>(logpolicy::json_size_field(line, "profile_factor", 0));
+        ev.ml_factor = static_cast<int>(logpolicy::json_size_field(line, "ml_factor", 0));
+        ev.graph_factor = static_cast<int>(logpolicy::json_size_field(line, "graph_factor", 0));
+        auto rules = logpolicy::json_string_array_field(line, "matched_rules");
+        ev.rule = rules.empty() ? "未命中规则" : rules.front();
+        if (ev.level == "HIGH") ++count_high;
+        else if (ev.level == "MID") ++count_mid;
+        else if (ev.level == "LOW") ++count_low;
+        else ++count_other;
+        events.push_back(std::move(ev));
+    }
+
+    // 规则分组：按规则编号聚合，组内按评分降序
+    std::map<std::string, std::vector<const ReportEvent*>> by_rule;
+    for (const auto& ev : events) by_rule[ev.rule].push_back(&ev);
+    for (auto& kv : by_rule) {
+        std::stable_sort(kv.second.begin(), kv.second.end(),
+                         [](const ReportEvent* a, const ReportEvent* b) {
+                             if (a->score != b->score) return a->score > b->score;
+                             return a->event_id < b->event_id;
+                         });
+    }
+
+    std::ostringstream o;
+    o << "# 合谋危害定级报告\n\n";
+    o << "- 生成时间：" << iso_time_epoch(now_epoch) << "\n";
+    if (days > 0) {
+        o << "- 统计区间：最近 " << days << " 天";
+        if (cutoff > 0) o << "（自 " << iso_time_epoch(cutoff) << " 起）";
+        o << "\n";
+    } else {
+        o << "- 统计区间：全量\n";
+    }
+    o << "- 风险事件总数：" << events.size()
+      << "（HIGH=" << count_high << " / MID=" << count_mid
+      << " / LOW=" << count_low << " / 其他=" << count_other << "）\n";
+    o << "- 涉及规则数：" << by_rule.size() << "\n\n";
+
+    if (events.empty()) {
+        o << "> 统计区间内暂无可定级的合谋风险事件。\n";
+        return o.str();
+    }
+
+    o << "## 规则汇总\n\n";
+    o << "| 规则 | 命中次数 | 最高等级 | 最高评分 |\n";
+    o << "|------|----------|----------|----------|\n";
+    for (const auto& kv : by_rule) {
+        std::string top_level;
+        int top_score = 0;
+        int top_rank = 0;
+        for (const auto* ev : kv.second) {
+            const int rank = level_rank(ev->level);
+            if (rank > top_rank || (rank == top_rank && ev->score > top_score)) {
+                top_rank = rank;
+                top_level = ev->level;
+                top_score = ev->score;
+            }
+        }
+        o << "| " << md_cell(kv.first) << " | " << kv.second.size() << " | "
+          << (top_level.empty() ? "-" : md_cell(top_level)) << " | " << top_score << " |\n";
+    }
+    o << "\n";
+
+    constexpr std::size_t kMaxEventsPerRule = 20;
+    for (const auto& kv : by_rule) {
+        o << "## 规则 " << md_cell(kv.first) << "\n\n";
+        o << "- 命中次数：" << kv.second.size() << "\n\n";
+        std::size_t shown = 0;
+        for (const auto* ev : kv.second) {
+            if (shown >= kMaxEventsPerRule) break;
+            ++shown;
+            const auto& line = ev->line;
+            const auto operators = logpolicy::json_string_array_field(line, "operators");
+            const auto score_notes = logpolicy::json_string_array_field(line, "score_notes");
+            const auto graph_notes = logpolicy::json_string_array_field(line, "graph_notes");
+            const auto matched_rules = logpolicy::json_string_array_field(line, "matched_rules");
+            const std::string asset_group = logpolicy::json_string_field(line, "asset_group");
+            const std::string group_by = logpolicy::json_string_field(line, "group_by");
+            const std::string group_key = logpolicy::json_string_field(line, "group_key");
+            const std::string window_start = logpolicy::json_string_field(line, "window_start");
+            const std::string window_end = logpolicy::json_string_field(line, "window_end");
+            const u64 span_us = static_cast<u64>(logpolicy::json_size_field(line, "window_span_us", 0));
+
+            o << "### 事件 " << md_cell(ev->event_id) << "（"
+              << (ev->level.empty() ? "未分级" : md_cell(ev->level)) << " / "
+              << ev->score << " 分）\n\n";
+            o << "- 证据规则：" << md_cell(join_text(matched_rules, "；")) << "\n";
+            o << "- 涉及操作员：" << (operators.empty() ? "-" : md_cell(join_text(operators, ", ")))
+              << "（" << operators.size() << " 人）\n";
+            o << "- 资产组：" << (asset_group.empty() ? "-" : md_cell(asset_group));
+            if (!group_by.empty()) {
+                o << "；分组维度：" << md_cell(group_by) << "，分组键：" << md_cell(group_key);
+            }
+            o << "\n";
+            if (!window_start.empty() || !window_end.empty()) {
+                o << "- 时间窗：" << md_cell(window_start) << " ~ " << md_cell(window_end);
+                if (span_us > 0) o << "（跨度 " << span_us << " us）";
+                o << "\n";
+            }
+            o << "- 评分构成：规则 " << ev->rule_factor << " / 画像 " << ev->profile_factor
+              << " / ML " << ev->ml_factor << " / 图 " << ev->graph_factor << "\n";
+            if (!score_notes.empty()) {
+                o << "- 评分说明：" << md_cell(join_text(score_notes, "；")) << "\n";
+            }
+            if (!graph_notes.empty()) {
+                o << "- 图谱指标：" << md_cell(join_text(graph_notes, "；")) << "\n";
+            }
+            const auto timeline = logpolicy::json_object_array_field(line, "evidence_timeline");
+            if (!timeline.empty()) {
+                o << "\n| 时间 | 操作员 | 主机 | 动作 | 对象 | 参数 |\n";
+                o << "|------|--------|------|------|------|------|\n";
+                for (const auto& item : timeline) {
+                    o << "| " << md_cell(logpolicy::json_string_field(item, "ts"))
+                      << " | " << md_cell(logpolicy::json_string_field(item, "oper_id"))
+                      << " | " << md_cell(logpolicy::json_string_field(item, "server_id"))
+                      << " | " << md_cell(logpolicy::json_string_field(item, "op_type"))
+                      << " | " << md_cell(logpolicy::json_string_field(item, "res_key"))
+                      << " | " << md_cell(logpolicy::json_string_field(item, "op_param"))
+                      << " |\n";
+                }
+            }
+            o << "\n";
+        }
+        if (kv.second.size() > kMaxEventsPerRule) {
+            o << "> 该规则仅展示评分最高的 " << kMaxEventsPerRule << " 条，共 "
+              << kv.second.size() << " 条。\n\n";
+        }
+    }
+    return o.str();
+}
+
+std::string Engine::incident_report_markdown(int days) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return build_incident_report_markdown(read_jsonl(events_path(data_dir_)), days, now_epoch());
 }
 
 }  // namespace af::collusion

@@ -42,6 +42,9 @@
 // M4: 轻量级图算法
 #include "auditforwarder/behavior_graph.h"
 
+// M8: 多操作员行为模拟器与危害定级报告
+#include "auditforwarder/simulator.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -813,6 +816,356 @@ void test_collusion_detect_scoring() {
     AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(1));
     AF_EXPECT_EQ(r.total_score, 94);
     AF_EXPECT_EQ(r.level, std::string("HIGH"));
+}
+
+void test_collusion_correlation_rules() {
+    using namespace af::collusion;
+    AF_LOG_INFO("=== test_collusion_correlation_rules ===");
+    std::vector<AssetGroup> groups = {
+        {"backup-group", {"*backup*", "*snapshot*"}},
+        {"db-group", {"*.sql", "*mysql*"}},
+    };
+
+    // group_by=operator：同一操作员跨事件有序序列（微秒时间窗内命中）
+    Rule by_op;
+    by_op.rule_id = "R-900";
+    by_op.name = "导出后清除";
+    by_op.group_by = "operator";
+    by_op.timespan_us = 600000000;   // 10 分钟
+    by_op.min_operator_cnt = 1;
+    by_op.base_score = 80;
+    by_op.sequence = { {{"export"}}, {{"clear"}} };
+
+    CleanEvent e1;
+    e1.oper_id = "opA"; e1.ts_us = 1000000000ULL; e1.ts_ms = 1000000;
+    e1.server_id = "s1"; e1.op_type = "file/export"; e1.res_key = "report.csv";
+    CleanEvent e2 = e1;
+    e2.ts_us = e1.ts_us + 120000000ULL;   // +120 秒
+    e2.ts_ms = e1.ts_ms + 120000; e2.op_type = "file/clear";
+    CorrelationMatch m;
+    AF_EXPECT(match_correlation_rule(by_op, {e1, e2}, groups, m));
+    AF_EXPECT_EQ(m.group_key, std::string("opA"));
+    AF_EXPECT_EQ(m.operator_ids.size(), std::size_t(1));
+    AF_EXPECT_EQ(m.window_end_us - m.window_start_us, 120000000ULL);
+
+    // 超出 timespan：不命中
+    CleanEvent e3 = e2;
+    e3.ts_us = e1.ts_us + by_op.timespan_us + 1;   // 窗口外 1 微秒
+    e3.ts_ms = e3.ts_us / 1000;
+    AF_EXPECT(!match_correlation_rule(by_op, {e1, e3}, groups, m));
+
+    // 顺序颠倒：不命中（clear 早于 export，有序序列语义）
+    CleanEvent e_early_clear = e1;
+    e_early_clear.op_type = "file/clear";
+    CleanEvent e_late_export = e1;
+    e_late_export.op_type = "file/export";
+    e_late_export.ts_us = e1.ts_us + 1000000ULL;
+    e_late_export.ts_ms = e_late_export.ts_us / 1000;
+    AF_EXPECT(!match_correlation_rule(by_op, {e_early_clear, e_late_export}, groups, m));
+
+    // 分组隔离：不同操作员的事件不组装到同一序列
+    CleanEvent e4 = e2;
+    e4.oper_id = "opB";
+    AF_EXPECT(!match_correlation_rule(by_op, {e1, e4}, groups, m));
+
+    // group_by=object：同一对象上的跨操作员序列（min_operator_cnt=2）
+    Rule by_obj = by_op;
+    by_obj.rule_id = "R-901";
+    by_obj.group_by = "object";
+    by_obj.timespan_us = 300000000;   // 5 分钟
+    by_obj.min_operator_cnt = 2;
+    by_obj.sequence = { {{"grant"}}, {{"export"}} };
+    CleanEvent o1 = e1;
+    o1.op_type = "db/grant";
+    CleanEvent o2 = o1;
+    o2.oper_id = "opB";
+    o2.ts_us = o1.ts_us + 60000000ULL;
+    o2.ts_ms = o1.ts_ms + 60000;
+    o2.op_type = "db/export";
+    AF_EXPECT(match_correlation_rule(by_obj, {o1, o2}, groups, m));
+    AF_EXPECT_EQ(m.group_key, std::string("report.csv"));
+    AF_EXPECT_EQ(m.operator_ids.size(), std::size_t(2));
+    // 不同对象：不命中
+    CleanEvent o3 = o2;
+    o3.res_key = "other.csv";
+    AF_EXPECT(!match_correlation_rule(by_obj, {o1, o3}, groups, m));
+
+    // 清洗：微秒字段优先，缺失时由毫秒换算
+    CleanEvent ce;
+    AF_EXPECT(clean_event_json(
+        R"({"oper_id":"opA","logged_time_us":1789700000123456,"server_id":"s1",)"
+        R"("op_type":"delete","res_key":"db.bak","return_code":0})", ce));
+    AF_EXPECT_EQ(ce.ts_us, 1789700000123456ULL);
+    AF_EXPECT_EQ(ce.ts_ms, 1789700000123ULL);
+    AF_EXPECT(clean_event_json(
+        R"({"actor":"opB","client_ts":1789700001000,"host_id":"s1",)"
+        R"("operation_type":"file","event_type":"delete","target":"a.bak"})", ce));
+    AF_EXPECT_EQ(ce.ts_us, 1789700001000000ULL);
+
+    // 资产组分组的旧行为保持不变（默认 group_by）
+    Rule legacy = by_op;
+    legacy.group_by = "asset_group";
+    legacy.min_operator_cnt = 2;
+    legacy.sequence = { {{"delete"}}, {{"snapshot"}} };
+    CleanEvent l1 = e1;  l1.op_type = "file/delete"; l1.res_key = "db_backup.bak";
+    CleanEvent l2 = e2;  l2.oper_id = "opB"; l2.op_type = "snapshot"; l2.res_key = "snapshot_1";
+    AF_EXPECT(match_correlation_rule(legacy, {l1, l2}, groups, m));
+    AF_EXPECT_EQ(m.group_key, std::string("backup-group"));
+}
+
+void test_collusion_correlation_engine() {
+    using namespace af;
+    using namespace af::collusion;
+    AF_LOG_INFO("=== test_collusion_correlation_engine ===");
+    auto dir = fs::join(fs::temp_directory(), "af_corr_test_" + crypto::random_hex(4));
+    auto policy = fs::join(dir, "policies");
+    (void)fs::create_directories(policy);
+    // 预置仅含关联规则的规则文件：验证 group_by/timespan_us 解析与热加载文件通道
+    const std::string rules = R"({
+  "rules": [
+    { "rule_id": "R-900", "name": "测试关联规则", "enabled": true,
+      "group_by": "operator", "timespan_us": 600000000,
+      "min_operator_cnt": 1, "base_score": 80,
+      "op_sequence": [ { "any_of": ["export"] }, { "any_of": ["clear"] } ] }
+  ]
+})";
+    {
+        std::ofstream out(fs::join(policy, "collusion_rules.json"), std::ios::binary);
+        out << rules;
+    }
+    {
+        Engine::instance().start(dir);
+        auto loaded = Engine::instance().rules_json();
+        AF_EXPECT(loaded.find("R-900") != std::string::npos);
+        AF_EXPECT(loaded.find("\"group_by\": \"operator\"") != std::string::npos);
+        AF_EXPECT(loaded.find("\"timespan_us\": 600000000") != std::string::npos);
+
+        u64 base = 1789700000000000ULL;
+        std::ostringstream b1;
+        b1 << R"({"oper_id":"opZ","event_timestamp_us":)" << base
+           << R"(,"server_id":"srv-1","op_type":"file/export","res_key":"report.csv","return_code":0})";
+        AF_EXPECT_EQ(Engine::instance().ingest_native_json(b1.str()), 1);
+        // 首事件未构成完整序列
+        AF_EXPECT(Engine::instance().events_json("HIGH", "", 10).find("R-900") == std::string::npos);
+
+        std::ostringstream b2;
+        b2 << R"({"oper_id":"opZ","event_timestamp_us":)" << (base + 1000000ULL)
+           << R"(,"server_id":"srv-1","op_type":"file/clear","res_key":"report.csv","return_code":0})";
+        AF_EXPECT_EQ(Engine::instance().ingest_native_json(b2.str()), 1);
+
+        auto high = Engine::instance().events_json("HIGH", "", 10);
+        AF_EXPECT(high.find("R-900") != std::string::npos);
+        AF_EXPECT(high.find("opZ") != std::string::npos);
+        AF_EXPECT(high.find("\"group_by\": \"operator\"") != std::string::npos);
+        AF_EXPECT(high.find("\"window_span_us\": 1000000") != std::string::npos);
+        // 再接入一条同样满足序列的事件：降噪窗口内该分组不重复落风险事件
+        std::ostringstream b3;
+        b3 << R"({"oper_id":"opZ","event_timestamp_us":)" << (base + 2000000ULL)
+           << R"(,"server_id":"srv-1","op_type":"file/clear","res_key":"report.csv","return_code":0})";
+        AF_EXPECT_EQ(Engine::instance().ingest_native_json(b3.str()), 1);
+        auto high2 = Engine::instance().events_json("HIGH", "", 10);
+        std::size_t hits = 0;
+        for (std::size_t p = high2.find("\"event_id\": \"ce-"); p != std::string::npos;
+             p = high2.find("\"event_id\": \"ce-", p + 1)) {
+            ++hits;
+        }
+        AF_EXPECT_EQ(hits, std::size_t(1));   // 仅一条风险事件
+        Engine::instance().stop();
+    }
+    (void)fs::remove(dir, true);
+}
+
+void test_simulator_scenario() {
+    using namespace af;
+    AF_LOG_INFO("=== test_simulator_scenario ===");
+
+    sim::SimConfig cfg;
+    cfg.scenario = "cert_r42";
+    cfg.operators = 3;
+    cfg.normal_events_per_operator = 2;
+    cfg.base_epoch_ms = 1789700000000ull;
+    cfg.seed = 42;
+    cfg.inject_attacks = true;
+
+    const std::string jsonl = sim::simulate_jsonl(cfg);
+    AF_EXPECT(!jsonl.empty());
+    AF_EXPECT(jsonl.back() == '\n');
+
+    std::vector<std::string> lines;
+    std::istringstream in(jsonl);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty()) lines.push_back(line);
+    }
+    // 3 名正常操作员 × 2 条 + 4 组攻击（3+3+2+2 条）
+    AF_EXPECT_EQ(lines.size(), std::size_t(3 * 2 + 10));
+
+    u64 last_ts = 0;
+    bool ordered = true;
+    bool has_dba = false, has_svc = false, has_insider_op = false;
+    std::size_t normal = 0;
+    for (const auto& l : lines) {
+        collusion::CleanEvent ce;
+        AF_EXPECT(collusion::clean_event_json(l, ce));
+        AF_EXPECT(ce.ts_us > 0);
+        if (ce.ts_us < last_ts) ordered = false;
+        last_ts = ce.ts_us;
+        if (ce.oper_id.rfind("op_r", 0) == 0) ++normal;
+        if (ce.oper_id == "op_dba1") has_dba = true;
+        if (ce.oper_id == "op_svc2") has_svc = true;
+        if (ce.oper_id == "op_ins1") has_insider_op = true;
+        AF_EXPECT_EQ(ce.server_id.empty(), false);
+        AF_EXPECT_EQ(ce.res_key.empty(), false);
+    }
+    AF_EXPECT(ordered);
+    AF_EXPECT_EQ(normal, std::size_t(3 * 2));
+    AF_EXPECT(has_dba);
+    AF_EXPECT(has_svc);
+    AF_EXPECT(has_insider_op);
+
+    // 同种子输出可复现
+    AF_EXPECT_EQ(sim::simulate_jsonl(cfg), jsonl);
+    // 不同种子正常行为不同（攻击序列固定，事件行数保持一致）
+    sim::SimConfig other = cfg;
+    other.seed = 43;
+    const std::string other_jsonl = sim::simulate_jsonl(other);
+    AF_EXPECT(other_jsonl != jsonl);
+    std::size_t other_lines = 0;
+    for (char c : other_jsonl) if (c == '\n') ++other_lines;
+    AF_EXPECT_EQ(other_lines, lines.size());
+
+    // 关闭攻击：仅保留正常操作员
+    sim::SimConfig normal_only = cfg;
+    normal_only.inject_attacks = false;
+    const std::string plain = sim::simulate_jsonl(normal_only);
+    AF_EXPECT(plain.find("op_dba1") == std::string::npos);
+    AF_EXPECT(plain.find("op_ins1") == std::string::npos);
+    std::size_t plain_lines = 0;
+    for (char c : plain) if (c == '\n') ++plain_lines;
+    AF_EXPECT_EQ(plain_lines, std::size_t(3 * 2));
+
+    // 未知场景：空输出（命令行返回失败码）
+    sim::SimConfig unknown = cfg;
+    unknown.scenario = "not_exist";
+    AF_EXPECT(sim::simulate_jsonl(unknown).empty());
+
+    // 场景目录
+    AF_EXPECT(!sim::scenario_catalog().empty());
+    AF_EXPECT(sim::scenario_catalog()[0].find("cert_r42") != std::string::npos);
+}
+
+void test_incident_report() {
+    using namespace af;
+    AF_LOG_INFO("=== test_incident_report ===");
+
+    const std::string e1 =
+        R"({"event_id":"ce-1","created_epoch":1000000000,"risk_level":"HIGH","risk_score":85,)"
+        R"("rule_factor":85,"profile_factor":0,"ml_factor":0,"graph_factor":12,)"
+        R"("matched_rules":["R-001 备份销毁合谋"],"operators":["op_dba1","op_dba2"],)"
+        R"("asset_group":"backup-group","group_by":"asset_group","group_key":"backup-group",)"
+        R"("window_start":"2026-10-22 10:00:00","window_end":"2026-10-22 10:06:00",)"
+        R"("window_span_us":360000000,"score_notes":["规则命中直接定级"],)"
+        R"("graph_notes":["操作员图谱：节点=3 边=3","时间窗稠密度=0.5"],)"
+        R"("evidence_timeline":[{"ts":"2026-10-22 10:00:00","ts_ms":1000000,)"
+        R"("ts_us":1000000000,"oper_id":"op_dba1","server_id":"db-srv",)"
+        R"("op_type":"file/delete","res_key":"/backup/x.bak","op_param":"rm -f /backup/x.bak"}]})";
+    const std::string e2 =
+        R"({"event_id":"ce-2","created_epoch":1000000000,"risk_level":"MID","risk_score":55,)"
+        R"("rule_factor":40,"profile_factor":15,"ml_factor":0,"graph_factor":0,)"
+        R"("matched_rules":["R-006 同一操作员导出后清除"],"operators":["op_ins1"],)"
+        R"("asset_group":"general-group","group_by":"operator","group_key":"op_ins1",)"
+        R"("window_start":"2026-10-22 11:00:00","window_end":"2026-10-22 11:03:00",)"
+        R"("window_span_us":180000000,"graph_notes":[],"score_notes":[],)"
+        R"("evidence_timeline":[{"ts":"2026-10-22 11:00:00","oper_id":"op_ins1",)"
+        R"("server_id":"book-web","op_type":"file/export","res_key":"/reports/a.csv",)"
+        R"("op_param":"export"}]})";
+
+    const u64 now = 1000000000ull;
+    const std::string md = collusion::build_incident_report_markdown({ e1, e2 }, 7, now);
+    AF_EXPECT(md.find("# 合谋危害定级报告") != std::string::npos);
+    AF_EXPECT(md.find("HIGH=1") != std::string::npos);
+    AF_EXPECT(md.find("MID=1") != std::string::npos);
+    AF_EXPECT(md.find("## 规则汇总") != std::string::npos);
+    AF_EXPECT(md.find("| R-001 备份销毁合谋 | 1 | HIGH | 85 |") != std::string::npos);
+    AF_EXPECT(md.find("涉及操作员：op_dba1, op_dba2（2 人）") != std::string::npos);
+    AF_EXPECT(md.find("评分构成：规则 85 / 画像 0 / ML 0 / 图 12") != std::string::npos);
+    AF_EXPECT(md.find("图谱指标：操作员图谱：节点=3 边=3；时间窗稠密度=0.5") != std::string::npos);
+    AF_EXPECT(md.find("| file/delete | /backup/x.bak | rm -f /backup/x.bak |") != std::string::npos);
+    AF_EXPECT(md.find("分组维度：operator，分组键：op_ins1") != std::string::npos);
+
+    // 时间窗过滤：早于统计区间的历史事件不进入报告
+    const std::string old =
+        R"({"event_id":"ce-old","created_epoch":990000000,"risk_level":"HIGH","risk_score":90,)"
+        R"("matched_rules":["R-OLD 历史规则"],"operators":["op_old"]})";
+    const std::string filtered =
+        collusion::build_incident_report_markdown({ old, e1 }, 1, now);
+    AF_EXPECT(filtered.find("R-OLD") == std::string::npos);
+    AF_EXPECT(filtered.find("R-001") != std::string::npos);
+
+    // 全量模式（days<=0）包含历史事件
+    const std::string all = collusion::build_incident_report_markdown({ old, e1 }, 0, now);
+    AF_EXPECT(all.find("R-OLD") != std::string::npos);
+
+    // 空数据：输出占位说明而非报错
+    const std::string empty = collusion::build_incident_report_markdown({}, 7, now);
+    AF_EXPECT(empty.find("暂无可定级的合谋风险事件") != std::string::npos);
+    AF_EXPECT(empty.find("风险事件总数：0") != std::string::npos);
+}
+
+void test_simulator_attack_chain() {
+    using namespace af;
+    using namespace af::collusion;
+    AF_LOG_INFO("=== test_simulator_attack_chain ===");
+
+    auto dir = fs::join(fs::temp_directory(), "af_sim_chain_" + crypto::random_hex(4));
+    Engine::instance().start(dir);   // 首次运行自动生成默认配置/R-001..R-007 规则
+
+    sim::SimConfig cfg;
+    cfg.base_epoch_ms = 1789700000000ull;
+    cfg.operators = 3;
+    cfg.normal_events_per_operator = 2;
+    cfg.inject_attacks = true;
+    const std::string jsonl = sim::simulate_jsonl(cfg);
+
+    std::ostringstream batch;
+    batch << "{\"events\":[";
+    std::size_t count = 0;
+    std::size_t start = 0;
+    while (start < jsonl.size()) {
+        auto end = jsonl.find('\n', start);
+        if (end == std::string::npos) end = jsonl.size();
+        if (end > start) {
+            if (count++) batch << ",";
+            batch << jsonl.substr(start, end - start);
+        }
+        start = end + 1;
+    }
+    batch << "]}";
+
+    // 单批次投递：资产组窗口聚合不会在批次中途提前冲刷（M8 演示的关键用法）
+    AF_EXPECT_EQ(Engine::instance().ingest_native_json(batch.str()), 16);
+
+    const auto high = Engine::instance().events_json("HIGH", "", 100);
+    AF_EXPECT(high.find("R-006") != std::string::npos);   // 同一操作员导出后清除
+    AF_EXPECT(high.find("R-007") != std::string::npos);   // 同对象提权后外泄
+    AF_EXPECT(high.find("op_ins3") != std::string::npos);
+
+    // 资产组聚合规则受 rule_max_factor=40 钳制，命中后落在 MID 层
+    const auto all = Engine::instance().events_json("", "", 200);
+    AF_EXPECT(all.find("R-001") != std::string::npos);   // 备份销毁合谋
+    AF_EXPECT(all.find("R-004") != std::string::npos);   // 数据批量外泄
+    AF_EXPECT(all.find("op_dba1") != std::string::npos);
+
+    // 危害定级报告可直接落盘/展示，含规则汇总与证据时间线
+    const auto report = Engine::instance().incident_report_markdown(0);
+    AF_EXPECT(report.find("# 合谋危害定级报告") != std::string::npos);
+    AF_EXPECT(report.find("## 规则汇总") != std::string::npos);
+    AF_EXPECT(report.find("R-001") != std::string::npos);
+    AF_EXPECT(report.find("涉及操作员：") != std::string::npos);
+    AF_EXPECT(report.find("| 时间 | 操作员 | 主机 | 动作 | 对象 | 参数 |") != std::string::npos);
+
+    Engine::instance().stop();
+    (void)fs::remove(dir, true);
 }
 
 void test_collusion_engine_end_to_end() {
@@ -1939,6 +2292,103 @@ void test_behavior_graph_similarity() {
     AF_EXPECT(r2.similarity_anomaly > 0.1f);   // Jaccard=0 < 0.3 → 异常 0.15
 }
 
+void test_operator_graph() {
+    using namespace af::graph;
+    AF_LOG_INFO("=== test_operator_graph ===");
+
+    OperatorGraphConfig cfg;
+    cfg.window_us = 10ull * 60ull * 1000000ull;   // 10 分钟（微秒）
+    cfg.density_threshold = 0.3f;
+    cfg.max_factor = 25;
+    ComplementPair cp;
+    cp.label = "备份破坏";
+    cp.first = { "delete", "rm" };
+    cp.second = { "unmount", "format" };
+    cfg.complement_pairs = { cp };
+
+    // 同对象共现：3 名操作员在窗口内操作同一对象 → 3 条边、稠密度 1.0
+    {
+        std::vector<OperatorEvent> evs = {
+            { "opA", 1000000ull, "/data/db.bak", "file/delete", "srv-1" },
+            { "opB", 1000000ull + 60000000ull, "/data/db.bak", "file/read", "srv-1" },
+            { "opC", 1000000ull + 120000000ull, "/data/db.bak", "file/read", "srv-2" },
+        };
+        auto a = analyze_operator_graph(evs, cfg);
+        AF_EXPECT_EQ(a.operator_count, std::size_t(3));
+        AF_EXPECT_EQ(a.edge_count, std::size_t(3));
+        AF_EXPECT_EQ(a.cooccur_edges, std::size_t(3));
+        AF_EXPECT_EQ(a.complement_edges, std::size_t(0));
+        AF_EXPECT(a.density > 0.99);
+        AF_EXPECT_EQ(a.graph_factor, 10);   // 0.4 稠密度分量 × 25
+        AF_EXPECT(!a.notes.empty());
+    }
+
+    // 窗口边界：恰好等于窗口计入；超出 1 微秒不计入
+    {
+        std::vector<OperatorEvent> evs = {
+            { "opA", 1000000ull, "/data/x.bak", "file/read", "srv-1" },
+            { "opB", 1000000ull + cfg.window_us, "/data/x.bak", "file/read", "srv-1" },
+        };
+        auto a = analyze_operator_graph(evs, cfg);
+        AF_EXPECT_EQ(a.edge_count, std::size_t(1));
+
+        evs[1].ts_us += 1;
+        auto b = analyze_operator_graph(evs, cfg);
+        AF_EXPECT_EQ(b.edge_count, std::size_t(0));
+        AF_EXPECT_EQ(b.density, 0.0);
+        AF_EXPECT_EQ(b.graph_factor, 0);
+    }
+
+    // 角色互补：不同对象、同一目标系统（删备份 + 卸载磁盘）→ 互补边
+    {
+        std::vector<OperatorEvent> evs = {
+            { "opA", 1000000ull, "/data/db_backup.bak", "File/Delete", "srv-1" },
+            { "opB", 1000000ull + 60000000ull, "/dev/sdb", "disk/unmount", "srv-1" },
+        };
+        auto a = analyze_operator_graph(evs, cfg);
+        AF_EXPECT_EQ(a.edge_count, std::size_t(1));
+        AF_EXPECT_EQ(a.complement_edges, std::size_t(1));
+        AF_EXPECT_EQ(a.edges[0].op_a, std::string("opA"));
+        AF_EXPECT_EQ(a.edges[0].op_b, std::string("opB"));
+        AF_EXPECT_EQ(a.edges[0].complement, std::size_t(1));
+        AF_EXPECT_EQ(a.edges[0].labels.size(), std::size_t(1));
+        AF_EXPECT_EQ(a.edges[0].labels[0], std::string("备份破坏"));
+        AF_EXPECT(a.graph_factor > 0);
+        AF_EXPECT(a.graph_factor <= cfg.max_factor);
+
+        // 上下文不一致（目标系统与对象均不同）：不产生互补边
+        evs[1].target_system = "srv-2";
+        auto b = analyze_operator_graph(evs, cfg);
+        AF_EXPECT_EQ(b.edge_count, std::size_t(0));
+        AF_EXPECT_EQ(b.complement_edges, std::size_t(0));
+        AF_EXPECT_EQ(b.graph_factor, 0);
+    }
+
+    // 角色互补超出时间窗：不产生边
+    {
+        std::vector<OperatorEvent> evs = {
+            { "opA", 1000000ull, "/data/db_backup.bak", "file/delete", "srv-1" },
+            { "opB", 1000000ull + cfg.window_us + 1, "/dev/sdb", "disk/unmount", "srv-1" },
+        };
+        auto a = analyze_operator_graph(evs, cfg);
+        AF_EXPECT_EQ(a.edge_count, std::size_t(0));
+        AF_EXPECT_EQ(a.graph_factor, 0);
+    }
+
+    // 因子上限：max_factor=5 时不超过 5（不直接触发 HIGH）
+    {
+        OperatorGraphConfig capped = cfg;
+        capped.max_factor = 5;
+        std::vector<OperatorEvent> evs = {
+            { "opA", 1000000ull, "/data/db.bak", "file/delete", "srv-1" },
+            { "opB", 1000000ull + 1000000ull, "/data/db.bak", "file/read", "srv-1" },
+        };
+        auto a = analyze_operator_graph(evs, capped);
+        AF_EXPECT(a.graph_factor > 0);
+        AF_EXPECT(a.graph_factor <= 5);
+    }
+}
+
 void test_collusion_graph_integration() {
     using namespace af::collusion;
     AF_LOG_INFO("=== test_collusion_graph_integration ===");
@@ -2018,6 +2468,11 @@ int main() {
     test_collusion_pure_logic();
     test_collusion_workorder_and_whitelist();
     test_collusion_detect_scoring();
+    test_collusion_correlation_rules();
+    test_collusion_correlation_engine();
+    test_simulator_scenario();
+    test_incident_report();
+    test_simulator_attack_chain();
     test_collusion_engine_end_to_end();
     test_syslog_adapter();
     test_db_audit_adapter();
@@ -2032,6 +2487,7 @@ int main() {
     test_behavior_graph_basic();
     test_behavior_graph_analyze();
     test_behavior_graph_similarity();
+    test_operator_graph();
     test_collusion_graph_integration();
 
     std::printf("\nResults: %d passed, %d failed\n", passed, failed);

@@ -11,9 +11,9 @@
 | 阶段 | 主题 | 状态 |
 |------|------|------|
 | M5 | 采集与身份贯通 | 已完成 |
-| M6 | 事件模型与危害规则 | 进行中（M6-1、M6-2 已完成） |
-| M7 | 合谋图谱增强 | 未开始 |
-| M8 | 模拟与演示 | 未开始 |
+| M6 | 事件模型与危害规则 | 已完成（M6-1、M6-2、M6-3） |
+| M7 | 合谋图谱增强 | 已完成 |
+| M8 | 模拟与演示 | 工具与报告已完成（多机联调待现场执行） |
 
 ---
 
@@ -163,6 +163,23 @@
   - 规则命中直接驱动危害定级；无规则命中时总分保持 < 80（项目硬约束）
   - 规则文件走现有 `load_rules` 热加载通道，无需重启
 
+#### M6-3 实施记录（2026-10-22）
+
+实现方式：在合谋检测引擎内新增 Sigma correlation 关联规则评估链路（`include/auditforwarder/collusion.h` + `server/src/collusion/collusion.cpp`），复用现有 `policies/collusion_rules.json` 规则文件与文件热加载通道（`maybe_reload_locked`，每 2 秒检查），无需重启。
+
+| 能力 | 实现 |
+|------|------|
+| `group_by` | `operator`（同一操作员跨事件）/ `object`（同一对象跨操作员）/ `asset_group`（默认，沿用原资产组+时间窗口聚合） |
+| `timespan_us` | 微秒时间窗，从有序序列首事件起算；`0` 表示不限 |
+| `ordered sequence` | `op_sequence` 按时间升序依次匹配，允许跳过无关事件；乱序接入先按微秒稳定排序 |
+| 事件时间戳 | `CleanEvent.ts_us` 优先取 `event_timestamp_us` / `logged_time_us` / `ts_micros`，缺失时由毫秒换算 |
+| 危害定级 | 命中直接以 `base_score` 定级（≥ `score_high` → HIGH），写入统一风险事件存储与平台告警；同规则+同分组在 `alert_dedup_seconds` 内降噪 |
+| 硬约束 | 关联规则仅在命中时落事件；资产组路径保持「规则零命中总分 < 80」钳制；`ml_factor ≤ 30` 不变 |
+
+预置示例规则 R-006（`operator`，10 分钟导出→清除）、R-007（`object`，5 分钟提权→外泄）。
+
+验证：新增 `test_collusion_correlation_rules` / `test_collusion_correlation_engine`（分组隔离、微秒 timespan 边界、有序序列、object 跨操作员、毫秒回退、规则文件解析、HIGH 定级与降噪），全量 503 项测试通过。
+
 ---
 
 ## M7：合谋图谱增强
@@ -177,6 +194,25 @@
   - 无规则命中时总分 < 80，不得直接触发 HIGH
   - 复用 M4 已有纯 C++ 图算法（度中心性 / Louvain / 三角计数 / Jaccard）
 
+#### M7 实施记录（2026-10-22）
+
+实现方式：新增共享模块 `include/auditforwarder/operator_graph.h` + `shared/src/graph/operator_graph.cpp`，合谋引擎 `detect()` 的图分析阶段改由该模块完成（节点从主机/资产升级为操作员）。
+
+| 能力 | 实现 |
+|------|------|
+| 节点重构 | 节点仅含 `operator_id`，同一操作员多次操作折叠为一个节点 |
+| 同对象共现边 | 同一 `object_key`（`res_key`）且事件时间差 ≤ `graph_window_us` 的操作员两两加边，记录共现次数与对象证据 |
+| 角色互补边 | 不同操作员在窗口内命中 `complementary_action_pairs`（如 `delete`/`rm` + `unmount`/`format`），且目标系统相同（或对象相同）时加边，记录组合标签 |
+| 时间窗稠密度 | 滑动窗口内「不同操作员对数量 / 理论两两组合数」的最大值，超 `graph_density_threshold` 计入稠密度分量 |
+| 图算法复用 | 由操作员图构建 `BehaviorGraph`，直接复用 M4 的度中心性 / Louvain 社区 / 三角形计数 / Jaccard 相似度 |
+| 评分 | `graph_factor = min(graph_max_factor, (M4 分量 + 稠密度分量 + 互补分量) × graph_max_factor)`，默认上限 25 |
+| 边界处理 | 无协作/互补边时直接返回 `graph_factor=0`，避免孤立节点被社区算法误判 |
+| 配置 | `graph_window_minutes` / `graph_density_threshold_pct` / `complementary_action_pairs`，随 `collusion_config.json` 热加载；旧配置缺失互补组合时使用内置默认值 |
+
+**硬约束保持**：`graph_factor ≤ 25`，规则零命中时总分钳制 < 80；`ml_factor ≤ 30` 不变。
+
+**验证**：新增 `test_operator_graph`（同对象共现、窗口边界微秒精度、角色互补、上下文不一致、超窗、因子上限），全量 530 项测试通过。
+
 ---
 
 ## M8：模拟与演示
@@ -184,6 +220,46 @@
 - **模拟器**：按 CERT r4.2 insider threat 剧本改编，生成多操作员正常行为 + 合谋攻击序列
 - **危害定级报告**：输出每条规则的命中证据链（涉及操作员、对象、时间窗、图谱指标）
 - **多机联调**：≥2 台客户端 + 1 台服务端（Radmin VPN 或局域网），端到端演示采集 → 身份贯通 → 规则命中 → 图谱分析 → 报告
+
+#### M8 实施记录（2026-10-22）
+
+**1. 多操作员行为模拟器**
+
+- 模块：`include/auditforwarder/simulator.h` + `shared/src/sim/cert_simulator.cpp`（纯逻辑，不涉及 IO）
+- 命令行：`tools/sim_main.cpp` → 可执行文件 `build/auditforwarder-sim.exe`
+- 场景 `cert_r42`：正常操作员（默认 4 人 × 8 条图书系统读/建/改）+ 4 组合谋攻击
+  - 攻击 A：备份销毁合谋（删备份 → 卸载备份卷 → 快照），命中 R-001 与图谱角色互补
+  - 攻击 B：数据批量外泄（提权 → 导出 → 清除），命中 R-004
+  - 攻击 C：同一操作员导出后清除，命中 R-006（`group_by=operator`）
+  - 攻击 D：同对象提权后外泄，命中 R-007（`group_by=object`）
+- 可复现：`--seed`（内置 xorshift64*，避免 `<random>` 平台差异）；事件统一 `event_timestamp_us` 微秒时间戳并按时间升序输出
+- 用法：`auditforwarder-sim --list` / `--scenario cert_r42 --operators 4 --output data/sim_events.jsonl` / `--no-attacks` 生成对照组
+
+**2. 危害定级报告**
+
+- `build_incident_report_markdown`（`server/src/collusion/collusion.cpp`）：把 `collusion_events.jsonl` 聚合为 Markdown
+  - 概览：统计区间、风险事件总数（HIGH/MID/LOW 分布）、涉及规则数
+  - 规则汇总表：命中次数、最高等级、最高评分
+  - 逐事件证据链：证据规则、涉及操作员、资产组/分组维度、时间窗（微秒跨度）、评分构成（规则/画像/ML/图）、图谱指标、`evidence_timeline` 明细表
+  - 单规则最多展示 20 条（按评分降序），`days<=0` 表示全量
+- 接口：`GET /collusion/incident-report?days=7`，返回 `text/markdown`；`Engine::incident_report_markdown` 同步提供
+
+**3. 演示脚本**
+
+- `scripts/demo_m8.ps1`：登录 → 调用模拟器生成事件（默认回溯 120 分钟）→ **单批次**投递 `/collusion/ingest` → 导出 `incident_report.md` → 打印 overview
+- 关键约束：事件必须**一次性批量投递**；逐条投递会即时冲刷资产组窗口，导致多步规则无法命中
+
+**本机冒烟结果**（服务端 `127.0.0.1:18443`，数据目录 `data/demo_server_m8`）
+
+| # | 检查项 | 结果 |
+|---|--------|------|
+| 1 | 模拟器生成 | 42 条事件（4 正常操作员 × 8 + 10 条攻击） |
+| 2 | 单批次投递 | `cleaned_events=42`，`rules_count=7` |
+| 3 | 风险事件 | HIGH=6 / MID=2 / LOW=3，全部待复核 |
+| 4 | 规则命中 | R-001、R-004、R-006、R-007 各命中 2 次（长窗口弱线索 + 短窗口强线索） |
+| 5 | 危害定级报告 | 规则汇总 + 证据时间线完整，含操作员、对象、动作与微秒时间窗 |
+
+**多机联调**：需 ≥2 台客户端 + 1 台服务端现场执行（Radmin VPN / 局域网），依赖现场环境，尚未执行。
 
 ---
 

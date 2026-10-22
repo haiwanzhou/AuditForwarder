@@ -121,6 +121,11 @@ set(AF_CORE_SOURCES
 
     # 图算法模块（M4 措施4：轻量级图算法替代 GNN）
     shared/src/graph/behavior_graph.cpp
+    # 操作员合谋图谱（M7：operator 节点 + 同对象共现/角色互补边）
+    shared/src/graph/operator_graph.cpp
+
+    # 多操作员行为模拟器（M8：CERT r4.2 改编剧本）
+    shared/src/sim/cert_simulator.cpp
 )
 
 if(AF_PLATFORM_LINUX)
@@ -205,6 +210,10 @@ target_link_libraries(auditforwarder-client PRIVATE auditforwarder_core)
 
 add_executable(auditforwarder-server server/src/server_main.cpp)
 target_link_libraries(auditforwarder-server PRIVATE auditforwarder_core)
+
+# 多操作员行为模拟器（M8 演示用）：生成 JSONL 供 /collusion/ingest 投递
+add_executable(auditforwarder-sim tools/sim_main.cpp)
+target_link_libraries(auditforwarder-sim PRIVATE auditforwarder_core)
 
 # 客户端 GUI 程序（Windows 原生窗口，仅 Windows 构建）
 if(WIN32)

@@ -3537,6 +3537,16 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             auto days = json_size_field("{\"days\":" + query_param(query, "days") + "}", "days", 7);
             return eng.report_json(static_cast<int>(days));
         }
+        if (path == "/collusion/incident-report" && method == "GET") {
+            // M8：危害定级报告（Markdown 证据链），days<=0 表示全量
+            auto days_text = query_param(query, "days");
+            auto days = days_text.empty()
+                            ? 7
+                            : static_cast<int>(json_size_field(
+                                  "{\"days\":" + days_text + "}", "days", 7));
+            content_type = "text/markdown; charset=utf-8";
+            return eng.incident_report_markdown(days);
+        }
         if (path == "/collusion/ingest" && method == "POST") {
             // 设计文档原生格式事件接入（oper_id/event_timestamp/server_id/op_type/
             // res_key/op_param/work_order_id/return_code），供外部系统直连与测试
