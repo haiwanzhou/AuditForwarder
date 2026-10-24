@@ -91,10 +91,12 @@
 
 <header>
   <div class="hrow">
-    <h1>图书管理系统 · 管理员操作台<span>Library Inventory System</span></h1>
+    <h1>图书管理系统 · 管理员操作台<span>图书库存管理系统</span></h1>
     <div class="who">
       <span>当前操作员</span>
       <span class="badge" id="whoBadge">未登录</span>
+      <a class="link" href="/app" target="_blank">业务界面 ↗</a>
+      <a class="link" href="/">入口 ↗</a>
       <a class="link" id="afLink" href="http://127.0.0.1:8443/ui#collusion" target="_blank">打开监管控制台 ↗</a>
     </div>
   </div>
@@ -197,14 +199,30 @@ function setWho(name){
   });
   // 刷新页面不丢身份：Chrome 里 token 跟着这个标签页活着
   try{
-    if(name){ sessionStorage.setItem("af_token",TOKEN); sessionStorage.setItem("af_who",name); }
-    else { sessionStorage.removeItem("af_token"); sessionStorage.removeItem("af_who"); }
+    if(name){
+      sessionStorage.setItem("af_token",TOKEN); sessionStorage.setItem("af_who",name);
+      // 同时写 localStorage：业务界面(/app)和运维界面(/admin)读的是这两个 key，
+      // 这样在一个页面登录，切到另外两个页面不用重复登录。
+      if(TOKEN){
+        localStorage.setItem("library_token",TOKEN);
+        localStorage.setItem("library_user",JSON.stringify({username:name}));
+      }
+    }
+    else {
+      sessionStorage.removeItem("af_token"); sessionStorage.removeItem("af_who");
+      localStorage.removeItem("library_token"); localStorage.removeItem("library_user");
+    }
   }catch(e){}
 }
 
 function restoreWho(){
   try{
     var t=sessionStorage.getItem("af_token"), w=sessionStorage.getItem("af_who");
+    if(!t){
+      // 没在操作台登录过，但可能在业务界面/运维界面登录过，沿用那份身份
+      t=localStorage.getItem("library_token");
+      try{ var u=JSON.parse(localStorage.getItem("library_user")||"null"); if(u) w=u.username; }catch(e){}
+    }
     if(t && w){ TOKEN=t; setWho(w); }
   }catch(e){}
 }

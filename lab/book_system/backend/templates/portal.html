@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图书管理系统 · 入口</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a21; --panel2:#1b222b; --line:#2a333f;
+    --txt:#e6edf3; --dim:#8b98a5; --acc:#4a9eff; --ok:#3fb950; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);min-height:100vh;
+       font:14px/1.7 "Microsoft YaHei","Segoe UI",system-ui,sans-serif}
+  header{padding:44px 24px 8px;text-align:center}
+  header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:.5px}
+  header p{margin:8px 0 0;color:var(--dim);font-size:13px}
+  main{max-width:1180px;margin:0 auto;padding:28px 24px 40px;
+       display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}
+  .card{display:block;text-decoration:none;color:inherit;background:var(--panel);
+        border:1px solid var(--line);border-radius:12px;padding:22px 22px 18px;
+        transition:.16s;position:relative;overflow:hidden}
+  .card:hover{border-color:var(--acc);transform:translateY(-2px)}
+  .card .tag{font-size:11px;letter-spacing:.5px;color:var(--dim);
+             text-transform:uppercase;margin-bottom:10px}
+  .card h2{margin:0 0 8px;font-size:16px;font-weight:600}
+  .card p{margin:0 0 16px;color:var(--dim);font-size:13px;line-height:1.7}
+  .card .go{font-size:13px;color:var(--acc);font-weight:600}
+  .card.primary{border-color:#2b4a6b}
+  .card.primary .go{color:#7ee787}
+  .note{max-width:1180px;margin:0 auto;padding:0 24px 48px}
+  .note div{background:var(--panel2);border:1px solid var(--line);border-left:2px solid var(--warn);
+            border-radius:8px;padding:14px 18px;font-size:13px;color:var(--dim)}
+  .note b{color:var(--txt);font-weight:600}
+  .note code{background:#0b0e13;border:1px solid var(--line);border-radius:4px;
+             padding:1px 6px;font-family:Consolas,monospace;font-size:12px;color:#9ecbff}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>图书管理系统</h1>
+  <p>图书管理系统 · 跨操作员合谋检测实验环境</p>
+</header>
+
+<main>
+  <a class="card primary" href="/app">
+    <div class="tag">业务系统</div>
+    <h2>图书管理系统</h2>
+    <p>系统本来的界面：浏览与搜索图书、新增图书、借书还书、按角色管理用户。
+       这里的每个动作都是真实的业务操作，会真的改数据库。</p>
+    <span class="go">进入系统 →</span>
+  </a>
+
+  <a class="card" href="/admin">
+    <div class="tag">系统管理</div>
+    <h2>系统运维</h2>
+    <p>数据库备份与恢复、数据卷挂载、系统配置、日志查阅与清理、密钥分发。
+       这些是正常的管理员工作，和运维真实系统的方式一致。</p>
+    <span class="go">进入运维 →</span>
+  </a>
+
+  <a class="card" href="/console">
+    <div class="tag">实验引导</div>
+    <h2>管理员操作台</h2>
+    <p>把合谋剧本拆成一步步按钮，点一步、看一眼告警。演示时用这个，
+       不用记每步要点什么。它调用的还是同一批接口。</p>
+    <span class="go">进入操作台 →</span>
+  </a>
+
+  <a class="card" id="afCard" href="#">
+    <div class="tag">监管端</div>
+    <h2>合谋检测控制台</h2>
+    <p>告警列表、证据时间线、危害定级报告。风险等级、涉及操作员与主机
+       都在这里看，和业务系统是分开的两台服务。</p>
+    <span class="go">打开监管端 →</span>
+  </a>
+</main>
+
+<div class="note">
+  <div>
+    <b>采集是怎么发生的：</b>浏览器把流量指向本机采集器 <code>127.0.0.1:8888</code>，
+    请求由采集器转发给本系统，同时被记成一条操作事件上报监管端。
+    所以不管你是点按钮、还是在业务界面里手动加书，只要走这个代理，
+    都会被记录；直接用普通浏览器窗口打开则采集不到。
+  </div>
+</div>
+
+<script>
+(function(){
+  var p = location.protocol, h = location.hostname;
+  var a = document.getElementById("afCard");
+  if (a) a.href = p + "//" + h + ":8443/ui#collusion";
+})();
+</script>
+
+</body>
+</html>

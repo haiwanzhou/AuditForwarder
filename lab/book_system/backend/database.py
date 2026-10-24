@@ -105,11 +105,11 @@ def seed_data():
 
         if existing_books == 0:
             books = [
-                ("9780262033848", "Introduction to Algorithms", "Thomas H. Cormen", "Computer Science", 2009, 3, 3, 1),
-                ("9780131103627", "The C Programming Language", "Brian Kernighan", "Programming", 1988, 2, 2, 1),
-                ("9780132350884", "Clean Code", "Robert C. Martin", "Software Engineering", 2008, 4, 4, 2),
-                ("9780596007126", "Head First Design Patterns", "Eric Freeman", "Software Engineering", 2004, 2, 2, 2),
-                ("9780134685991", "Effective Java", "Joshua Bloch", "Programming", 2018, 3, 3, 2),
+                ("9780262033848", "算法导论", "Thomas H. Cormen", "计算机科学", 2009, 3, 3, 1),
+                ("9780131103627", "C 程序设计语言", "Brian Kernighan", "程序设计", 1988, 2, 2, 1),
+                ("9780132350884", "代码整洁之道", "Robert C. Martin", "软件工程", 2008, 4, 4, 2),
+                ("9780596007126", "深入浅出设计模式", "Eric Freeman", "软件工程", 2004, 2, 2, 2),
+                ("9780134685991", "Java 高效编程", "Joshua Bloch", "程序设计", 2018, 3, 3, 2),
             ]
 
             conn.executemany(

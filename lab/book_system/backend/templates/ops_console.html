@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>系统运维 · 图书管理系统</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a21; --panel2:#1b222b; --line:#2a333f;
+    --txt:#e6edf3; --dim:#8b98a5; --acc:#4a9eff; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 "Microsoft YaHei","Segoe UI",system-ui,sans-serif}
+  header{padding:14px 22px 0;background:var(--panel);border-bottom:1px solid var(--line);
+         position:sticky;top:0;z-index:10}
+  .hrow{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:600}
+  h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
+  .who{display:flex;align-items:center;gap:12px;font-size:13px}
+  .badge{padding:3px 12px;border-radius:999px;background:#23303d;border:1px solid var(--line);
+         color:var(--dim);font-weight:600}
+  .badge.on{background:#12341c;border-color:#2ea043;color:#7ee787}
+  .link{color:var(--acc);text-decoration:none;font-size:13px}
+  .link:hover{text-decoration:underline}
+  nav{display:flex;gap:4px;margin-top:12px;overflow-x:auto}
+  nav button{background:none;border:none;border-bottom:2px solid transparent;
+             color:var(--dim);padding:9px 14px;font:inherit;font-size:13px;cursor:pointer;
+             white-space:nowrap}
+  nav button:hover{color:var(--txt)}
+  nav button.on{color:var(--acc);border-bottom-color:var(--acc);font-weight:600}
+  main{padding:20px 22px 48px;max-width:1180px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:18px 20px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 4px;font-weight:600}
+  .card .meta{font-size:12px;color:var(--dim);margin-bottom:14px}
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+  button{cursor:pointer;font:inherit;font-size:13px;border-radius:6px;border:1px solid var(--line);
+         background:var(--panel2);color:var(--txt);padding:7px 14px;transition:.15s}
+  button:hover{border-color:var(--acc)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+  button.danger{background:#3d1418;border-color:#5c1f24;color:#ff9a9a}
+  button.danger:hover{border-color:#f85149}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  tr:last-child td{border-bottom:none}
+  td.num{color:var(--dim);font-variant-numeric:tabular-nums}
+  .st{padding:1px 9px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+  .st.on{background:#12341c;border-color:#2ea043;color:#7ee787}
+  .st.off{background:#2b2320;border-color:#5c4a24;color:#d29922}
+  .empty{color:var(--dim);font-size:13px;padding:18px 0;text-align:center}
+  .msg{font-size:13px;margin-top:12px;padding:8px 12px;border-radius:6px;display:none}
+  .msg.ok{display:block;background:#12341c;border:1px solid #2ea043;color:#7ee787}
+  .msg.bad{display:block;background:#3d1418;border:1px solid #5c1f24;color:#ff9a9a}
+  label{display:block;font-size:12px;color:var(--dim);margin:0 0 5px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+  input,select{width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--line);
+               background:var(--panel2);color:var(--txt);font:inherit;font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--acc)}
+  .hint{font-size:12px;color:var(--dim);margin-top:10px;line-height:1.7}
+
+  /* ---- 切换用户 ---- */
+  #whoBadge{cursor:pointer}
+  .swbtn{padding:4px 12px;font-size:12px}
+  .acct-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(212px,1fr));gap:12px}
+  .acct{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+        padding:12px 14px;cursor:pointer;transition:.15s;text-align:left}
+  .acct:hover{border-color:var(--acc);transform:translateY(-1px)}
+  .acct.cur{border-color:#2ea043;background:#12341c}
+  .acct .u{font-weight:600;font-size:14px;display:flex;align-items:center;gap:6px}
+  .acct .u .tick{color:#7ee787;font-size:12px}
+  .acct .r{font-size:12px;color:var(--dim);margin-top:3px}
+  .acct .p{font-size:12px;color:var(--dim);margin-top:6px;
+           font-family:Consolas,"Courier New",monospace}
+  .wrow{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .wrow>div{flex:1 1 220px}
+  .wrow>div.fix{flex:0 0 auto}
+  .idbox{margin-top:14px;padding:11px 14px;border-radius:8px;font-size:13px;line-height:1.9}
+  .idbox.ok{background:#12341c;border:1px solid #2ea043}
+  .idbox.bad{background:#3d1418;border:1px solid #5c1f24}
+  .idbox.warn{background:#2b2320;border:1px solid #5c4a24}
+  .idbox b{color:#fff}
+  .toast{position:fixed;right:22px;bottom:22px;max-width:400px;padding:12px 16px;
+         border-radius:8px;background:#3d1418;border:1px solid #5c1f24;color:#ff9a9a;
+         font-size:13px;line-height:1.65;box-shadow:0 8px 26px rgba(0,0,0,.45);
+         display:none;z-index:60}
+  .toast.on{display:block}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hrow">
+    <h1>系统运维<span>图书管理系统 · 系统运维</span></h1>
+    <div class="who">
+      <span>当前操作员</span>
+      <span class="badge" id="whoBadge" title="点这里切换账号">未登录</span>
+      <button class="swbtn" onclick="loadTab('switch')">切换用户</button>
+      <a class="link" href="/app">业务界面 ↗</a>
+      <a class="link" href="/console">实验操作台 ↗</a>
+      <a class="link" href="/">入口 ↗</a>
+    </div>
+  </div>
+  <nav id="tabs">
+    <button data-tab="backup" class="on">备份管理</button>
+    <button data-tab="snapshot">快照管理</button>
+    <button data-tab="volume">数据卷</button>
+    <button data-tab="config">系统配置</button>
+    <button data-tab="logs">系统日志</button>
+    <button data-tab="key">密钥管理</button>
+    <button data-tab="switch">切换用户</button>
+  </nav>
+</header>
+
+<main><section id="panel"></section></main>
+<div class="toast" id="toast"></div>
+
+<script>
+var TOKEN = localStorage.getItem("library_token") || "";
+var USER  = null;
+try { USER = JSON.parse(localStorage.getItem("library_user") || "null"); } catch(e){}
+
+var ROLE_CN = { admin: "管理员", librarian: "图书馆员", member: "普通读者" };
+
+// 实验账号表：密码内置，点一下即切换。
+// 只放实验环境用得到的账号，正式部署时这段应当删掉。
+var ACCOUNTS = [
+  { u: "admin",      p: "admin123",  r: "admin",     note: "管理员 甲" },
+  { u: "admin2",     p: "admin123",  r: "admin",     note: "管理员 乙" },
+  { u: "admin3",     p: "admin123",  r: "admin",     note: "管理员 丙" },
+  { u: "librarian1", p: "lib123",    r: "librarian", note: "图书馆员 甲" },
+  { u: "librarian2", p: "lib123",    r: "librarian", note: "图书馆员 乙" },
+  { u: "member1",    p: "member123", r: "member",    note: "普通读者" }
+];
+
+function roleCN(role){ return ROLE_CN[role] || role || "未知"; }
+
+// 本标签页代表的「人」。sessionStorage 是每个标签页各自独立的，所以开三个
+// 标签页就能同时扮演三个账号；而登录 Cookie 是整个浏览器共用的，做不到这一点
+// ——这正是「开了三个标签页、结果全记在同一个人名下」的原因。
+var AF_ME = "";
+try { AF_ME = sessionStorage.getItem("af_me") || ""; } catch(e){}
+
+function setAFMe(u){
+  AF_ME = u || "";
+  try {
+    if (AF_ME) sessionStorage.setItem("af_me", AF_ME);
+    else sessionStorage.removeItem("af_me");
+  } catch(e){}
+  paintWho();
+}
+
+function paintWho(){
+  var b = document.getElementById("whoBadge");
+  if (!b) return;
+  var me = AF_ME || (USER && USER.username) || "";
+  if (me) {
+    b.textContent = me;
+    b.className = "badge on";
+    b.title = "本标签页的操作会记在 " + me + " 名下 · 点击切换账号";
+  } else {
+    b.textContent = "未登录";
+    b.className = "badge";
+    b.title = "点击登录或切换账号";
+  }
+}
+paintWho();
+
+function api(method, path, body){
+  var opt = { method: method, headers: {} };
+  if (TOKEN) opt.headers["Authorization"] = "Bearer " + TOKEN;
+  // 关键：显式告诉采集端「这一次是谁」。采集端优先读这个头，其次才读登录 Cookie。
+  // 每个标签页各写各的，所以三个标签页 = 三个人。
+  if (AF_ME) opt.headers["x-af-operator"] = AF_ME;
+  if (body !== undefined && body !== null){
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(body);
+  }
+  return fetch(path, opt).then(function(r){
+    return r.text().then(function(t){
+      var j = null; try { j = JSON.parse(t); } catch(e){}
+      if (r.status === 401) { TOKEN = ""; localStorage.removeItem("library_token"); }
+      // 403 基本都是「换了账号但没权限」。如果只提示"没有数据"会让人误以为系统坏了。
+      if (r.status === 403) {
+        toast("当前账号（" + ((USER && USER.username) || "未登录") +
+              "）没有运维权限，这个页面需要管理员或馆员账号。" +
+              "点右上角「切换用户」换一个即可。");
+      }
+      return { status: r.status, ok: r.ok, json: j };
+    });
+  });
+}
+
+var _toastTimer = null;
+function toast(text){
+  var box = document.getElementById("toast");
+  if (!box) return;
+  box.textContent = text;
+  box.className = "toast on";
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function(){ box.className = "toast"; }, 7000);
+}
+
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"]/g, function(c){
+    return ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" })[c];
+  });
+}
+
+function fmtSize(n){
+  if (n == null) return "-";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n/1024).toFixed(1) + " KB";
+  return (n/1048576).toFixed(1) + " MB";
+}
+
+function msg(text, ok, id){
+  var box = document.getElementById(id || "m");
+  if (!box) return;
+  box.className = "msg " + (ok ? "ok" : "bad");
+  box.textContent = text;
+}
+
+function needLogin(){
+  return '<div class="card"><div class="empty">尚未登录。点上面的 ' +
+         '<b style="color:var(--acc)">「切换用户」</b> 标签页，直接在本页登录，' +
+         '不用再回业务界面转一圈。</div></div>';
+}
+
+var TABS = {};
+
+// ---- 备份 ----
+TABS.backup = function(el){
+  el.innerHTML =
+    '<div class="card"><h2>备份管理</h2>' +
+    '<div class="meta">数据库备份文件，存放在 runtime/backups。创建后可直接用于恢复。</div>' +
+    '<div class="bar"><button class="primary" onclick="doBackup()">新建备份</button>' +
+    '<button onclick="loadTab(\'backup\')">刷新</button></div>' +
+    '<div id="tbl"><div class="empty">读取中…</div></div>' +
+    '<div class="hint">每一次「新建」和「删除」都是真实的文件操作：' +
+    '文件会真的写进或移出备份目录，同时作为操作事件被采集。</div>' +
+    '<div class="msg" id="m"></div></div>';
+
+  api("GET", "/api/backup").then(function(r){
+    var arr = (r.json && r.json.data && r.json.data.backups) || [];
+    var box = document.getElementById("tbl");
+    if (!arr.length){ box.innerHTML = '<div class="empty">还没有备份文件</div>'; return; }
+    var h = '<table><tr><th>文件名</th><th>大小</th><th>创建时间</th><th>操作</th></tr>';
+    arr.forEach(function(b){
+      var n = esc(b.name);
+      h += '<tr><td>' + n + '</td><td class="num">' + fmtSize(b.size) +
+           '</td><td class="num">' + esc(b.created_at) + '</td><td>' +
+           '<button onclick="doRestore(\'' + n + '\')">恢复</button> ' +
+           '<button class="danger" onclick="doDelBackup(\'' + n + '\')">删除</button>' +
+           '</td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  });
+};
+
+function doBackup(){
+  api("POST", "/api/backup", {}).then(function(r){
+    if (!r.ok){ msg("创建失败 HTTP " + r.status, false); return; }
+    loadTab("backup");
+    msg("备份已创建", true);
+  });
+}
+function doDelBackup(name){
+  if (!confirm("确定删除备份 " + name + " ？")) return;
+  api("DELETE", "/api/backup/" + encodeURIComponent(name)).then(function(r){
+    if (!r.ok){ msg("删除失败 HTTP " + r.status, false); return; }
+    loadTab("backup");
+    msg("已删除 " + name, true);
+  });
+}
+function doRestore(name){
+  if (!confirm("用 " + name + " 覆盖当前数据库？")) return;
+  api("POST", "/api/backup/" + encodeURIComponent(name) + "/restore", {}).then(function(r){
+    msg(r.ok ? "已从备份恢复" : "恢复失败 HTTP " + r.status, r.ok);
+  });
+}
+
+// ---- 快照 ----
+TABS.snapshot = function(el){
+  el.innerHTML =
+    '<div class="card"><h2>快照管理</h2>' +
+    '<div class="meta">某一时刻的数据快照，存放在 runtime/snapshots。</div>' +
+    '<div class="bar"><button class="primary" onclick="doSnap()">新建快照</button>' +
+    '<button onclick="loadTab(\'snapshot\')">刷新</button></div>' +
+    '<div id="tbl"><div class="empty">读取中…</div></div>' +
+    '<div class="msg" id="m"></div></div>';
+
+  api("GET", "/api/snapshot").then(function(r){
+    var arr = (r.json && r.json.data && r.json.data.snapshots) || [];
+    var box = document.getElementById("tbl");
+    if (!arr.length){ box.innerHTML = '<div class="empty">还没有快照</div>'; return; }
+    var h = '<table><tr><th>文件名</th><th>大小</th><th>创建时间</th><th>操作</th></tr>';
+    arr.forEach(function(s){
+      var n = esc(s.name);
+      h += '<tr><td>' + n + '</td><td class="num">' + fmtSize(s.size) +
+           '</td><td class="num">' + esc(s.created_at) + '</td><td>' +
+           '<button class="danger" onclick="doDelSnap(\'' + n + '\')">删除</button>' +
+           '</td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  });
+};
+
+function doSnap(){
+  api("POST", "/api/snapshot", {}).then(function(r){
+    if (!r.ok){ msg("创建失败 HTTP " + r.status, false); return; }
+    loadTab("snapshot");
+    msg("快照已创建", true);
+  });
+}
+function doDelSnap(name){
+  if (!confirm("确定删除快照 " + name + " ？")) return;
+  api("DELETE", "/api/snapshot/" + encodeURIComponent(name)).then(function(r){
+    if (!r.ok){ msg("删除失败 HTTP " + r.status, false); return; }
+    loadTab("snapshot");
+    msg("已删除 " + name, true);
+  });
+}
+
+// ---- 数据卷 ----
+TABS.volume = function(el){
+  el.innerHTML =
+    '<div class="card"><h2>数据卷</h2>' +
+    '<div class="meta">受管的存储卷及其挂载状态。卸载后该卷上的数据不再对外提供服务。</div>' +
+    '<div class="bar"><button onclick="loadTab(\'volume\')">刷新</button></div>' +
+    '<div id="tbl"><div class="empty">读取中…</div></div>' +
+    '<div class="msg" id="m"></div></div>';
+
+  api("GET", "/api/storage/volume").then(function(r){
+    var arr = (r.json && r.json.data && r.json.data.volumes) || [];
+    var box = document.getElementById("tbl");
+    if (!arr.length){ box.innerHTML = '<div class="empty">没有数据卷</div>'; return; }
+    var h = '<table><tr><th>ID</th><th>名称</th><th>挂载点</th><th>状态</th><th>操作</th></tr>';
+    arr.forEach(function(v){
+      var on = String(v.mounted) === "1";
+      h += '<tr><td class="num">' + v.id + '</td><td>' + esc(v.name) +
+           '</td><td class="num">' + esc(v.mount_point) + '</td>' +
+           '<td><span class="st ' + (on ? "on" : "off") + '">' + (on ? "已挂载" : "未挂载") + '</span></td>' +
+           '<td>' + (on
+             ? '<button class="danger" onclick="doVol(' + v.id + ',\'unmount\')">卸载</button>'
+             : '<button onclick="doVol(' + v.id + ',\'mount\')">挂载</button>') +
+           '</td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  });
+};
+
+function doVol(id, action){
+  api("PATCH", "/api/storage/volume/" + id + "/" + action).then(function(r){
+    if (!r.ok){ msg("失败 HTTP " + r.status, false); return; }
+    loadTab("volume");
+    msg("卷 " + id + " 已" + (action === "mount" ? "挂载" : "卸载"), true);
+  });
+}
+
+// ---- 系统配置 ----
+TABS.config = function(el){
+  el.innerHTML = '<div class="card"><div class="empty">读取中…</div></div>';
+  api("GET", "/api/system/config").then(function(r){
+    var c = (r.json && r.json.data && r.json.data.config) || {};
+    el.innerHTML =
+      '<div class="card"><h2>系统配置</h2>' +
+      '<div class="meta">这些值保存在 runtime/system_config.json，修改后立即写盘。</div>' +
+      '<div class="grid">' +
+        '<div><label>日志留存天数（retention_days）</label>' +
+        '<input id="c_ret" type="number" value="' + (c.retention_days != null ? c.retention_days : 90) + '"></div>' +
+        '<div><label>导出配额（export_quota）</label>' +
+        '<input id="c_quota" type="number" value="' + (c.export_quota != null ? c.export_quota : 10000) + '"></div>' +
+        '<div><label>启用自动备份</label>' +
+        '<select id="c_bak"><option value="true"' + (c.backup_enabled ? " selected" : "") + '>是</option>' +
+        '<option value="false"' + (!c.backup_enabled ? " selected" : "") + '>否</option></select></div>' +
+        '<div><label>日志级别（log_level）</label>' +
+        '<select id="c_lvl">' +
+          ["debug","info","warn","error"].map(function(x){
+            return '<option value="' + x + '"' + (c.log_level === x ? " selected" : "") + '>' + x + '</option>';
+          }).join("") +
+        '</select></div>' +
+      '</div>' +
+      '<div class="bar" style="margin-top:18px"><button class="primary" onclick="saveConfig()">保存配置</button>' +
+      '<button onclick="loadTab(\'config\')">放弃修改</button></div>' +
+      '<div class="hint">注意：把留存天数改大是「延长审计保留」，改小才是「缩短」，两者的风险方向不同。' +
+      '这里每次保存都会写文件并被采集，改动本身留痕。</div>' +
+      '<div class="msg" id="m"></div></div>';
+  });
+};
+
+function saveConfig(){
+  var body = {
+    retention_days: Number(document.getElementById("c_ret").value),
+    export_quota: Number(document.getElementById("c_quota").value),
+    backup_enabled: document.getElementById("c_bak").value === "true",
+    log_level: document.getElementById("c_lvl").value
+  };
+  api("PUT", "/api/system/config", body).then(function(r){
+    msg(r.ok ? "配置已保存" : "保存失败 HTTP " + r.status, r.ok);
+  });
+}
+
+// ---- 系统日志 ----
+TABS.logs = function(el){
+  el.innerHTML =
+    '<div class="card"><h2>系统日志</h2>' +
+    '<div class="meta">本系统自己的操作审计（数据库表 ops_audit_logs），最近 50 条。</div>' +
+    '<div class="bar"><button onclick="loadTab(\'logs\')">刷新</button>' +
+    '<button class="danger" onclick="doClearLogs()">清空日志</button></div>' +
+    '<div id="tbl"><div class="empty">读取中…</div></div>' +
+    '<div class="hint">这张表是本系统内部的审计。清空它只会清掉这里的记录——' +
+    '外部的采集端是从网络侧旁路记录的，清不掉。</div>' +
+    '<div class="msg" id="m"></div></div>';
+
+  api("GET", "/api/system/logs").then(function(r){
+    var arr = (r.json && r.json.data && r.json.data.logs) || [];
+    var box = document.getElementById("tbl");
+    if (!arr.length){ box.innerHTML = '<div class="empty">没有日志记录</div>'; return; }
+    var h = '<table><tr><th>时间</th><th>操作员</th><th>动作</th><th>对象</th></tr>';
+    arr.forEach(function(l){
+      h += '<tr><td class="num">' + esc(l.ts) + '</td><td>' + esc(l.username) +
+           '</td><td>' + esc(l.action) + '</td><td class="num">' + esc(l.target) + '</td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  });
+};
+
+function doClearLogs(){
+  if (!confirm("确定清空系统日志？此操作不可撤销。")) return;
+  api("DELETE", "/api/system/logs/clear").then(function(r){
+    var n = r.json && r.json.data ? r.json.data.deleted : null;
+    msg(r.ok ? ("已清空" + (n != null ? "，删除 " + n + " 条" : "")) : "清空失败 HTTP " + r.status, r.ok);
+    if (r.ok) loadTab("logs");
+  });
+}
+
+// ---- 密钥 ----
+// 分发接口走的是数字编号：POST /api/key/{id}/distribute。
+// 以前这里把密钥「名字」拼进 URL，Flask 的 <int:key_id> 匹配不上，稳定 404。
+var KEYS = {};   // id -> 名称，供提示语显示用
+
+TABS.key = function(el){
+  el.innerHTML =
+    '<div class="card"><h2>密钥管理</h2>' +
+    '<div class="meta">系统访问密钥。生成后需要分发给具体账号才能使用。</div>' +
+    '<div class="bar"><button class="primary" onclick="doKey()">生成密钥</button>' +
+    '<button onclick="loadTab(\'key\')">刷新</button>' +
+    '<button class="danger" onclick="doClearKeyAudit()">清空密钥审计</button></div>' +
+    '<div id="tbl"><div class="empty">读取中…</div></div>' +
+    '<div class="msg" id="m"></div></div>';
+
+  api("GET", "/api/key").then(function(r){
+    var arr = (r.json && r.json.data && r.json.data.keys) || [];
+    var box = document.getElementById("tbl");
+    if (!arr.length){ box.innerHTML = '<div class="empty">还没有密钥</div>'; return; }
+    KEYS = {};
+    var h = '<table><tr><th>ID</th><th>名称</th><th>指纹</th><th>创建人</th><th>状态</th><th>操作</th></tr>';
+    arr.forEach(function(k){
+      var nm = k.name || ("key-" + k.id);
+      KEYS[k.id] = nm;
+      var fp = String(k.fingerprint || "");
+      if (fp.length > 12) fp = fp.slice(0, 12) + "…";
+      var done = String(k.distributed) === "1";
+      h += '<tr><td class="num">' + k.id + '</td><td>' + esc(nm) +
+           '</td><td class="num">' + esc(fp || "-") + '</td>' +
+           '<td>' + esc(k.created_by || "-") + '</td>' +
+           '<td><span class="st ' + (done ? "on" : "off") + '">' +
+             (done ? "已分发" : "未分发") + '</span></td>' +
+           '<td><button onclick="doDist(' + k.id + ')">分发</button></td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  });
+};
+
+function doKey(){
+  var name = prompt("给这个密钥起个名字（留空则自动生成，例如 key_20261024_181653）", "");
+  if (name === null) return;                       // 点了取消
+  var body = name.trim() ? { name: name.trim() } : {};
+  api("POST", "/api/key", body).then(function(r){
+    var made = (r.json && r.json.data) || {};
+    if (!r.ok){ msg("生成失败 HTTP " + r.status, false); return; }
+    loadTab("key");
+    msg("密钥已生成：" + (made.name || "") + "（编号 " + (made.id != null ? made.id : "-") + "）", true);
+  });
+}
+
+function doDist(id){
+  var nm = KEYS[id] || ("编号 " + id);
+  var to = prompt("把密钥「" + nm + "」分发给哪个账号？", "admin3");
+  if (!to || !to.trim()) return;
+  to = to.trim();
+  api("POST", "/api/key/" + id + "/distribute", { to: to }).then(function(r){
+    if (!r.ok){ msg("分发失败 HTTP " + r.status, false); return; }
+    loadTab("key");
+    msg("密钥「" + nm + "」已分发给 " + to + "（状态改为已分发）", true);
+  });
+}
+
+function doClearKeyAudit(){
+  if (!confirm("确定清空密钥审计记录？")) return;
+  api("DELETE", "/api/key/audit/clear").then(function(r){
+    var n = r.json && r.json.data ? r.json.data.deleted : null;
+    msg(r.ok ? ("密钥审计已清空" + (n != null ? "，删除 " + n + " 条" : "")) : "失败 HTTP " + r.status, r.ok);
+  });
+}
+
+// ---- 切换用户 ----
+TABS.switch = function(el){
+  var cur = AF_ME || ((USER && USER.username) ? USER.username : "");
+  var curAcc = null;
+  for (var ci = 0; ci < ACCOUNTS.length; ci++) if (ACCOUNTS[ci].u === cur) curAcc = ACCOUNTS[ci];
+  var curRole = curAcc ? roleCN(curAcc.r) : (USER ? roleCN(USER.role) : "未登录");
+  var h = "";
+
+  // 当前身份
+  h += '<div class="card"><h2>当前登录身份</h2>' +
+       '<div class="meta">切换后立刻生效，不用退回业务界面重新登录。' +
+       '本页的运维按钮会以新身份调用接口，采集端也会把后续操作记在新账号名下。</div>' +
+       '<div class="bar">' +
+         '<span class="badge ' + (USER ? "on" : "") + '" style="padding:6px 18px;font-size:14px">' +
+           esc(cur || "未登录") + '</span>' +
+         '<span style="color:var(--dim);font-size:13px">角色：' + esc(curRole) + '</span>' +
+         (USER ? '<button class="danger" onclick="doLogout()">退出登录</button>' : '') +
+       '</div>' +
+       '<div id="whoCheck" class="hint">正在核对采集端认定的身份…</div>' +
+       '</div>';
+
+  // 快速切换
+  h += '<div class="card"><h2>快速切换</h2>' +
+       '<div class="meta">点一下即切换，密码已内置（仅实验环境）。当前账号会高亮。</div>' +
+       '<div class="acct-grid">';
+  ACCOUNTS.forEach(function(a){
+    var on = (a.u === cur);
+    var canOps = (a.r === "admin" || a.r === "librarian");
+    h += '<div class="acct' + (on ? " cur" : "") +
+         '" onclick="doSwitch(\'' + a.u + '\',\'' + a.p + '\')">' +
+           '<div class="u">' + esc(a.u) +
+             (on ? '<span class="tick">✓ 当前</span>' : '') + '</div>' +
+           '<div class="r">' + esc(roleCN(a.r)) + ' · ' + esc(a.note) + '</div>' +
+           '<div class="p">密码 ' + esc(a.p) + (canOps ? '' : ' · 无运维权限') + '</div>' +
+         '</div>';
+  });
+  h += '</div><div class="msg" id="swMsg"></div></div>';
+
+  // 手动登录
+  h += '<div class="card"><h2>用其他账号登录</h2>' +
+       '<div class="meta">账号不在上面的列表里时用这里。切换本身就是一次真实的 POST /api/auth/login。</div>' +
+       '<div class="wrow">' +
+         '<div><label>用户名</label><input id="sw_u" autocomplete="off" placeholder="例如 admin2"></div>' +
+         '<div><label>密码</label><input id="sw_p" type="password" autocomplete="off" placeholder="密码"></div>' +
+         '<div class="fix"><button class="primary" onclick="doSwitchForm()">切换</button></div>' +
+       '</div>' +
+       '<div class="msg" id="swMsg2"></div></div>';
+
+  // 说明
+  h += '<div class="card"><h2>做多人实验时怎么用</h2>' +
+       '<div class="hint" style="margin-top:0">' +
+       '<b>方式一 · 三个标签页各扮一个人（推荐）</b><br>' +
+       '开三个 /admin 标签页，分别点 <b>admin</b>、<b>admin2</b>、<b>admin3</b> 的卡片。' +
+       '每个标签页只记住自己是谁，互不干扰。然后按顺序做：' +
+       '① 页1 生成密钥 → ② 页2 分发 → ③ 页3 清空密钥审计。<br><br>' +
+       '<b style="color:var(--warn)">以前为什么会失败：</b>' +
+       '登录 Cookie 是整个浏览器共用的一份。你在任何一个标签页换人，所有标签页的 Cookie 都会跟着变；' +
+       '而每个页面加载时读到的令牌还留在内存里，于是出现「用着甲的令牌、身份却是乙」。' +
+       '三个标签页的动作最后全记在<b>最后切换的那个人</b>名下——人数不够 3，规则不成立，一条都不会报。<br><br>' +
+       '现在每个标签页把「我是谁」写进自己的会话（标签页之间相互独立），并在每次请求里显式带上 ' +
+       '<b>x-af-operator</b> 头；采集端优先采信这个头，所以三个标签页就是三个人。<br><br>' +
+       '<b>方式二 · 两台电脑：</b>用 8888 和 8889 两个窗口各登一个，最接近真实场景。' +
+       '</div></div>';
+
+  el.innerHTML = h;
+  checkWho();
+};
+
+function doSwitch(username, password){
+  if (!username || !password){ msg("请输入用户名和密码", false, "swMsg"); return; }
+  msg("正在切换到 " + username + " …", true, "swMsg");
+  fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ username: username, password: password })
+  }).then(function(r){
+    return r.text().then(function(t){
+      var j = null; try { j = JSON.parse(t); } catch(e){}
+      if (!r.ok || !j || !j.data || !j.data.token){
+        msg("切换失败：" + ((j && j.message) || ("HTTP " + r.status)), false, "swMsg");
+        return;
+      }
+      TOKEN = j.data.token;
+      USER  = j.data.user;
+      localStorage.setItem("library_token", TOKEN);
+      localStorage.setItem("library_user", JSON.stringify(USER));
+      setAFMe(j.data.user.username);
+      loadTab("switch");
+      msg("✓ 已切换到 " + USER.username + "（" + roleCN(USER.role) + "）", true, "swMsg");
+    });
+  }).catch(function(e){
+    msg("切换失败：" + e.message, false, "swMsg");
+  });
+}
+
+function doSwitchForm(){
+  var u = document.getElementById("sw_u");
+  var p = document.getElementById("sw_p");
+  if (!u || !p) return;
+  doSwitch((u.value || "").trim(), p.value || "");
+}
+
+function doLogout(){
+  // 先让后端清掉身份 Cookie，再清本地令牌——只清 localStorage 的话，
+  // 退出后采集端仍认为还是上一个人在操作。
+  fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" })
+    .catch(function(){})
+    .then(function(){
+      TOKEN = ""; USER = null;
+      localStorage.removeItem("library_token");
+      localStorage.removeItem("library_user");
+      setAFMe("");
+      loadTab("switch");
+      msg("已退出登录：本地令牌和采集端身份 Cookie 都已清除。", true, "swMsg");
+    });
+}
+
+function checkWho(){
+  var box = document.getElementById("whoCheck");
+  if (!box) return;
+  var headers = {};
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  fetch("/api/auth/whoami", { headers: headers, credentials: "same-origin" })
+    .then(function(r){
+      return r.text().then(function(t){
+        var j = null; try { j = JSON.parse(t); } catch(e){}
+        if (!r.ok || !j || !j.data){
+          box.className = "idbox warn";
+          box.innerHTML = "身份核对接口不可用（HTTP " + r.status + "）。" +
+                          "如果刚更新过代码，重启一次图书管理系统就会生效；不影响切换本身。";
+          return;
+        }
+        var d  = j.data;
+        var ck = d.cookie_operator || "";
+        var tk = d.token_operator || "";
+        var me = AF_ME || "";
+        var eff = me || ck || "";
+        if (!eff && !tk){
+          box.className = "idbox warn";
+          box.innerHTML = "当前没有任何登录身份。点上面的账号开始。";
+        } else if (me && ck && me !== ck){
+          box.className = "idbox warn";
+          box.innerHTML = "本标签页身份：<b>" + esc(me) + "</b>　·　浏览器登录 Cookie：<b>" +
+                          esc(ck) + "</b><br>两者不同<b>不影响记录</b>：本页每个请求都带 " +
+                          "<b>x-af-operator: " + esc(me) + "</b>，采集端优先按它记账，" +
+                          "所以这个标签页的操作会记在 <b>" + esc(me) + "</b> 名下。";
+        } else {
+          box.className = "idbox ok";
+          box.innerHTML = "采集端认定身份：<b>" + esc(eff || "（无）") + "</b>　·　接口令牌身份：<b>" +
+                          esc(tk || "（无）") + "</b><br>接下来的运维操作都会记在 <b>" +
+                          esc(eff || "未知") + "</b> 名下。";
+        }
+      });
+    })
+    .catch(function(e){
+      box.className = "idbox warn";
+      box.textContent = "核对失败：" + e.message;
+    });
+}
+
+// ---- 分发 ----
+function loadTab(name){
+  Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function(b){
+    b.className = (b.getAttribute("data-tab") === name) ? "on" : "";
+  });
+  var panel = document.getElementById("panel");
+  if (!TOKEN && name !== "switch"){ panel.innerHTML = needLogin(); return; }
+  panel.innerHTML = "";
+  (TABS[name] || TABS.backup)(panel);
+}
+
+document.getElementById("tabs").addEventListener("click", function(e){
+  var b = e.target.closest("button[data-tab]");
+  if (b) loadTab(b.getAttribute("data-tab"));
+});
+
+document.getElementById("whoBadge").addEventListener("click", function(){
+  loadTab("switch");
+});
+
+// 登录 Cookie 是整个浏览器共享的：别的标签页换了人，这个标签页的登录态也会跟着变。
+// 切回来时再核对一次，避免「以为自己还是甲、其实 Cookie 已经是乙」。
+function refreshIdentity(){
+  if (document.getElementById("whoCheck")) checkWho();
+  paintWho();
+}
+window.addEventListener("focus", refreshIdentity);
+document.addEventListener("visibilitychange", function(){ if (!document.hidden) refreshIdentity(); });
+
+loadTab(TOKEN ? "backup" : "switch");
+</script>
+</body>
+</html>

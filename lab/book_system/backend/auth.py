@@ -96,7 +96,7 @@ def login_required(route_function):
         if token is None:
             return jsonify({
                 "status": "error",
-                "message": "Missing or invalid Authorization header"
+                "message": "未登录或缺少身份令牌"
             }), 401
 
         user_payload = verify_token(token)
@@ -104,7 +104,7 @@ def login_required(route_function):
         if user_payload is None:
             return jsonify({
                 "status": "error",
-                "message": "Invalid or expired token"
+                "message": "登录已失效，请重新登录"
             }), 401
 
         g.current_user = user_payload
@@ -130,7 +130,7 @@ def role_required(*allowed_roles):
             if current_role not in allowed_roles:
                 return jsonify({
                     "status": "error",
-                    "message": "Insufficient permissions",
+                    "message": "权限不足，当前账号无权执行该操作",
                     "required_roles": list(allowed_roles),
                     "your_role": current_role
                 }), 403

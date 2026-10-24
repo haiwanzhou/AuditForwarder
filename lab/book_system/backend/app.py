@@ -104,9 +104,22 @@ def parse_bool(value):
 
 @app.route("/")
 def home():
+    """入口页。
+
+    改造前这里返回 API 说明 JSON，整个系统只有一个「实验操作台」页面可用，
+    演示时容易被误认为"只会点按钮、没有真实业务"。这里拆成两个入口：
+      /app      —— 图书管理系统本来的业务界面（加书、借还、用户管理）
+      /console  —— 实验操作台（按剧本点按钮，便于现场演示）
+    原来的 API 说明挪到 /api/info。
+    """
+    return render_template("portal.html")
+
+
+@app.route("/api/info")
+def api_info():
     return success_response({
-        "project": "Library Inventory System",
-        "description": "Database-backed CRUD REST API with search, filtering, roles, and SQLite",
+        "project": "图书管理系统",
+        "description": "基于 SQLite 的图书库存管理 REST API，支持检索、筛选与角色权限",
         "endpoints": {
             "auth": ["/api/auth/login", "/api/auth/register"],
             "books": ["/api/books", "/api/books/<id>"],
@@ -115,6 +128,29 @@ def home():
             "stats": ["/api/stats"]
         }
     })
+
+
+@app.route("/app")
+def library_app():
+    """图书管理系统原本的业务界面。
+
+    原项目自带这套前端（templates/index.html + static/js/app.js），
+    改造时只做了后端接口，页面一直没挂路由。现在放出来：
+    这里的每一步都是真实业务操作（新增图书、借书、还书、改角色），
+    产生的请求同样经过 8888 采集器，同样会进合谋检测。
+    """
+    return render_template("index.html")
+
+
+@app.route("/admin")
+def ops_console():
+    """系统运维界面：备份、快照、数据卷、配置、日志、密钥。
+
+    这些能力原本只有「实验操作台」里的剧本按钮，演示时像在演戏。
+    这一页把它们做成正常的系统管理功能，操作方式与真实运维一致，
+    调用的是同一批接口，产生的请求同样会被采集与判定。
+    """
+    return render_template("ops_console.html")
 
 
 @app.route("/ui")
@@ -185,16 +221,16 @@ def register():
     password = data.get("password")
 
     if not username or not password:
-        return error_response("username and password are required", 400)
+        return error_response("请输入用户名和密码", 400)
 
     try:
         with db_session() as conn:
             user = create_user(conn, username=username, password=password, role="member")
 
-        return success_response(user, "User registered successfully", 201)
+        return success_response(user, "注册成功", 201)
 
     except sqlite3.IntegrityError:
-        return error_response("Username already exists", 409)
+        return error_response("用户名已存在", 409)
 
     except Exception as error:
         return error_response(str(error), 500)
@@ -208,20 +244,20 @@ def login():
     password = data.get("password")
 
     if not username or not password:
-        return error_response("username and password are required", 400)
+        return error_response("请输入用户名和密码", 400)
 
     with db_session() as conn:
         user = authenticate_user(conn, username, password)
 
     if user is None:
-        return error_response("Invalid username or password", 401)
+        return error_response("用户名或密码错误", 401)
 
     token = generate_token(user)
 
     body, status_code = success_response({
         "user": user,
         "token": token
-    }, "Login successful")
+    }, "登录成功")
 
     # 下发身份 Cookie：这是"当前会话是谁"的明文标识，
     # 采集器（http_proxy）据此把每个请求归属到真实的操作员，
@@ -229,6 +265,54 @@ def login():
     # 生产环境应改为 HttpOnly + Secure + 短期签名，这里为实验可观测性保留明文。
     body.set_cookie("af_operator", user["username"], httponly=True, samesite="Lax")
     return body, status_code
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    """退出登录：清掉身份 Cookie。
+
+    只清 localStorage 是不够的——af_operator 是 HttpOnly，前端删不掉。
+    如果不清，退出后采集端仍然认为还是上一个人在操作，
+    会出现"已经退出了，流水却还记在旧账号名下"的错觉。
+    """
+    body, status_code = success_response(None, "已退出登录")
+    body.delete_cookie("af_operator")
+    return body, status_code
+
+
+@app.route("/api/auth/whoami", methods=["GET"])
+def whoami():
+    """返回"当前会话是谁"的两个来源，用于在运维界面核对身份切换是否生效。
+
+    两者不是一回事：
+      - token_operator：接口令牌里的用户，决定你能调哪些接口；
+      - cookie_operator：登录时下发的 af_operator Cookie，采集器
+        （client/src/collector/http_proxy_collector.h）优先用它把请求归到操作员。
+
+    正常情况下两者同名。一旦不一致，就说明出现"拿着 A 的令牌、顶着 B 的身份"，
+    这时候采集端记的是 B——这也是合谋实验里"改身份头即可换人"的原理。
+    """
+    try:
+        from .auth import get_token_from_header, verify_token
+    except ImportError:
+        from auth import get_token_from_header, verify_token
+
+    from flask import request
+
+    cookie_operator = request.cookies.get("af_operator") or ""
+
+    token_operator = ""
+    token = get_token_from_header()
+    if token:
+        payload = verify_token(token)
+        if payload:
+            token_operator = payload.get("username", "")
+
+    return success_response({
+        "cookie_operator": cookie_operator,
+        "token_operator": token_operator,
+        "consistent": bool(cookie_operator) and cookie_operator == token_operator,
+    })
 
 
 # -------------------------
@@ -247,7 +331,7 @@ def get_books():
         page = int(request.args.get("page", 1))
         limit = int(request.args.get("limit", 10))
     except ValueError:
-        return error_response("page and limit must be numbers", 400)
+        return error_response("page 和 limit 必须是数字", 400)
 
     if page < 1:
         page = 1
@@ -281,7 +365,7 @@ def get_single_book(book_id):
         book = get_book_by_id(conn, book_id)
 
     if book is None:
-        return error_response("Book not found", 404)
+        return error_response("图书不存在", 404)
 
     return success_response(book)
 
@@ -295,12 +379,12 @@ def add_book():
     author = data.get("author")
 
     if not title or not author:
-        return error_response("title and author are required", 400)
+        return error_response("书名和作者不能为空", 400)
 
     try:
         total_copies = int(data.get("total_copies", 1))
     except ValueError:
-        return error_response("total_copies must be a number", 400)
+        return error_response("总册数必须是数字", 400)
 
     try:
         with db_session() as conn:
@@ -315,10 +399,10 @@ def add_book():
                 added_by=g.current_user["user_id"],
             )
 
-        return success_response(book, "Book created successfully", 201)
+        return success_response(book, "图书已新增", 201)
 
     except sqlite3.IntegrityError:
-        return error_response("ISBN already exists or invalid data", 409)
+        return error_response("ISBN 已存在或数据格式不正确", 409)
 
     except ValueError as error:
         return error_response(str(error), 400)
@@ -337,12 +421,12 @@ def edit_book(book_id):
             book = update_book(conn, book_id, data)
 
         if book is None:
-            return error_response("Book not found", 404)
+            return error_response("图书不存在", 404)
 
-        return success_response(book, "Book updated successfully")
+        return success_response(book, "图书已更新")
 
     except sqlite3.IntegrityError:
-        return error_response("Invalid update. Check ISBN or copy values.", 409)
+        return error_response("更新失败，请检查 ISBN 或册数是否正确", 409)
 
     except ValueError as error:
         return error_response(str(error), 400)
@@ -359,9 +443,9 @@ def remove_book(book_id):
             deleted = delete_book(conn, book_id)
 
         if not deleted:
-            return error_response("Book not found", 404)
+            return error_response("图书不存在", 404)
 
-        return success_response(message="Book deleted successfully")
+        return success_response(message="图书已删除")
 
     except ValueError as error:
         return error_response(str(error), 400)
@@ -382,7 +466,7 @@ def borrow_book():
     book_id = data.get("book_id")
 
     if not book_id:
-        return error_response("book_id is required", 400)
+        return error_response("缺少 book_id 参数", 400)
 
     due_date = data.get("due_date")
 
@@ -398,7 +482,7 @@ def borrow_book():
                 due_date=due_date,
             )
 
-        return success_response(loan, "Book borrowed successfully", 201)
+        return success_response(loan, "借阅成功", 201)
 
     except ValueError as error:
         return error_response(str(error), 400)
@@ -447,9 +531,9 @@ def mark_loan_returned(loan_id):
             loan = return_loan(conn, loan_id)
 
         if loan is None:
-            return error_response("Loan not found", 404)
+            return error_response("借阅记录不存在", 404)
 
-        return success_response(loan, "Book returned successfully")
+        return success_response(loan, "归还成功")
 
     except ValueError as error:
         return error_response(str(error), 400)
@@ -481,7 +565,7 @@ def get_single_user(user_id):
         user = get_user_by_id(conn, user_id)
 
     if user is None:
-        return error_response("User not found", 404)
+        return error_response("用户不存在", 404)
 
     return success_response(user)
 
@@ -493,16 +577,16 @@ def change_user_role(user_id):
     new_role = data.get("role")
 
     if not new_role:
-        return error_response("role is required", 400)
+        return error_response("缺少 role 参数", 400)
 
     try:
         with db_session() as conn:
             user = update_user_role(conn, user_id, new_role)
 
         if user is None:
-            return error_response("User not found", 404)
+            return error_response("用户不存在", 404)
 
-        return success_response(user, "User role updated successfully")
+        return success_response(user, "角色已更新")
 
     except ValueError as error:
         return error_response(str(error), 400)
@@ -519,12 +603,12 @@ def remove_user(user_id):
             deleted = delete_user(conn, user_id)
 
         if not deleted:
-            return error_response("User not found", 404)
+            return error_response("用户不存在", 404)
 
-        return success_response(message="User deleted successfully")
+        return success_response(message="用户已删除")
 
     except sqlite3.IntegrityError:
-        return error_response("Cannot delete user because they have related records", 400)
+        return error_response("该用户存在关联记录，无法删除", 400)
 
     except Exception as error:
         return error_response(str(error), 500)
@@ -549,12 +633,12 @@ def stats():
 
 @app.errorhandler(404)
 def not_found(error):
-    return error_response("Endpoint not found", 404)
+    return error_response("接口不存在", 404)
 
 
 @app.errorhandler(405)
 def method_not_allowed(error):
-    return error_response("Method not allowed", 405)
+    return error_response("请求方法不允许", 405)
 
 
 # -------------------------

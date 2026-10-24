@@ -1,6 +1,14 @@
 let token = localStorage.getItem("library_token");
 let currentUser = JSON.parse(localStorage.getItem("library_user") || "null");
 
+// 界面上显示中文，但接口和数据库里仍然是英文枚举值（admin / librarian / member），
+// 只在这一层做映射，不要改后端取值，否则权限判断会全部失效。
+const ROLE_CN = { admin: "管理员", librarian: "馆员", member: "读者" };
+const STATUS_CN = { active: "在借", returned: "已归还", overdue: "已逾期" };
+
+function roleCN(role) { return ROLE_CN[role] || role || "-"; }
+function statusCN(status) { return STATUS_CN[status] || status || "-"; }
+
 const loginSection = document.getElementById("loginSection");
 const mainApp = document.getElementById("mainApp");
 const userBox = document.getElementById("userBox");
@@ -36,7 +44,7 @@ async function apiRequest(url, options = {}) {
     const data = await response.json();
 
     if (!response.ok) {
-        throw new Error(data.message || "Request failed");
+        throw new Error(data.message || "请求失败");
     }
 
     return data;
@@ -61,7 +69,7 @@ async function login() {
         localStorage.setItem("library_token", token);
         localStorage.setItem("library_user", JSON.stringify(currentUser));
 
-        showMessage("loginMessage", "Login successful", "success");
+        showMessage("loginMessage", "登录成功", "success");
         renderApp();
 
     } catch (error) {
@@ -91,7 +99,7 @@ function renderApp() {
     mainApp.classList.remove("hidden");
     userBox.classList.remove("hidden");
 
-    currentUserSpan.textContent = `${currentUser.username} (${currentUser.role})`;
+    currentUserSpan.textContent = `${currentUser.username}（${roleCN(currentUser.role)}）`;
 
     const canManageBooks = currentUser.role === "admin" || currentUser.role === "librarian";
     const canViewAllLoans = currentUser.role === "admin" || currentUser.role === "librarian";
@@ -167,8 +175,8 @@ async function loadBooks() {
                     <td>${book.available_copies}</td>
                     <td>
                         ${canBorrow
-                    ? `<button class="btn small primary" onclick="borrowBook(${book.id})">Borrow</button>`
-                    : `<span class="muted">Unavailable</span>`
+                    ? `<button class="btn small primary" onclick="borrowBook(${book.id})">借阅</button>`
+                    : `<span class="muted">无可借</span>`
                 }
                     </td>
                 </tr>
@@ -196,7 +204,7 @@ async function addBook() {
             body: JSON.stringify(book)
         });
 
-        showMessage("addBookMessage", "Book added successfully", "success");
+        showMessage("addBookMessage", "图书已新增", "success");
 
         document.getElementById("newIsbn").value = "";
         document.getElementById("newTitle").value = "";
@@ -222,7 +230,7 @@ async function borrowBook(bookId) {
             })
         });
 
-        alert("Book borrowed successfully");
+        alert("借阅成功");
 
         loadBooks();
         loadMyLoans();
@@ -250,7 +258,7 @@ async function loadMyLoans() {
                     <td>${loan.id}</td>
                     <td>${loan.book_title}</td>
                     <td>${loan.due_date}</td>
-                    <td><span class="badge ${loan.status}">${loan.status}</span></td>
+                    <td><span class="badge ${loan.status}">${statusCN(loan.status)}</span></td>
                 </tr>
             `;
         });
@@ -274,11 +282,11 @@ async function loadAllLoans() {
                     <td>${loan.username}</td>
                     <td>${loan.book_title}</td>
                     <td>${loan.due_date}</td>
-                    <td><span class="badge ${loan.status}">${loan.status}</span></td>
+                    <td><span class="badge ${loan.status}">${statusCN(loan.status)}</span></td>
                     <td>
                         ${loan.status === "active"
-                    ? `<button class="btn small primary" onclick="returnLoan(${loan.id})">Return</button>`
-                    : `<span class="muted">Done</span>`
+                    ? `<button class="btn small primary" onclick="returnLoan(${loan.id})">归还</button>`
+                    : `<span class="muted">已完成</span>`
                 }
                     </td>
                 </tr>
@@ -296,7 +304,7 @@ async function returnLoan(loanId) {
             method: "PATCH"
         });
 
-        alert("Book returned successfully");
+        alert("归还成功");
 
         loadBooks();
         loadMyLoans();
@@ -320,13 +328,13 @@ async function loadUsers() {
                 <tr>
                     <td>${user.id}</td>
                     <td>${user.username}</td>
-                    <td>${user.role}</td>
+                    <td>${roleCN(user.role)}</td>
                     <td>
                         <select onchange="changeUserRole(${user.id}, this.value)">
-                            <option value="">Select role</option>
-                            <option value="member">member</option>
-                            <option value="librarian">librarian</option>
-                            <option value="admin">admin</option>
+                            <option value="">选择角色</option>
+                            <option value="member">读者</option>
+                            <option value="librarian">馆员</option>
+                            <option value="admin">管理员</option>
                         </select>
                     </td>
                 </tr>
@@ -349,7 +357,7 @@ async function changeUserRole(userId, role) {
             })
         });
 
-        alert("User role updated successfully");
+        alert("角色已更新");
         loadUsers();
 
     } catch (error) {
