@@ -84,3 +84,6 @@ lab/book_system/runtime/
 
 # 客户端打包分发包（含 exe/dll，体积大，走 Release 分发而非仓库）
 friend-client/
+
+# 误产生的临时文本文件（非项目文件）
+采集客户端
