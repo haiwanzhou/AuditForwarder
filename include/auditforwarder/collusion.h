@@ -51,6 +51,10 @@ struct EngineConfig {
     int     score_high         { 80 };               // 高风险阈值
     int     score_mid          { 40 };               // 中风险阈值
     u64     alert_dedup_seconds{ 300 };              // 同一聚合 key 告警降噪窗口
+    // 实验/演示模式：每接入一条事件就对所属窗口做一次增量评估，
+    // 不必等 15 分钟窗口结束才出结果（答辩现场不可能等窗口）。
+    // 只影响"何时评估"，不影响判定规则本身；LOW 结果不落库，避免刷屏。
+    bool    eager_eval         { false };
     bool    emergency_mode     { false };            // 应急运维模式（等级自动降一级）
     u64     emergency_until_epoch { 0 };             // 应急模式截止时间（0 = 手动关闭前一直生效）
     bool    profile_enabled    { true };
@@ -110,6 +114,7 @@ struct CleanEvent {
     u64         ts_ms { 0 };    // 操作发生时间戳（UTC 毫秒）
     std::string server_id;      // 目标服务器唯一标识（即 host_id）
     std::string op_type;        // 操作类型（如 file/delete 或 delete_backup）
+    std::string action_norm;    // 归一化动作（<verb>.<object>，如 delete.backup），规则精确匹配用
     std::string res_key;        // 被操作资源唯一标识（聚合核心 key）
     std::string op_param;       // 操作参数（还原证据链用）
     std::string work_order_id;  // 运维工单编号，可为空
@@ -281,7 +286,8 @@ private:
 
     void maybe_reload_locked(u64 now_ms);         // 配置/规则热更新（带节流）
     void flush_due_locked(u64 now_ms);            // 冲刷到期窗口 → 检测 → 告警/存储
-    void evaluate_locked(const AggSet& set);
+    void evaluate_locked(const AggSet& set, bool update_profile = true, bool eager = false);
+    void eager_evaluate_locked(const AggSet& set);   // 实验模式：窗口未结束也评估
     // ---- M6-3 Sigma correlation 关联规则 ----
     void evaluate_correlation_locked(const CleanEvent& e);      // 滚动缓冲内匹配跨事件序列
     void prune_correlation_locked();                            // 按最大 timespan 与容量裁剪
@@ -307,6 +313,7 @@ private:
     std::map<std::string, AggSet> short_sets_;    // aggregate_key -> 集合
     std::map<std::string, AggSet> long_sets_;
     std::map<std::string, u64> last_alert_epoch_; // 告警降噪：aggregate_key -> 上次告警时间
+    std::map<std::string, std::size_t> eager_last_count_;  // eager 模式：key -> 已评估事件数
     // ---- M6-3：Sigma correlation 滚动事件缓冲与告警降噪 ----
     std::deque<CleanEvent> corr_events_;          // 按接入顺序的最近事件（匹配时按微秒排序）
     std::map<std::string, u64> last_corr_alert_ms_; // 降噪：rule_id|group -> 上次告警毫秒

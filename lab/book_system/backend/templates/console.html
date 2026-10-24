@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图书管理系统 · 管理员操作台</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a21; --panel2:#1b222b; --line:#2a333f;
+    --txt:#e6edf3; --dim:#8b98a5; --acc:#4a9eff; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 "Microsoft YaHei","Segoe UI",system-ui,sans-serif}
+  header{display:flex;flex-direction:column;align-items:stretch;gap:10px;
+         padding:12px 22px;background:var(--panel);border-bottom:1px solid var(--line);
+         position:sticky;top:0;z-index:10}
+  .hrow{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
+  header h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
+  .who{display:flex;align-items:center;gap:10px;font-size:13px}
+  .badge{padding:3px 12px;border-radius:999px;background:#23303d;border:1px solid var(--line);
+         color:var(--dim);font-weight:600}
+  .badge.on{background:#12341c;border-color:#2ea043;color:#7ee787}
+  .wrap{display:grid;grid-template-columns:340px 1fr;gap:18px;padding:18px 22px;align-items:start}
+  @media(max-width:1100px){.wrap{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 4px;font-weight:600}
+  .card h2 em{font-style:normal;color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+  .card .meta{font-size:12px;color:var(--dim);margin-bottom:14px}
+  label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+  select,input{width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--line);
+               background:var(--panel2);color:var(--txt);font:inherit;font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--acc)}
+  button{cursor:pointer;font:inherit;font-size:13px;border-radius:6px;border:1px solid var(--line);
+         background:var(--panel2);color:var(--txt);padding:7px 14px;transition:.15s}
+  button:hover{border-color:var(--acc);color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+  button.primary:hover{background:#2b7ef5}
+  .steps{display:flex;flex-direction:column;gap:8px}
+  .step{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;
+        background:var(--panel2);border:1px solid transparent;transition:.15s}
+  .step:hover{border-color:var(--line)}
+  .step .no{width:22px;height:22px;flex:0 0 22px;border-radius:50%;background:#23303d;
+            display:grid;place-items:center;font-size:11px;color:var(--dim)}
+  .step .txt{flex:1;min-width:0}
+  .step .txt b{display:block;font-weight:500;font-size:13px}
+  .step .txt small{color:var(--dim);font-size:11.5px;font-family:Consolas,monospace}
+  .step .side{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+  .op{font-size:11px;padding:2px 8px;border-radius:4px;background:#1f2937;
+      border:1px solid var(--line);color:#9fb3c8;font-family:Consolas,monospace}
+  .op.cur{background:#12341c;border-color:#2ea043;color:#7ee787}
+  .step.done{background:#101c14;border-color:#1f4a2a}
+  .step.done .no{background:#2ea043;color:#04210c;font-weight:700}
+  .step.err{background:#1e1214;border-color:#5c1f22}
+  .step.err .no{background:var(--bad);color:#fff}
+  .res{font-size:11.5px;color:var(--dim);margin-top:4px;word-break:break-all}
+  #flow{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12px;
+        height:300px;overflow:auto;font-family:Consolas,monospace;font-size:12px;line-height:1.7}
+  #flow div{border-bottom:1px dashed #1d242d;padding:3px 0}
+  #flow .t{color:#5c6b7a}
+  #flow .empty{color:#5c6b7a}
+  .tip{font-size:12px;color:var(--dim);background:#12181f;border-left:3px solid var(--acc);
+       padding:10px 12px;border-radius:0 6px 6px 0;margin-bottom:14px}
+  .link{color:var(--acc);text-decoration:none;font-size:13px}
+  .link:hover{text-decoration:underline}
+  .grp{display:inline-block;font-size:11px;padding:1px 7px;border-radius:4px;
+       background:#1c2430;color:#8fb8de;font-family:Consolas,monospace}
+
+  /* 顶部实时告警条 */
+  .statusbar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+             padding:8px 14px;border-radius:8px;background:#12181f;
+             border:1px solid var(--line);transition:background .4s,border-color .4s}
+  .statusbar.flash{background:#12341c;border-color:#2ea043}
+  .sitem{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--dim)}
+  .sitem b{font-size:17px;font-weight:700;font-family:Consolas,monospace;color:var(--txt)}
+  .sdot{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .sdot.hi{background:var(--bad)} .sdot.mi{background:var(--warn)} .sdot.lo{background:#4a7fb5}
+  .delta{font-size:11.5px;font-weight:700;color:var(--ok)}
+  .slatest{flex:1;min-width:220px;font-size:12px;color:var(--dim);
+           overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .slatest b{color:#7ee787;font-weight:600}
+  @keyframes bump{0%{transform:scale(1)}40%{transform:scale(1.4)}100%{transform:scale(1)}}
+  .bump{display:inline-block;animation:bump .55s ease}
+  #btnStat{font-size:12px;padding:4px 10px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hrow">
+    <h1>图书管理系统 · 管理员操作台<span>Library Inventory System</span></h1>
+    <div class="who">
+      <span>当前操作员</span>
+      <span class="badge" id="whoBadge">未登录</span>
+      <a class="link" id="afLink" href="http://127.0.0.1:8443/ui#collusion" target="_blank">打开监管控制台 ↗</a>
+    </div>
+  </div>
+  <div class="statusbar" id="statusbar">
+    <span class="sitem"><i class="sdot hi"></i>高风险 <b id="sHigh">–</b><span class="delta" id="dHigh"></span></span>
+    <span class="sitem"><i class="sdot mi"></i>中风险 <b id="sMid">–</b><span class="delta" id="dMid"></span></span>
+    <span class="sitem" title="多人协作但没命中规则时会记一条低风险，属正常噪音，不用管">
+      <i class="sdot lo"></i>低风险 <b id="sLow">–</b><span class="delta" id="dLow"></span></span>
+    <span class="sitem" title="等于全部事件的条数。低风险也算在内，所以它可能比高风险多">待复核 <b id="sPend">–</b></span>
+    <span class="slatest" id="sLatest">正在读取监管端…</span>
+    <button id="btnStat">立即刷新</button>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- 左列 -->
+  <div>
+    <div class="card">
+      <h2>切换操作员</h2>
+      <div class="meta">每次登录会下发身份 Cookie，采集器据此认定「是谁在操作」</div>
+      <label>账号</label>
+      <select id="acct">
+        <option value="admin:admin123">admin（管理员）</option>
+        <option value="admin2:admin123">admin2（管理员）</option>
+        <option value="admin3:admin123">admin3（管理员）</option>
+        <option value="librarian1:lib123">librarian1（馆员）</option>
+        <option value="librarian2:lib123">librarian2（馆员）</option>
+        <option value="member1:member123">member1（普通读者）</option>
+      </select>
+      <label>密码</label>
+      <input id="pwd" value="admin123" autocomplete="off">
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <button class="primary" id="btnLogin" style="flex:1">登录 / 切换</button>
+        <button id="btnLogout">清空状态</button>
+      </div>
+      <div class="res" id="loginRes"></div>
+    </div>
+
+    <div class="card">
+      <h2>操作流水</h2>
+      <div class="meta">本页发出的每个请求都会经过采集器 → 进入监管控制台</div>
+      <div id="flow"><div class="empty">等待操作…</div></div>
+    </div>
+  </div>
+
+  <!-- 右列 -->
+  <div>
+    <div class="tip">
+      <b>怎么用：</b>先在左边登录某个账号，然后点它对应的步骤按钮。括号里的
+      <span class="op">admin</span> 表示这一步应该由谁来做。注意<b>每一步都要点不同账号</b>
+      —— 这正是「合谋」的定义。<br>
+      <b>看结果：</b>不用切窗口，顶部那条状态栏每 10 秒自动刷新。点完一步等 2~4 秒，
+      <b>高风险</b>数字会跳，旁边出现绿色的「新增 +N」，右侧写出命中的规则和参与的操作员。
+      <br>
+      <span style="color:#5c6b7a">「低风险 / 待复核」会因为窗口内出现多个操作员而自己 +1
+      （说明检测到多人协作，但没命中具体规则），属正常，不影响对高风险的判断。</span>
+    </div>
+    <div id="scenarios"></div>
+  </div>
+
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// 状态
+// ---------------------------------------------------------------------------
+var TOKEN = "";
+var CURRENT = "";       // 当前登录的操作员
+var STATE = {};         // 各剧本的中间产物（备份名、快照名、密钥 id、新账号 id）
+
+function esc(s){ return String(s).replace(/[&<>"]/g, function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
+
+function nowStr(){
+  var d=new Date();
+  var p=function(n){return n<10?"0"+n:""+n;};
+  return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
+}
+
+function log(html){
+  var box=document.getElementById("flow");
+  // 占位符用独立的 .empty，不能再用 .t：
+  // 每条日志的时间戳本来就是 <span class="t">，用 .t 判断占位符会在记第一条
+  // 之后每次都命中自己，于是整个框被清空——表现是"流水永远只有最后一条"。
+  if(box.querySelector(".empty")) box.innerHTML="";
+  var div=document.createElement("div");
+  div.innerHTML=html;
+  box.appendChild(div);
+  box.scrollTop=box.scrollHeight;
+}
+
+function setWho(name){
+  CURRENT=name||"";
+  var b=document.getElementById("whoBadge");
+  if(name){ b.textContent=name; b.className="badge on"; }
+  else { b.textContent="未登录"; b.className="badge"; }
+  document.querySelectorAll(".op[data-op]").forEach(function(el){
+    el.className = "op" + (el.dataset.op===CURRENT ? " cur" : "");
+  });
+  // 刷新页面不丢身份：Chrome 里 token 跟着这个标签页活着
+  try{
+    if(name){ sessionStorage.setItem("af_token",TOKEN); sessionStorage.setItem("af_who",name); }
+    else { sessionStorage.removeItem("af_token"); sessionStorage.removeItem("af_who"); }
+  }catch(e){}
+}
+
+function restoreWho(){
+  try{
+    var t=sessionStorage.getItem("af_token"), w=sessionStorage.getItem("af_who");
+    if(t && w){ TOKEN=t; setWho(w); }
+  }catch(e){}
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+function api(method, path, body){
+  var opt={ method:method, headers:{}, credentials:"same-origin" };
+  if(TOKEN) opt.headers["Authorization"]="Bearer "+TOKEN;
+  if(body!==undefined && body!==null){
+    opt.headers["Content-Type"]="application/json";
+    opt.body=JSON.stringify(body);
+  }
+  return fetch(path,opt).then(function(r){
+    return r.text().then(function(t){
+      var j=null; try{ j=JSON.parse(t); }catch(e){}
+      // token 过期（默认 1 小时）时自动退出，避免后面每步都悄悄失败
+      if(r.status===401 && path.indexOf("/api/auth/login")<0){
+        TOKEN=""; setWho("");
+      }
+      return {status:r.status, ok:r.ok, json:j, text:t};
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 顶部实时告警条
+//   数据由本机 Flask 的 /api/_alerts 中转（它再去问 8443 的监管端），
+//   这样页面只发同源请求，不用管跨域，也绕开了系统代理。
+// ---------------------------------------------------------------------------
+var STAT=null;   // 上一次读到的计数，用来算「新增多少」
+
+function paint(id, did, val, prev){
+  var el=document.getElementById(id);
+  var dl=document.getElementById(did);
+  el.textContent=val;
+  if(prev===null || prev===undefined) return;
+  if(val>prev){
+    el.classList.remove("bump"); void el.offsetWidth; el.classList.add("bump");
+    dl.textContent="新增 +"+(val-prev);
+    setTimeout(function(){ dl.textContent=""; }, 12000);
+  }else if(val<prev){
+    el.classList.remove("bump"); void el.offsetWidth; el.classList.add("bump");
+    dl.textContent="已清空";
+    setTimeout(function(){ dl.textContent=""; }, 6000);
+  }
+}
+
+function refreshStat(){
+  return fetch("/api/_alerts",{cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){
+        document.getElementById("sLatest").innerHTML =
+          '<span style="color:var(--bad)">监管端（8443）不可达：'+esc(d.error||"")+'</span>';
+        return;
+      }
+      var prev=STAT;
+      STAT=d;
+      paint("sHigh","dHigh", d.high, prev?prev.high:null);
+      paint("sMid", "dMid",  d.mid,  prev?prev.mid:null);
+      paint("sLow", "dLow",  d.low,  prev?prev.low:null);
+      document.getElementById("sPend").textContent=d.pending;
+
+      var newest=(d.recent||[])[0];
+      document.getElementById("sLatest").innerHTML = newest
+        ? '最新高风险：<b>'+esc(newest.rule)+'</b> '+newest.score+' 分 · '+
+          esc((newest.operators||[]).join(", "))+
+          ' <span style="color:#5c6b7a">'+esc((newest.at||"").replace("T"," ").replace("Z",""))+'</span>'
+        : '暂无高风险事件。点一步操作，2~4 秒后这里会跳数字。';
+
+      if(prev && prev.high!==d.high){
+        var bar=document.getElementById("statusbar");
+        bar.classList.add("flash");
+        setTimeout(function(){ bar.classList.remove("flash"); }, 1800);
+      }
+    })
+    .catch(function(e){
+      document.getElementById("sLatest").innerHTML =
+        '<span style="color:var(--bad)">读不到告警计数：'+esc(e)+'</span>';
+    });
+}
+
+// 点完一步后短时高频刷新，不用等下一轮定时器
+function kickStat(){
+  var n=0;
+  (function loop(){
+    refreshStat();
+    if(++n<8) setTimeout(loop, 900);
+  })();
+}
+
+document.getElementById("btnStat").addEventListener("click", function(){ refreshStat(); kickStat(); });
+
+// ---------------------------------------------------------------------------
+// 登录
+// ---------------------------------------------------------------------------
+document.getElementById("acct").addEventListener("change", function(){
+  var v=this.value.split(":");
+  document.getElementById("pwd").value=v[1]||"";
+});
+
+document.getElementById("btnLogin").addEventListener("click", function(){
+  var sel=document.getElementById("acct").value.split(":");
+  var user=sel[0], pwd=document.getElementById("pwd").value;
+  var out=document.getElementById("loginRes");
+  out.textContent="登录中…";
+  api("POST","/api/auth/login",{username:user,password:pwd}).then(function(r){
+    if(r.ok && r.json && r.json.data){
+      TOKEN=r.json.data.token;
+      setWho(r.json.data.user.username);
+      out.innerHTML='<span style="color:var(--ok)">已切换为 <b>'+esc(CURRENT)+
+        '</b>，接下来你的操作都会被记在它名下</span>';
+      log('<span class="t">'+nowStr()+'</span> 登录 <b>'+esc(CURRENT)+'</b>');
+    }else{
+      TOKEN=""; setWho("");
+      out.innerHTML='<span style="color:var(--bad)">登录失败：'+esc(r.text.slice(0,120))+'</span>';
+    }
+  }).catch(function(e){ out.innerHTML='<span style="color:var(--bad)">'+esc(e)+'</span>'; });
+});
+
+document.getElementById("btnLogout").addEventListener("click", function(){
+  TOKEN=""; setWho("");
+  document.getElementById("loginRes").textContent="已清空（Cookie 仍留在浏览器里，重新登录会覆盖）";
+});
+
+// ---------------------------------------------------------------------------
+// 剧本定义
+//   path 里的 {xxx} 会被 STATE[scenario].xxx 替换
+//   save 表示把响应里的哪个字段存进 STATE
+// ---------------------------------------------------------------------------
+var SCENARIOS=[
+  {
+    id:"r001", rule:"R-001", title:"备份销毁合谋", group:"backup-group", score:"100 分",
+    why:"删备份 + 卸卷 + 删快照。单看每步都是正常运维，合起来数据不可恢复、也无从追溯。",
+    steps:[
+      {who:"admin",  label:"把数据卷挂回来（准备素材）", method:"PATCH",  path:"/api/storage/volume/{vol}/mount",
+       lookup:{url:"/api/storage/volume", listKey:"volumes", match:{}, set:"vol"}},
+      {who:"admin",  label:"造一个备份（准备素材）", method:"POST",   path:"/api/backup",   body:{}, save:"backup"},
+      {who:"admin",  label:"造一个快照（准备素材）", method:"POST",   path:"/api/snapshot", body:{}, save:"snapshot"},
+      // 删备份同样带上 lookup：备份列表也是按时间倒序，取最新那个就是刚造的。
+      // 这样即使中途刷新过页面、STATE 丢了，也不会拼出 __MISSING_backup__ 的路径。
+      {who:"admin",  label:"删掉刚造的备份",       method:"DELETE", path:"/api/backup/{backup}",
+       lookup:{url:"/api/backup", listKey:"backups", match:{}, set:"backup"}},
+      // 这两步都要带上 lookup。原因：两台机器各自一个浏览器标签页时，
+      // STATE 是本页的变量——A 页面里存下的 vol / snapshot，B 页面根本没有，
+      // 路径会被替换成 /__MISSING_vol__/ 然后 404，看着像"接口坏了"。
+      // 改成每次执行前自己去查一遍目标对象，谁点都能跑通。
+      {who:"admin2", label:"卸载数据卷",           method:"PATCH",  path:"/api/storage/volume/{vol}/unmount",
+       lookup:{url:"/api/storage/volume", listKey:"volumes", match:{mounted:1}, set:"vol"}},
+      // 快照列表按创建时间倒序，match 空对象即取最新那一个（就是刚造的）
+      {who:"admin3", label:"删掉刚造的快照",       method:"DELETE", path:"/api/snapshot/{snapshot}",
+       lookup:{url:"/api/snapshot", listKey:"snapshots", match:{}, set:"snapshot"}}
+    ]
+  },
+  {
+    id:"r002", rule:"R-002", title:"密钥权限拆分绕过", group:"key-mgmt-group", score:"98 分",
+    why:"一个人生成密钥、一个人分发出去、一个人清掉密钥审计。三步分开谁都没越权，合起来等于私配钥匙再把痕迹抹掉。",
+    steps:[
+      {who:"admin",  label:"生成一把密钥",       method:"POST",   path:"/api/key", body:{}, save:"key"},
+      {who:"admin2", label:"把密钥分发给 admin3", method:"POST",   path:"/api/key/{key}/distribute", body:{to:"admin3"},
+       lookup:{url:"/api/key", listKey:"keys", match:{}, set:"key"}},
+      {who:"admin3", label:"清除密钥审计记录",   method:"DELETE", path:"/api/key/audit/clear"}
+    ]
+  },
+  {
+    id:"r003", rule:"R-003", title:"配置篡改链路", group:"sys-config-group", score:"88 分",
+    why:"改配置（拉长日志留存）+ 重启服务 + 清系统日志。结果是配置被改过、痕迹也没了。",
+    steps:[
+      {who:"admin",  label:"修改系统配置（留存改 3650 天）", method:"PUT",    path:"/api/system/config", body:{retention_days:3650}},
+      {who:"admin2", label:"重启应用服务",                  method:"POST",   path:"/api/system/service/restart"},
+      {who:"admin3", label:"清除系统日志",                  method:"DELETE", path:"/api/system/logs/clear"}
+    ]
+  },
+  {
+    id:"r004", rule:"R-004", title:"数据批量外泄", group:"db-group", score:"100 分",
+    why:"给账号加导出权限 + 导出全部数据 + 清图书审计。一个人做是流程，三个人接力做就是有组织的数据搬走。",
+    steps:[
+      {who:"admin",  label:"给 member1 加导出权限", method:"PATCH",  path:"/api/users/{member1_id}/privilege",
+       body:{privilege:"export"},
+       lookup:{url:"/api/users", listKey:"users", match:{username:"member1"}, set:"member1_id"}},
+      {who:"admin2", label:"导出全部图书数据",     method:"GET",    path:"/api/books/export"},
+      {who:"admin3", label:"清除图书审计记录",     method:"DELETE", path:"/api/books/audit/clear"}
+    ]
+  },
+  {
+    id:"r005", rule:"R-005", title:"权限晋升合谋", group:"general-group", score:"98 分",
+    why:"建一个后门账号 + 提成管理员 + 用管理员身份执行清库。三个人把「造人→给权→动手」拆成三步。",
+    steps:[
+      {who:"admin",  label:"创建一个新账号",       method:"POST", path:"/api/admin/user",
+       body:{username:"", password:"backdoor123", role:"member"}, save:"newuser"},
+      {who:"admin2", label:"把新账号提为管理员",   method:"POST", path:"/api/admin/user/{newuser}/assign-admin"},
+      {who:"admin3", label:"用管理员身份执行清库", method:"POST", path:"/api/admin/exec", body:{action:"purge_books"}}
+    ]
+  },
+  {
+    id:"ctrl", rule:"对照", title:"正常业务：删一本书", group:"db-group", score:"不该告警",
+    why:"这是用来证明「没有误报」的。删一本书会被归一化成 delete.book，和删备份的 delete.backup 是两回事。",
+    steps:[
+      {who:"admin", label:"删除列表里的第一本书", method:"DELETE", path:"/api/books/{book_id}",
+       lookup:{url:"/api/books", listKey:"books", match:{}, set:"book_id"}}
+    ]
+  }
+];
+
+// ---------------------------------------------------------------------------
+// 渲染
+// ---------------------------------------------------------------------------
+function render(){
+  var box=document.getElementById("scenarios");
+  SCENARIOS.forEach(function(sc){
+    var card=document.createElement("div");
+    card.className="card";
+    var ops=sc.steps.map(function(s){return s.who;})
+      .filter(function(v,i,a){return a.indexOf(v)===i;});
+    card.innerHTML =
+      '<h2>'+esc(sc.rule)+' · '+esc(sc.title)+
+      '<em><span class="grp">'+esc(sc.group)+'</span> 命中即 '+esc(sc.score)+'</em></h2>'+
+      '<div class="meta">'+esc(sc.why)+'</div>';
+    var list=document.createElement("div");
+    list.className="steps";
+    sc.steps.forEach(function(st,i){
+      var row=document.createElement("div");
+      row.className="step";
+      row.innerHTML =
+        '<div class="no">'+(i+1)+'</div>'+
+        '<div class="txt"><b>'+esc(st.label)+'</b>'+
+          '<small>'+esc(st.method)+' '+esc(st.path)+'</small>'+
+          '<div class="res"></div></div>'+
+        '<div class="side"><span class="op" data-op="'+esc(st.who)+'">'+esc(st.who)+'</span>'+
+        '<button>执行</button></div>';
+      row.querySelector("button").addEventListener("click", function(){
+        runStep(sc, st, row);
+      });
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+    box.appendChild(card);
+  });
+  setWho(CURRENT);
+}
+
+// ---------------------------------------------------------------------------
+// 执行一步
+// ---------------------------------------------------------------------------
+function buildPath(sc, st){
+  var p=st.path;
+  var m=p.match(/\{(\w+)\}/g)||[];
+  m.forEach(function(tag){
+    var key=tag.slice(1,-1);
+    var v=(STATE[sc.id]||{})[key];
+    // 没存到就把整段换成 1，让请求失败得明显一点，而不是静默打错地方
+    p=p.replace(tag, (v===undefined||v===null||v==="")?"__MISSING_"+key+"__":v);
+  });
+  return p;
+}
+
+// 执行前置查询：把目标对象的真实标识查出来，避免写死
+function doLookup(sc, st){
+  if(!st.lookup) return Promise.resolve();
+  var lk=st.lookup;
+  return api("GET", lk.url).then(function(r){
+    if(!r.ok) throw new Error("前置查询失败 HTTP "+r.status);
+    var arr=((r.json||{}).data||{})[lk.listKey]||[];
+    var keys=Object.keys(lk.match||{});
+    var hit=arr.filter(function(x){
+      return keys.every(function(k){ return String(x[k])===String(lk.match[k]); });
+    })[0];
+    if(!hit) throw new Error("在 "+lk.url+" 里找不到 "+JSON.stringify(lk.match)+
+                             (arr.length?"":"（列表为空）"));
+    // 主键不一定叫 id：备份和快照的列表项只有 name（{name,size,created_at}），
+    // 卷和用户才有 id。原来一律取 hit.id，删备份那一步就拿到了 undefined，
+    // 路径拼成 /api/backup/__MISSING_backup__ 然后 404。
+    var v = (hit.id !== undefined && hit.id !== null) ? hit.id : hit.name;
+    if(v === undefined || v === null || v === ""){
+      throw new Error("查到了对象但没有可用的标识："+JSON.stringify(hit));
+    }
+    STATE[sc.id]=STATE[sc.id]||{};
+    STATE[sc.id][lk.set]=v;
+  });
+}
+
+function runStep(sc, st, row){
+  var resEl=row.querySelector(".res");
+  var btn=row.querySelector("button");
+
+  if(!TOKEN){
+    resEl.innerHTML='<span style="color:var(--warn)">先登录再操作（左边选择账号）</span>';
+    return;
+  }
+  if(CURRENT!==st.who){
+    if(!confirm("这一步按剧本应该由「"+st.who+"」来做，\n当前登录的是「"+CURRENT+"」。\n\n继续的话，这一步会记在 "+CURRENT+" 名下，跨人聚合可能凑不齐。\n仍要继续吗？")){
+      return;
+    }
+  }
+
+  var body=null;
+  if(st.body){
+    body=JSON.parse(JSON.stringify(st.body));
+    // 建账号的名字要唯一，否则第二次跑就 409
+    if(sc.id==="r005" && st.save==="newuser"){
+      body.username="lab_backdoor_"+String(Date.now()).slice(-6);
+    }
+  }
+
+  btn.disabled=true;
+  resEl.textContent="执行中…";
+
+  doLookup(sc, st).then(function(){
+    var path=buildPath(sc,st);
+    return api(st.method, path, body).then(function(r){
+    btn.disabled=false;
+    // 采集端有 1~3 秒的批处理延迟，这里立刻开始密集刷新，做完就能看到数字动
+    kickStat();
+    if(r.ok){
+        row.className="step done";
+        var note="";
+        if(st.save && r.json && r.json.data){
+          var v=r.json.data.id!==undefined ? r.json.data.id
+               : (r.json.data.name!==undefined ? r.json.data.name : null);
+          if(v!==null){ STATE[sc.id]=STATE[sc.id]||{}; STATE[sc.id][st.save]=v; note=" → 已记住 "+st.save+"="+v; }
+        }
+        resEl.innerHTML='<span style="color:var(--ok)">HTTP '+r.status+
+          "，"+(r.json&&r.json.message?esc(r.json.message):"成功")+esc(note)+'</span>';
+        log('<span class="t">'+nowStr()+'</span> <b>'+esc(CURRENT)+'</b> '+
+            esc(st.method)+' '+esc(path)+' <span style="color:var(--ok)">'+r.status+'</span>');
+      }else{
+        row.className="step err";
+        resEl.innerHTML='<span style="color:var(--bad)">HTTP '+r.status+'：'+esc(r.text.slice(0,160))+'</span>';
+        log('<span class="t">'+nowStr()+'</span> <b>'+esc(CURRENT)+'</b> '+
+            esc(st.method)+' '+esc(path)+' <span style="color:var(--bad)">'+r.status+'</span>');
+      }
+    });
+  }).catch(function(e){
+    btn.disabled=false;
+    row.className="step err";
+    resEl.innerHTML='<span style="color:var(--bad)">'+esc(e.message||e)+'</span>';
+    log('<span class="t">'+nowStr()+'</span> <b>'+esc(CURRENT)+'</b> '+
+        esc(st.label)+' <span style="color:var(--bad)">失败</span>');
+  });
+}
+
+render();
+restoreWho();
+
+// 监管控制台链接跟着当前访问地址走：
+// 页面在 192.168.1.5:18080 打开时，链接应该指向 192.168.1.5:8443，
+// 而不是写死的 127.0.0.1——否则同学那台机器点开的是他自己的本机。
+(function(){
+  var a = document.getElementById("afLink");
+  if (a) a.href = location.protocol + "//" + location.hostname + ":8443/ui#collusion";
+})();
+
+// 顶部告警条：进来先读一次，之后每 4 秒自动刷新
+refreshStat();
+setInterval(refreshStat, 10000);
+</script>
+</body>
+</html>

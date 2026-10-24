@@ -1,0 +1,187 @@
+{
+  "note": "合谋规则（实验用）。any_of 使用动作归一化后的 <verb>.<object> 精确形式，例如 delete.backup；带 '.' 的关键词会进入严格匹配，裸词被忽略。动作归一化由客户端 ActionNormalizer 产出，见 docs/EXPERIMENT_MANUAL.md。",
+  "rules": [
+    {
+      "rule_id": "R-001",
+      "name": "备份销毁合谋",
+      "enabled": true,
+      "asset_group": "backup-group",
+      "min_operator_cnt": 2,
+      "base_score": 85,
+      "note": "删备份 + 卸卷 + 删快照：单步都合规，叠加后数据不可恢复、不可追溯",
+      "op_sequence": [
+        {
+          "any_of": [
+            "delete.backup"
+          ]
+        },
+        {
+          "any_of": [
+            "unmount.volume",
+            "detach.volume"
+          ]
+        },
+        {
+          "any_of": [
+            "delete.snapshot"
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "R-002",
+      "name": "密钥权限拆分绕过",
+      "enabled": true,
+      "asset_group": "key-mgmt-group",
+      "min_operator_cnt": 3,
+      "base_score": 80,
+      "note": "生成密钥 / 分发 / 清密钥审计，三人各做一步，谁都不越权",
+      "op_sequence": [
+        {
+          "any_of": [
+            "create.key"
+          ]
+        },
+        {
+          "any_of": [
+            "distribute.key"
+          ]
+        },
+        {
+          "any_of": [
+            "clear.key_audit"
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "R-003",
+      "name": "配置篡改链路",
+      "enabled": true,
+      "asset_group": "sys-config-group",
+      "min_operator_cnt": 2,
+      "base_score": 85,
+      "note": "改配置 + 重启服务 + 清日志：改完即生效，日志被清后无法回溯",
+      "op_sequence": [
+        {
+          "any_of": [
+            "update.config"
+          ]
+        },
+        {
+          "any_of": [
+            "restart.service"
+          ]
+        },
+        {
+          "any_of": [
+            "clear.logs"
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "R-004",
+      "name": "数据批量外泄",
+      "enabled": true,
+      "asset_group": "db-group",
+      "min_operator_cnt": 2,
+      "base_score": 82,
+      "note": "提权 + 批量导出 + 清业务审计：数据已出门，本地凭据全部抹掉",
+      "op_sequence": [
+        {
+          "any_of": [
+            "grant.user",
+            "grant.privilege"
+          ]
+        },
+        {
+          "any_of": [
+            "export.book",
+            "export.db"
+          ]
+        },
+        {
+          "any_of": [
+            "clear.book_audit",
+            "clear.db_audit"
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "R-005",
+      "name": "权限晋升合谋",
+      "enabled": true,
+      "asset_group": "*",
+      "min_operator_cnt": 3,
+      "base_score": 85,
+      "note": "A 建账号 / B 授权成管理员 / C 用该账号执行敏感动作：后门由三人接力拼出来",
+      "op_sequence": [
+        {
+          "any_of": [
+            "create.user"
+          ]
+        },
+        {
+          "any_of": [
+            "assign.user",
+            "grant.admin"
+          ]
+        },
+        {
+          "any_of": [
+            "exec.purge_books",
+            "exec.*"
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "R-006",
+      "name": "同一操作员导出后清除",
+      "enabled": false,
+      "group_by": "operator",
+      "timespan_us": 600000000,
+      "min_operator_cnt": 1,
+      "base_score": 80,
+      "note": "实验边界：本项目只研究管理员之间的合谋，单人规则会造成“一个人也能报 HIGH”的假象，污染检出率统计，故禁用。它作为负样本保留。",
+      "op_sequence": [
+        {
+          "any_of": [
+            "export.book",
+            "export.db"
+          ]
+        },
+        {
+          "any_of": [
+            "clear.book_audit",
+            "clear.db_audit"
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "R-007",
+      "name": "同对象提权后外泄",
+      "enabled": false,
+      "group_by": "object",
+      "timespan_us": 300000000,
+      "min_operator_cnt": 2,
+      "base_score": 82,
+      "note": "按 res_key 全等分组，而“提权”与“导出”落在不同 URL 上，永远聚不到一组，规则不可达；保留定义供后续按 action_norm 的对象位重新实现。",
+      "op_sequence": [
+        {
+          "any_of": [
+            "grant.user"
+          ]
+        },
+        {
+          "any_of": [
+            "export.book"
+          ]
+        }
+      ]
+    }
+  ]
+}

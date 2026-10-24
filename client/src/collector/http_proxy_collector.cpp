@@ -214,6 +214,81 @@ std::string header_of(const RequestHead& h, const std::string& name) {
     return it == h.headers.end() ? std::string() : it->second;
 }
 
+// 从 Cookie 头里取指定名字的值（cookie 名大小写不敏感）。
+std::string cookie_of(const RequestHead& h, const std::string& name) {
+    const std::string raw = header_of(h, "cookie");
+    if (raw.empty() || name.empty()) return {};
+    std::size_t pos = 0;
+    while (pos <= raw.size()) {
+        std::size_t semi = raw.find(';', pos);
+        std::string item = raw.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+        std::size_t eq = item.find('=');
+        if (eq != std::string::npos) {
+            if (lower_copy(trim_copy(item.substr(0, eq))) == lower_copy(name)) {
+                return trim_copy(item.substr(eq + 1));
+            }
+        }
+        if (semi == std::string::npos) break;
+        pos = semi + 1;
+    }
+    return {};
+}
+
+// 从 JSON 请求体里取某个字符串字段（仅用于登录请求的 username 兜底）。
+std::string json_body_string(const std::string& body, const std::string& key) {
+    if (body.empty() || key.empty()) return {};
+    const std::string needle = "\"" + key + "\"";
+    std::size_t p = body.find(needle);
+    if (p == std::string::npos) return {};
+    p = body.find(':', p + needle.size());
+    if (p == std::string::npos) return {};
+    ++p;
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) ++p;
+    if (p >= body.size() || body[p] != '"') return {};
+    std::size_t q = body.find('"', p + 1);
+    if (q == std::string::npos) return {};
+    return body.substr(p + 1, q - p - 1);
+}
+
+// base64 / base64url 解码（忽略填充与非法字符）。
+std::string base64_decode(const std::string& in) {
+    static const char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        int d = 0;
+        if (c == '-')      d = 62;
+        else if (c == '_') d = 63;
+        else {
+            const char* p = std::strchr(kTable, c);
+            if (!p || c == '\0') continue;
+            d = static_cast<int>(p - kTable);
+        }
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((val >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// 从 Authorization: Bearer <token> 中解析登录用户名。
+// 图书系统的 token 形如 base64url({"user_id":..,"username":..,"role":..}).<hmac>，
+// 取第一段解码即可拿到 username —— 身份来自真实请求，而非客户端配置。
+std::string username_from_bearer(const std::string& auth) {
+    if (auth.empty()) return {};
+    std::size_t sp = auth.find(' ');
+    const std::string token = sp == std::string::npos ? auth : auth.substr(sp + 1);
+    const std::size_t dot = token.find('.');
+    const std::string payload = dot == std::string::npos ? token : token.substr(0, dot);
+    if (payload.empty()) return {};
+    return json_body_string(base64_decode(payload), "username");
+}
+
 bool parse_request_head(const std::string& raw, std::size_t head_end, RequestHead& out) {
     std::string block = raw.substr(0, head_end);
     std::size_t eol = block.find("\r\n");
@@ -447,7 +522,11 @@ struct HttpProxyEngine::Impl {
     void emit_event(const std::string& method, const std::string& host, u16 port,
                     const std::string& uri, const std::string& user_agent,
                     int status_code, std::size_t req_body_len, const std::string& body_snippet,
-                    bool allowed);
+                    bool allowed, const std::string& oper_id = {});
+
+    // 操作员身份提取：从同一次 HTTP 请求中解析"这是谁做的"。
+    // 顺序：显式身份头 > 身份 Cookie > 请求体 username（登录请求）> 空（由 Enricher 回退到配置值）。
+    std::string extract_operator(const RequestHead& req, const std::string& body) const;
 };
 
 Result<void> HttpProxyEngine::Impl::start() {
@@ -599,7 +678,8 @@ void HttpProxyEngine::Impl::handle_connect(Sock client, const RequestHead& req, 
     if (target == kInvalidSock) {
         static const char kFail[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(client, kFail, sizeof(kFail) - 1);
-        emit_event("CONNECT", host, port, "", header_of(req, "user-agent"), 502, 0, "", allowed);
+        emit_event("CONNECT", host, port, "", header_of(req, "user-agent"), 502, 0, "", allowed,
+                   extract_operator(req, {}));
         return;
     }
 
@@ -608,7 +688,8 @@ void HttpProxyEngine::Impl::handle_connect(Sock client, const RequestHead& req, 
         close_socket(target);
         return;
     }
-    emit_event("CONNECT", host, port, "", header_of(req, "user-agent"), 200, 0, "", allowed);
+    emit_event("CONNECT", host, port, "", header_of(req, "user-agent"), 200, 0, "", allowed,
+               extract_operator(req, {}));
     relay_bidirectional(client, target);
     close_socket(target);
 }
@@ -668,11 +749,14 @@ void HttpProxyEngine::Impl::handle_plain(Sock client, const std::string& raw,
     }
     upstream += "Connection: close\r\n\r\n";
 
+    // 操作员身份：请求体读完后即可解析（登录请求用 username，后续请求用 Cookie/头）
+    const std::string oper_id = extract_operator(req, body);
+
     Sock target = connect_target(url.host, url.port == 0 ? 80 : url.port, kConnectTimeoutMs);
     if (target == kInvalidSock) {
         static const char kFail[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(client, kFail, sizeof(kFail) - 1);
-        emit_event(method, url.host, url.port, url.path, ua, 502, body_len, "", allowed);
+        emit_event(method, url.host, url.port, url.path, ua, 502, body_len, "", allowed, oper_id);
         return;
     }
 
@@ -684,7 +768,7 @@ void HttpProxyEngine::Impl::handle_plain(Sock client, const std::string& raw,
         close_socket(target);
         static const char kFail[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(client, kFail, sizeof(kFail) - 1);
-        emit_event(method, url.host, url.port, url.path, ua, 502, body_len, "", allowed);
+        emit_event(method, url.host, url.port, url.path, ua, 502, body_len, "", allowed, oper_id);
         return;
     }
 
@@ -695,7 +779,7 @@ void HttpProxyEngine::Impl::handle_plain(Sock client, const std::string& raw,
         close_socket(target);
         static const char kTimeout[] = "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(client, kTimeout, sizeof(kTimeout) - 1);
-        emit_event(method, url.host, url.port, url.path, ua, 504, body_len, "", allowed);
+        emit_event(method, url.host, url.port, url.path, ua, 504, body_len, "", allowed, oper_id);
         return;
     }
 
@@ -704,7 +788,7 @@ void HttpProxyEngine::Impl::handle_plain(Sock client, const std::string& raw,
     if (cfg.capture_body && allowed && !body.empty()) {
         snippet = sanitize_snippet(body, cfg.max_body_bytes);
     }
-    emit_event(method, url.host, url.port, url.path, ua, status, body_len, snippet, allowed);
+    emit_event(method, url.host, url.port, url.path, ua, status, body_len, snippet, allowed, oper_id);
 
     send_all(client, resp.data(), resp.size());
     relay_downstream(target, client);
@@ -755,7 +839,7 @@ void HttpProxyEngine::Impl::emit_event(const std::string& method, const std::str
                                        u16 port, const std::string& uri,
                                        const std::string& user_agent, int status_code,
                                        std::size_t req_body_len, const std::string& body_snippet,
-                                       bool allowed) {
+                                       bool allowed, const std::string& oper_id) {
     if (!allowed || !cb) return;
 
     AuditEvent ev;
@@ -791,9 +875,43 @@ void HttpProxyEngine::Impl::emit_event(const std::string& method, const std::str
     if (!body_snippet.empty()) {
         ev.attrs[logmeta::attr::kHttpReqBody] = body_snippet;
     }
+    // 操作员身份：从本次请求解析出的真实身份。
+    // 这里显式写入后，Enricher 的 "缺失才补配置值" 逻辑不会覆盖它，
+    // 因此同一台机器上不同管理员的操作能被区分开（跨操作员合谋检测的前提）。
+    if (!oper_id.empty()) {
+        ev.attrs[logmeta::attr::kOperatorId]   = oper_id;
+        ev.attrs[logmeta::attr::kOperatorName] = oper_id;
+    }
     logmeta::tag_collector(ev, logmeta::collector::kHttpProxy);
 
     cb(ev);
+}
+
+std::string HttpProxyEngine::Impl::extract_operator(const RequestHead& req,
+                                                    const std::string& body) const {
+    // 1. 显式身份头：脚本、网关或演示工具直接声明操作员
+    if (!cfg.identity_header.empty()) {
+        std::string v = header_of(req, lower_copy(cfg.identity_header));
+        if (!v.empty()) return v;
+    }
+    // 2. 身份 Cookie：业务系统登录后下发，代表"当前会话是谁"
+    if (!cfg.identity_cookie.empty()) {
+        std::string v = cookie_of(req, cfg.identity_cookie);
+        if (!v.empty()) return v;
+    }
+    // 3. Authorization: Bearer <token>：从登录令牌里解出 username
+    if (cfg.identity_from_bearer) {
+        std::string v = username_from_bearer(header_of(req, "authorization"));
+        if (!v.empty()) return v;
+    }
+    // 4. 请求体 username：登录动作本身
+    if (cfg.identity_from_body && !body.empty()) {
+        std::string v = json_body_string(body, "username");
+        if (v.empty()) v = json_body_string(body, "operator");
+        if (!v.empty()) return v;
+    }
+    // 5. 无法判定：返回空，由 Enricher 回退到客户端配置的 operator.id
+    return {};
 }
 
 // =========================================================================

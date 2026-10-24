@@ -20,8 +20,8 @@
 #include <commctrl.h>
 #include <shellapi.h>
 
-// MinGW 下 popen 使用 _popen
-#ifdef __MINGW32__
+// Windows（MSVC / MinGW）下 popen 使用 _popen，POSIX 平台才是 popen
+#if defined(_WIN32)
 #define AF_POPEN _popen
 #define AF_PCLOSE _pclose
 #else

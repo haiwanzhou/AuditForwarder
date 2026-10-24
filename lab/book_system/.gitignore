@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+instance/
+.vscode/
+
+# Database generated locally
+library.db
+*.db
+
+# OS files
+.DS_Store
+Thumbs.db

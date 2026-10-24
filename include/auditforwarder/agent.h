@@ -104,6 +104,12 @@ struct AgentConfig {
     int         http_proxy_listen_port { 8888 };
     std::vector<std::string> http_proxy_target_hosts;  // 空 = 采集全部主机
     bool        http_proxy_capture_body { false };     // 请求体验存（下游 PIIMasker 脱敏）
+    // 操作员身份提取：HTTP 事件的操作员不再取客户端配置的写死值，而是从请求中解析。
+    // 一台机器上多个管理员轮流登录时，只有这样才能区分"谁做的"。
+    std::string http_proxy_identity_header { "x-af-operator" };  // 显式身份头（脚本/网关）
+    std::string http_proxy_identity_cookie { "af_operator" };    // 身份 Cookie（业务系统下发）
+    bool        http_proxy_identity_from_bearer { true };      // 解 Bearer token 里的 username
+    bool        http_proxy_identity_from_body { true };         // 登录请求体 username 兜底
 
     // 采集器降噪过滤（collectors.filter.*，见 collector_filter.h）：
     // 路径/进程/网络/ETW 四类过滤，未配置时使用内置默认值（已按噪声经验调优）。

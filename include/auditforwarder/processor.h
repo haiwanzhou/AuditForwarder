@@ -113,4 +113,18 @@ public:
     std::string name() const override { return "schema_mapper"; }
 };
 
+// 动作归一化（合谋检测基线）：把不同来源的原始动作归一成 "<verb>.<object>" 形式，
+// 例如 HTTP DELETE /api/backup/3 → delete.backup，命令行 mountvol X: /D → unmount.volume。
+//
+// 为什么需要：合谋规则原先用裸子串匹配 "delete"，导致"删除一本书"与"删除备份"
+// 无法区分，正常业务也会命中备份销毁剧本。归一化后规则可写 delete.backup 精确命中。
+//
+// 部署位置：Normalizer 之后、SchemaMapper 之前。必须先于 SchemaMapper，
+// 因为后者用 set_attr_if_empty 写 activity_name，晚于它写入会被丢弃。
+class ActionNormalizer : public Processor {
+public:
+    bool process(AuditEvent& ev) override;
+    std::string name() const override { return "action_normalizer"; }
+};
+
 }  // namespace af::processor

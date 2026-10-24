@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Library Inventory System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+
+    <div class="app-shell">
+
+        <header class="topbar">
+            <div>
+                <h1>Library Inventory System</h1>
+                <p>Database-backed CRUD system with roles, search, loans, and testing</p>
+            </div>
+
+            <div id="userBox" class="user-box hidden">
+                <span id="currentUser"></span>
+                <button onclick="logout()" class="btn danger">Logout</button>
+            </div>
+        </header>
+
+        <main>
+
+            <!-- LOGIN -->
+            <section id="loginSection" class="card login-card">
+                <h2>Login</h2>
+                <p class="muted">Use one of the default accounts to test role-based access.</p>
+
+                <div class="quick-logins">
+                    <button onclick="fillLogin('admin', 'admin123')">Admin</button>
+                    <button onclick="fillLogin('librarian1', 'lib123')">Librarian</button>
+                    <button onclick="fillLogin('member1', 'member123')">Member</button>
+                </div>
+
+                <label>Username</label>
+                <input id="username" type="text" placeholder="admin">
+
+                <label>Password</label>
+                <input id="password" type="password" placeholder="admin123">
+
+                <button onclick="login()" class="btn primary full">Login</button>
+
+                <div id="loginMessage" class="message"></div>
+            </section>
+
+            <!-- APP CONTENT -->
+            <section id="mainApp" class="hidden">
+
+                <!-- DASHBOARD -->
+                <section class="grid cards-grid">
+                    <div class="stat-card">
+                        <span>Total Titles</span>
+                        <strong id="totalTitles">-</strong>
+                    </div>
+                    <div class="stat-card">
+                        <span>Total Copies</span>
+                        <strong id="totalCopies">-</strong>
+                    </div>
+                    <div class="stat-card">
+                        <span>Available Copies</span>
+                        <strong id="availableCopies">-</strong>
+                    </div>
+                    <div class="stat-card">
+                        <span>Active Loans</span>
+                        <strong id="activeLoans">-</strong>
+                    </div>
+                </section>
+
+                <!-- BOOKS -->
+                <section class="card">
+                    <div class="section-header">
+                        <div>
+                            <h2>Books</h2>
+                            <p class="muted">Search, filter, and borrow books.</p>
+                        </div>
+                        <button onclick="loadBooks()" class="btn">Refresh</button>
+                    </div>
+
+                    <div class="filters">
+                        <input id="searchInput" type="text" placeholder="Search title, author, or ISBN">
+                        <input id="genreInput" type="text" placeholder="Genre">
+                        <select id="availableInput">
+                            <option value="">All books</option>
+                            <option value="true">Available only</option>
+                        </select>
+                        <button onclick="loadBooks()" class="btn primary">Search</button>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Title</th>
+                                    <th>Author</th>
+                                    <th>Genre</th>
+                                    <th>Copies</th>
+                                    <th>Available</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="booksTable"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- ADD BOOK -->
+                <section id="addBookSection" class="card hidden">
+                    <h2>Add New Book</h2>
+                    <p class="muted">Only Admin and Librarian accounts can add books.</p>
+
+                    <div class="form-grid">
+                        <input id="newIsbn" type="text" placeholder="ISBN">
+                        <input id="newTitle" type="text" placeholder="Title">
+                        <input id="newAuthor" type="text" placeholder="Author">
+                        <input id="newGenre" type="text" placeholder="Genre">
+                        <input id="newYear" type="number" placeholder="Publication year">
+                        <input id="newCopies" type="number" placeholder="Total copies">
+                    </div>
+
+                    <button onclick="addBook()" class="btn primary">Add Book</button>
+                    <div id="addBookMessage" class="message"></div>
+                </section>
+
+                <!-- MY LOANS -->
+                <section class="card">
+                    <div class="section-header">
+                        <div>
+                            <h2>My Loans</h2>
+                            <p class="muted">Books borrowed by the logged-in user.</p>
+                        </div>
+                        <button onclick="loadMyLoans()" class="btn">Refresh</button>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Loan ID</th>
+                                    <th>Book</th>
+                                    <th>Due Date</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="myLoansTable"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- ALL LOANS -->
+                <section id="allLoansSection" class="card hidden">
+                    <div class="section-header">
+                        <div>
+                            <h2>All Loans</h2>
+                            <p class="muted">Visible only to Admin and Librarian.</p>
+                        </div>
+                        <button onclick="loadAllLoans()" class="btn">Refresh</button>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Loan ID</th>
+                                    <th>User</th>
+                                    <th>Book</th>
+                                    <th>Due Date</th>
+                                    <th>Status</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="allLoansTable"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- USERS -->
+                <section id="usersSection" class="card hidden">
+                    <div class="section-header">
+                        <div>
+                            <h2>User Management</h2>
+                            <p class="muted">Visible only to Admin.</p>
+                        </div>
+                        <button onclick="loadUsers()" class="btn">Refresh</button>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>User ID</th>
+                                    <th>Username</th>
+                                    <th>Role</th>
+                                    <th>Change Role</th>
+                                </tr>
+                            </thead>
+                            <tbody id="usersTable"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+            </section>
+
+        </main>
+
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

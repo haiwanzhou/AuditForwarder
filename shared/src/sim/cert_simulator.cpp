@@ -34,6 +34,7 @@ struct SimEvent {
     std::uint64_t ts_us { 0 };
     std::string server_id;
     std::string op_type;
+    std::string action_norm;   // <verb>.<object>，规则精确匹配用
     std::string res_key;
     std::string op_param;
 };
@@ -70,6 +71,7 @@ std::string event_line(const SimEvent& e) {
       << "\"event_timestamp_us\": " << e.ts_us << ", "
       << "\"server_id\": \"" << json_escape(e.server_id) << "\", "
       << "\"op_type\": \"" << json_escape(e.op_type) << "\", "
+      << "\"action_norm\": \"" << json_escape(e.action_norm) << "\", "
       << "\"res_key\": \"" << json_escape(e.res_key) << "\", "
       << "\"op_param\": \"" << json_escape(e.op_param) << "\", "
       << "\"return_code\": 0"
@@ -147,6 +149,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             a1.operator_name = "DBA Li";
             a1.server_id = "db-srv";
             a1.op_type = "file/delete";
+            a1.action_norm = "delete.backup";
             a1.res_key = "/backup/library_full_backup.bak";
             a1.op_param = "rm -f /backup/library_full_backup.bak";
             a1.ts_us = t0;
@@ -156,6 +159,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             a2.oper_id = "op_dba2";
             a2.operator_name = "DBA Wang";
             a2.op_type = "disk/unmount";
+            a2.action_norm = "unmount.volume";
             a2.res_key = "/backup/backup_volume";
             a2.op_param = "umount /backup/backup_volume";
             a2.ts_us = t0 + 3ull * 60ull * 1000000ull;
@@ -165,6 +169,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             a3.oper_id = "op_dba3";
             a3.operator_name = "DBA Zhao";
             a3.op_type = "file/snapshot";
+            a3.action_norm = "delete.snapshot";
             a3.res_key = "/backup/library_snapshot";
             a3.op_param = "snapshot --target /backup/library_snapshot";
             a3.ts_us = t0 + 6ull * 60ull * 1000000ull;
@@ -179,6 +184,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             b1.operator_name = "Service Admin";
             b1.server_id = "db-srv";
             b1.op_type = "db/grant";
+            b1.action_norm = "grant.user";
             b1.res_key = "/var/db/library.sql";
             b1.op_param = "GRANT ALL ON library.* TO tmp_user";
             b1.ts_us = t0;
@@ -188,6 +194,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             b2.oper_id = "op_svc2";
             b2.operator_name = "Service Operator";
             b2.op_type = "db/export";
+            b2.action_norm = "export.book";
             b2.res_key = "/var/db/library.sql";
             b2.op_param = "mysqldump --result-file=/tmp/library.sql library";
             b2.ts_us = t0 + 2ull * 60ull * 1000000ull;
@@ -195,6 +202,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
 
             SimEvent b3 = b2;
             b3.op_type = "db/clear";
+            b3.action_norm = "clear.book_audit";
             b3.op_param = "TRUNCATE TABLE loans";
             b3.ts_us = t0 + 5ull * 60ull * 1000000ull;
             events.push_back(b3);
@@ -208,6 +216,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             c1.operator_name = "Insider Chen";
             c1.server_id = "book-web";
             c1.op_type = "file/export";
+            c1.action_norm = "export.book";
             c1.res_key = "/reports/all_loans.csv";
             c1.op_param = "export --all --format csv";
             c1.ts_us = t0;
@@ -215,6 +224,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
 
             SimEvent c2 = c1;
             c2.op_type = "file/clear";
+            c2.action_norm = "clear.book_audit";
             c2.op_param = "clear --path /reports --all";
             c2.ts_us = t0 + 3ull * 60ull * 1000000ull;
             events.push_back(c2);
@@ -228,6 +238,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             d1.operator_name = "Insider Sun";
             d1.server_id = "db-srv";
             d1.op_type = "db/grant";
+            d1.action_norm = "grant.user";
             d1.res_key = "/var/db/secret.sql";
             d1.op_param = "GRANT SELECT ON secret.* TO backup_user";
             d1.ts_us = t0;
@@ -237,6 +248,7 @@ std::string simulate_jsonl(const SimConfig& cfg) {
             d2.oper_id = "op_ins3";
             d2.operator_name = "Insider Zhou";
             d2.op_type = "db/export";
+            d2.action_norm = "export.book";
             d2.op_param = "mysqldump --result-file=/tmp/secret.sql secret";
             d2.ts_us = t0 + 2ull * 60ull * 1000000ull;
             events.push_back(d2);

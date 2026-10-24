@@ -26,6 +26,14 @@ struct HttpProxyConfig {
     std::vector<std::string> target_hosts;    // 受管系统主机列表，空 = 采集全部主机
     bool        capture_body { false };        // 是否留存请求体（下游 PIIMasker 负责脱敏）
     std::size_t max_body_bytes { 1024 };      // 请求体留存上限
+
+    // 操作员身份提取（跨操作员合谋检测的前提）：
+    // 事件的操作员默认取客户端配置的 operator.id，一台机器只能对应一个操作员。
+    // 开启以下来源后，采集器会从每个请求里解析真实身份，覆盖配置值。
+    std::string identity_header { "x-af-operator" };  // 显式身份头（脚本 / 网关注入）
+    std::string identity_cookie { "af_operator" };    // 身份 Cookie（业务系统登录后下发）
+    bool        identity_from_bearer { true };       // 解 Authorization: Bearer 里的 username
+    bool        identity_from_body { true };         // 登录请求体中的 username 兜底
 };
 
 namespace http_proxy_detail {

@@ -98,6 +98,11 @@ constexpr const char* kSchemaOutcome      = "ocsf.outcome";        // success/fa
 constexpr const char* kSchemaSeverityId   = "ocsf.severity_id";    // OCSF 数值严重度 1-6
 constexpr const char* kSchemaTargetSystem = "ocsf.target_system";  // 受管系统标识（host:port / local）
 constexpr const char* kSchemaMetadata     = "ocsf.metadata";       // JSON: 版本/产品/采集器/时间戳等
+// —— 动作归一化（合谋检测用）——
+// 形如 "<verb>.<object>"，例如 delete.backup / unmount.volume / clear.logs。
+// 由 ActionNormalizer 在 SchemaMapper 之前写入，随 operation-logs 以顶层字段
+// action_norm 上送；服务端规则据此做精确匹配，避免 "delete" 裸词命中所删除书。
+constexpr const char* kActionNorm         = "ozsf.action_norm";
 }  // namespace attr
 
 // 当前 Unix 毫秒时间戳。

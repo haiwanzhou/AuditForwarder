@@ -248,6 +248,7 @@ std::string default_config_json() {
   "score_high": 80,
   "score_mid": 40,
   "alert_dedup_seconds": 300,
+  "eager_eval": false,
   "emergency_mode": false,
   "emergency_until_epoch": 0,
   "profile_enabled": true,
@@ -282,58 +283,63 @@ std::string default_config_json() {
 }
 
 std::string default_rules_json() {
-    // 预置 5 条典型合谋规则（R-001~R-005），sequence 为按时间有序的操作子序列，
-    // 每一步任一关键词命中即视为完成该步骤；支持配置化扩展与热加载。
+    // 预置合谋规则：sequence 为按时间有序的操作子序列，每一步任一关键词命中即完成该步骤。
+    //
+    // 关键词一律使用动作归一化后的精确形式 <verb>.<object>（如 delete.backup）。
+    // 不要写裸词 "delete"：严格模式下裸词会被忽略；而在未归一化的事件上裸词又会
+    // 把"删除一本书"误判成"删除备份"。精确形式的来源见客户端 ActionNormalizer。
     return R"({
   "rules": [
     { "rule_id": "R-001", "name": "备份销毁合谋", "enabled": true,
       "asset_group": "backup-group", "min_operator_cnt": 2, "base_score": 85,
       "op_sequence": [
-        { "any_of": ["delete", "remove", "删除"] },
-        { "any_of": ["unmount", "detach", "卸载", "取消挂载"] },
-        { "any_of": ["snapshot", "快照"] }
+        { "any_of": ["delete.backup"] },
+        { "any_of": ["unmount.volume", "detach.volume"] },
+        { "any_of": ["delete.snapshot"] }
       ] },
     { "rule_id": "R-002", "name": "密钥权限拆分绕过", "enabled": true,
       "asset_group": "key-mgmt-group", "min_operator_cnt": 3, "base_score": 80,
       "op_sequence": [
-        { "any_of": ["generate", "create", "生成"] },
-        { "any_of": ["distribut", "grant", "分发", "授权"] },
-        { "any_of": ["clear", "clean", "清理", "清除"] }
+        { "any_of": ["create.key"] },
+        { "any_of": ["distribute.key"] },
+        { "any_of": ["clear.key_audit"] }
       ] },
     { "rule_id": "R-003", "name": "配置篡改链路", "enabled": true,
       "asset_group": "sys-config-group", "min_operator_cnt": 2, "base_score": 70,
       "op_sequence": [
-        { "any_of": ["write", "modify", "set", "修改", "配置"] },
-        { "any_of": ["restart", "stop", "start", "重启", "停止"] },
-        { "any_of": ["clear", "clean", "清空", "清除"] }
+        { "any_of": ["update.config"] },
+        { "any_of": ["restart.service"] },
+        { "any_of": ["clear.logs"] }
       ] },
     { "rule_id": "R-004", "name": "数据批量外泄", "enabled": true,
       "asset_group": "db-group", "min_operator_cnt": 2, "base_score": 82,
       "op_sequence": [
-        { "any_of": ["privilege", "elevat", "grant", "提权", "授权"] },
-        { "any_of": ["export", "download", "dump", "导出", "下载"] },
-        { "any_of": ["clear", "clean", "清除"] }
+        { "any_of": ["grant.user", "grant.privilege"] },
+        { "any_of": ["export.book", "export.db"] },
+        { "any_of": ["clear.book_audit", "clear.db_audit"] }
       ] },
     { "rule_id": "R-005", "name": "权限晋升合谋", "enabled": true,
       "asset_group": "*", "min_operator_cnt": 3, "base_score": 75,
       "op_sequence": [
-        { "any_of": ["role", "useradd", "创建角色", "创建用户", "new-user"] },
-        { "any_of": ["member", "assign", "加入", "添加"] },
-        { "any_of": ["admin", "sensitive", "exec", "敏感", "提权"] }
+        { "any_of": ["create.user"] },
+        { "any_of": ["assign.user", "grant.admin"] },
+        { "any_of": ["exec.purge_books", "exec.*"] }
       ] },
-    { "rule_id": "R-006", "name": "同一操作员导出后清除", "enabled": true,
+    { "rule_id": "R-006", "name": "同一操作员导出后清除", "enabled": false,
       "group_by": "operator", "timespan_us": 600000000,
       "min_operator_cnt": 1, "base_score": 80,
+      "note": "单人规则，与“只研究管理员合谋”的边界冲突，作为负样本禁用",
       "op_sequence": [
-        { "any_of": ["export", "download", "dump", "导出", "下载"] },
-        { "any_of": ["clear", "clean", "purge", "清除", "清空"] }
+        { "any_of": ["export.book", "export.db"] },
+        { "any_of": ["clear.book_audit", "clear.db_audit"] }
       ] },
-    { "rule_id": "R-007", "name": "同对象提权后外泄", "enabled": true,
+    { "rule_id": "R-007", "name": "同对象提权后外泄", "enabled": false,
       "group_by": "object", "timespan_us": 300000000,
       "min_operator_cnt": 2, "base_score": 82,
+      "note": "按 res_key 全等分组，提权与导出落在不同 URL，规则不可达",
       "op_sequence": [
-        { "any_of": ["privilege", "elevat", "grant", "提权", "授权"] },
-        { "any_of": ["export", "download", "dump", "导出", "下载"] }
+        { "any_of": ["grant.user"] },
+        { "any_of": ["export.book"] }
       ] }
   ]
 }
@@ -374,6 +380,7 @@ std::string config_to_json(const EngineConfig& c) {
       << "  \"score_high\": " << c.score_high << ",\n"
       << "  \"score_mid\": " << c.score_mid << ",\n"
       << "  \"alert_dedup_seconds\": " << c.alert_dedup_seconds << ",\n"
+      << "  \"eager_eval\": " << (c.eager_eval ? "true" : "false") << ",\n"
       << "  \"emergency_mode\": " << (c.emergency_mode ? "true" : "false") << ",\n"
       << "  \"emergency_until_epoch\": " << c.emergency_until_epoch << ",\n"
       << "  \"profile_enabled\": " << (c.profile_enabled ? "true" : "false") << ",\n"
@@ -445,6 +452,7 @@ EngineConfig config_from_json(const std::string& j) {
     c.score_high = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "score_high", 80)), 50), 100);
     c.score_mid = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "score_mid", 40)), 10), c.score_high - 1);
     c.alert_dedup_seconds = static_cast<u64>(logpolicy::json_size_field(j, "alert_dedup_seconds", 300));
+    c.eager_eval = json_bool_field(j, "eager_eval", false);
     c.emergency_mode = json_bool_field(j, "emergency_mode", false);
     c.emergency_until_epoch = static_cast<u64>(logpolicy::json_size_field(j, "emergency_until_epoch", 0));
     c.profile_enabled = json_bool_field(j, "profile_enabled", true);
@@ -621,13 +629,62 @@ bool any_keyword_hit(const std::vector<std::string>& keywords, const std::string
     return false;
 }
 
+// 规则步骤命中判定（动作归一化优先）。
+//
+// 背景：旧实现用裸词子串匹配 "delete"，"删除一本书"与"删除备份"无法区分，
+// 正常业务也会命中"备份销毁"剧本 → 误报。归一化后动作形如 delete.backup。
+//
+// 规则：
+//   1) 日志无 action_norm → 沿用原子串匹配（兼容非 HTTP / 旧客户端）。
+//   2) 关键词里出现带 "." 的精确动作名 → 进入严格模式：只认带 "." 的关键词，
+//      与 action_norm 全等或按通配符匹配；裸词一律忽略（避免又退回宽泛匹配）。
+//   3) 关键词全是裸词（旧规则集）→ 仍走子串匹配，保证老配置不至于全部哑火。
+//
+// 若要精确区分对象，规则必须写成 "<verb>.<object>"，例如 delete.backup。
+bool step_hit(const std::vector<std::string>& keywords, const CleanEvent& e) {
+    if (keywords.empty()) return false;
+    const std::string searchable = e.op_type + " " + e.res_key + " " + e.op_param;
+    if (e.action_norm.empty()) return any_keyword_hit(keywords, searchable);
+
+    bool has_dotted = false;
+    for (const auto& k : keywords) {
+        if (k.find('.') != std::string::npos) { has_dotted = true; break; }
+    }
+    if (!has_dotted) return any_keyword_hit(keywords, searchable);
+
+    const std::string norm = to_lower_copy(e.action_norm);
+    for (const auto& k : keywords) {
+        if (k.empty()) continue;
+        const std::string kw = to_lower_copy(k);
+        if (kw.find('.') == std::string::npos) continue;   // 严格模式忽略裸词
+        if (kw == norm) return true;
+        if (wildcard_match(kw, norm)) return true;
+    }
+    return false;
+}
+
+// 把事件按"发生时间"插入聚合集合，而不是按到达顺序追加。
+//
+// 为什么必须这样：规则里的 op_sequence 描述的是"先做什么、再做什么"，
+// is_subsequence() 是顺着 events 的顺序去比对的。单机时代客户端按操作顺序
+// 逐条上报，push_back 恰好等于时间序；一旦变成多台上报（两台管理员机器
+// 各跑一个采集器），到达顺序就由网络和批次节奏决定，A 机先操作却后上报
+// 是很常见的情况。此时集合里变成 [第2步, 第3步, 第1步]，
+// 本来成立的三步合谋会被判成"序列不成立"——告警直接丢失，而且不报错。
+//
+// 插入排序在窗口内的几十条事件上开销可以忽略，换来的是与证据时间线一致的语义。
+void append_event_ordered(std::vector<CleanEvent>& events, const CleanEvent& e) {
+    auto pos = events.end();
+    while (pos != events.begin() && (pos - 1)->ts_ms > e.ts_ms) --pos;
+    events.insert(pos, e);
+}
+
 bool is_subsequence(const std::vector<RuleStep>& sequence, const std::vector<CleanEvent>& events) {
     if (sequence.empty()) return false;
     std::size_t si = 0;
     for (const auto& e : events) {
         if (si >= sequence.size()) break;
-        std::string searchable = e.op_type + " " + e.res_key + " " + e.op_param;
-        if (any_keyword_hit(sequence[si].any_of, searchable)) ++si;
+        if (step_hit(sequence[si].any_of, e)) ++si;
     }
     return si == sequence.size();
 }
@@ -663,9 +720,7 @@ bool match_correlation_rule(const Rule& rule, const std::vector<CleanEvent>& eve
             const u64 ts_us = sorted[j].ts_us ? sorted[j].ts_us : sorted[j].ts_ms * 1000;
             // timespan 从序列首事件起算；超窗即停止（后续事件更晚，无需继续）
             if (rule.timespan_us > 0 && ts_us > start_us + rule.timespan_us) break;
-            const std::string searchable = sorted[j].op_type + " " + sorted[j].res_key + " " +
-                                           sorted[j].op_param;
-            if (!any_keyword_hit(rule.sequence[si].any_of, searchable)) continue;
+            if (!step_hit(rule.sequence[si].any_of, sorted[j])) continue;
             matched.push_back(sorted[j]);
             ++si;
         }
@@ -709,6 +764,9 @@ bool clean_event_json(const std::string& json, CleanEvent& out) {
     // 缺失关键直接丢弃（设计方案 3.1：缺失关键字段的日志直接丢弃）。
     out = CleanEvent{};
     out.oper_id = logpolicy::json_string_field(json, "oper_id");
+    // 客户端 operation-logs 信封使用 operator_id；必须优先取它，
+    // 否则 oper_id 落到 actor（进程名）上，跨操作员聚合会退化成"每个进程一个人"。
+    if (out.oper_id.empty()) out.oper_id = logpolicy::json_string_field(json, "operator_id");
     if (out.oper_id.empty()) out.oper_id = logpolicy::json_string_field(json, "operator");
     if (out.oper_id.empty()) out.oper_id = logpolicy::json_string_field(json, "actor");
     if (out.oper_id.empty()) return false;
@@ -740,8 +798,22 @@ bool clean_event_json(const std::string& json, CleanEvent& out) {
     if (out.res_key.empty()) out.res_key = logpolicy::json_string_field(json, "target");
     if (out.res_key.empty()) return false;
 
+    // 归一化动作（<verb>.<object>）：客户端 ActionNormalizer 产出，规则据此精确匹配。
+    // 缺失时回退到 OCSF activity_name，再缺失则由匹配逻辑回退到 op_type 子串匹配。
+    out.action_norm = logpolicy::json_string_field(json, "action_norm");
+    if (out.action_norm.empty()) out.action_norm = logpolicy::json_string_field(json, "ocsf.activity_name");
+
     out.op_param = logpolicy::json_string_field(json, "op_param");
     if (out.op_param.empty()) out.op_param = logpolicy::json_string_field(json, "message");
+    // 进程命令行补充：进程采集器只把命令行放在 attrs["process.command_line"]，
+    // 而服务端原先不读该字段，导致 mountvol / vssadmin 这类动作在日志里只剩进程名，
+    // 规则永远匹配不到。这里补进 op_param，让真实命令行进入检测视野。
+    {
+        const std::string cmdline = logpolicy::json_string_field(json, "process.command_line");
+        if (!cmdline.empty() && out.op_param.find(cmdline) == std::string::npos) {
+            out.op_param += " cmd=" + cmdline;
+        }
+    }
     out.work_order_id = logpolicy::json_string_field(json, "work_order_id");
     if (out.work_order_id.empty()) out.work_order_id = logpolicy::json_string_field(json, "ticket_id");
 
@@ -1182,10 +1254,22 @@ void Engine::ingest_json(const std::string& event_json) {
             if (!e.work_order_id.empty() &&
                 std::find(s.work_order_ids.begin(), s.work_order_ids.end(), e.work_order_id) == s.work_order_ids.end())
                 s.work_order_ids.push_back(e.work_order_id);
-            s.events.push_back(e);
+            // 按发生时间插入（不是 push_back）：跨机器上报的到达顺序不可靠，
+            // 详见 append_event_ordered 的说明。
+            append_event_ordered(s.events, e);
         };
         add(short_sets_, "short");
         add(long_sets_, "long");
+        // 实验模式：不等窗口结束，事件一进集合就评估一次（只看本事件所属窗口）
+        if (cfg_.eager_eval) {
+            for (auto& kv : short_sets_) {
+                if (kv.second.asset_group == ag &&
+                    std::find(kv.second.operator_ids.begin(), kv.second.operator_ids.end(), e.oper_id)
+                        != kv.second.operator_ids.end()) {
+                    eager_evaluate_locked(kv.second);
+                }
+            }
+        }
     }
     evaluate_correlation_locked(e);
 
@@ -1227,10 +1311,21 @@ int Engine::ingest_native_json(const std::string& body) {
                 if (!e.work_order_id.empty() &&
                     std::find(s.work_order_ids.begin(), s.work_order_ids.end(), e.work_order_id) == s.work_order_ids.end())
                     s.work_order_ids.push_back(e.work_order_id);
-                s.events.push_back(e);
+                // 按发生时间插入（不是 push_back）：跨机器上报的到达顺序不可靠，
+                // 详见 append_event_ordered 的说明。
+                append_event_ordered(s.events, e);
             };
             add(short_sets_, "short");
             add(long_sets_, "long");
+            if (cfg_.eager_eval) {
+                for (auto& kv : short_sets_) {
+                    if (kv.second.asset_group == ag &&
+                        std::find(kv.second.operator_ids.begin(), kv.second.operator_ids.end(), e.oper_id)
+                            != kv.second.operator_ids.end()) {
+                        eager_evaluate_locked(kv.second);
+                    }
+                }
+            }
         }
         evaluate_correlation_locked(e);
         ++accepted;
@@ -1239,11 +1334,22 @@ int Engine::ingest_native_json(const std::string& body) {
     return accepted;
 }
 
+// 实验模式：窗口尚未结束时对当前集合做一次增量评估。
+// 同一 key 只在事件数增加时评估，避免重复计算与重复告警。
+void Engine::eager_evaluate_locked(const AggSet& set) {
+    if (!cfg_.eager_eval) return;
+    if (set.distinct_op_count() < 2) return;
+    auto it = eager_last_count_.find(set.aggregate_key);
+    if (it != eager_last_count_.end() && it->second == set.events.size()) return;
+    eager_last_count_[set.aggregate_key] = set.events.size();
+    evaluate_locked(set, /*update_profile=*/false, /*eager=*/true);
+}
+
 void Engine::flush_due_locked(u64 now) {
     auto flush_map = [this](std::map<std::string, AggSet>& m, u64 now) {
         for (auto it = m.begin(); it != m.end();) {
             if (it->second.window_end_ms + cfg_.flush_grace_ms <= now) {
-                evaluate_locked(it->second);
+                evaluate_locked(it->second, true, false);
                 it = m.erase(it);
             } else {
                 ++it;
@@ -1295,7 +1401,11 @@ void Engine::prune_correlation_locked() {
 }
 
 void Engine::evaluate_correlation_locked(const CleanEvent& e) {
-    corr_events_.push_back(e);
+    // 同上：关联规则的 timespan 与 prune 的"最旧/最新"判断都假定队列按时间升序，
+    // 跨机器上报必须按发生时间插入，否则会误删还没过期的事件。
+    auto pos = corr_events_.end();
+    while (pos != corr_events_.begin() && (pos - 1)->ts_ms > e.ts_ms) --pos;
+    corr_events_.insert(pos, e);
     prune_correlation_locked();
 
     std::vector<const Rule*> active;
@@ -1473,7 +1583,7 @@ void Engine::update_profile_locked(const AggSet& set) {
     profile_dirty_ = true;
 }
 
-void Engine::evaluate_locked(const AggSet& set) {
+void Engine::evaluate_locked(const AggSet& set, bool update_profile, bool eager) {
     // 过滤规则：集合内不同操作员 < 2 直接丢弃（单人操作交由原有单条审计处理）
     if (set.distinct_op_count() < 2) return;
 
@@ -1481,9 +1591,13 @@ void Engine::evaluate_locked(const AggSet& set) {
     auto res = detect(set, cfg_, rules_, profile_, workorders_, now_ep, onnx_if_.get(), graph_baseline_.get());
 
     // 画像以本次集合为历史：先检测后更新（保证“陌生/跨域”基于此前基线判定）
-    update_profile_locked(set);
+    // eager 增量评估不更新画像，否则同一批事件会被重复计入协作次数。
+    if (update_profile) update_profile_locked(set);
 
     if (res.level == "NONE") return;   // 0 分无风险：直接丢弃不存储
+    // eager 增量评估期间，中间态（LOW）不落库，避免窗口未结束时刷屏；
+    // 真正的 HIGH/MID 仍然正常存储与告警。
+    if (eager && res.level == "LOW") return;
 
     // 长窗口为弱关联线索：最高只记为中风险（不触发高危）
     if (set.window_kind == "long" && res.level == "HIGH") {

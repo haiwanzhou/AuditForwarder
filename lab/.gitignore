@@ -1,0 +1,5 @@
+# 实验受管系统的运行数据，不入库
+book_system/library.db
+book_system/runtime/
+book_system/**/__pycache__/
+book_system/.pytest_cache/

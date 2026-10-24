@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -409,6 +410,15 @@ void RemoteAgentClient::stop() {
 }
 
 void RemoteAgentClient::enqueue_batch_summary(const chain::EventBatch& batch) {
+    // 每 100 个批次打一条，用来判断"操作日志发不出去"到底是
+    // 没入队（回调没触发 / running_ 为 false）还是发了没成功。
+    static std::atomic<std::uint64_t> enq_count{0};
+    auto seq = enq_count.fetch_add(1);
+    if (seq % 100 == 0) {
+        AF_LOG_INFO("remote_client[" << cfg_.host_id << "]: enqueue batch #" << seq
+                    << " events=" << batch.events.size()
+                    << " running=" << (running_.load() ? 1 : 0));
+    }
     if (!running_.load()) return;
     // 拷贝补盖客户端时间戳（用于服务端传输延迟统计），并按内容分流
     chain::EventBatch b = batch;
@@ -592,21 +602,39 @@ void RemoteAgentClient::send_heartbeat() {
 }
 
 void RemoteAgentClient::send_audit_summaries(bool high_only) {
+    // 单次最多取这么多批次。
+    //
+    // 原来的写法是把两个队列整批 swap 出来，队列堆到 1000 条时会构造出
+    // 几十 MB 的 body：发送超时 → 整批塞回队列 → 下次更大，形成"永远发不出去"
+    // 的死锁。表现出来的现象非常迷惑人：
+    //   心跳一直 ok、chain 通道的批次一直在 upload status=200，
+    //   但 operation-logs 一条都到不了服务端，合谋检测自然是空的。
+    // 分批发送才能把积压慢慢消化掉。
+    constexpr std::size_t kMaxPerSend = 40;
     std::vector<chain::EventBatch> pending;
+    auto take = [&pending](std::vector<chain::EventBatch>& q, std::size_t want) {
+        std::size_t n = want < q.size() ? want : q.size();
+        pending.insert(pending.end(),
+                       std::make_move_iterator(q.begin()),
+                       std::make_move_iterator(q.begin() + static_cast<std::ptrdiff_t>(n)));
+        q.erase(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(n));
+    };
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (high_only) {
-            pending.swap(hi_audit_queue_);
+            take(hi_audit_queue_, kMaxPerSend);
         } else {
-            // 定时通道：高优先级排在前面
-            pending.reserve(hi_audit_queue_.size() + audit_queue_.size());
-            for (auto& b : hi_audit_queue_) pending.push_back(std::move(b));
-            for (auto& b : audit_queue_)    pending.push_back(std::move(b));
-            hi_audit_queue_.clear();
-            audit_queue_.clear();
+            take(hi_audit_queue_, kMaxPerSend);              // 高优先级先走
+            take(audit_queue_, kMaxPerSend - pending.size()); // 剩余额度给普通
         }
     }
-    if (pending.empty()) return;
+    if (pending.empty()) {
+        static std::atomic<std::uint32_t> idle{0};
+        if ((idle.fetch_add(1) % 30) == 0) {
+            AF_LOG_INFO("remote_client[" << cfg_.host_id << "]: audit queue empty, nothing to send");
+        }
+        return;
+    }
     const char* channel_priority = high_only ? "high" : "normal";
     std::ostringstream body;
     body << "{"
@@ -663,6 +691,9 @@ void RemoteAgentClient::send_audit_summaries(bool high_only) {
                       << "\"priv_ts\":\"" << json_escape(attr_str(ev, logmeta::attr::kPrivTs, "")) << "\","
                       << "\"client_ts\":" << attr_str(ev, logmeta::attr::kClientTs, "0") << ","
                       << "\"message\":\"" << json_escape(ev.message) << "\","
+                      // 动作归一化结果（<verb>.<object>）：服务端合谋规则按此精确匹配，
+                      // 避免 "delete" 裸词把"删除一本书"误判为"删除备份"。
+                      << "\"action_norm\":\"" << json_escape(attr_str(ev, logmeta::attr::kActionNorm, "")) << "\","
                       // 完整 attrs 原样上送（含 ETW raw_xml/event_id 等富字段），
                       // 服务端按采集器过滤策略（strict/lenient）决定保留范围
                       << "\"attrs\":{";
@@ -694,6 +725,10 @@ void RemoteAgentClient::send_audit_summaries(bool high_only) {
             else AF_LOG_WARN("remote_client: operation logs upload failed: " << r2.error);
         }
         if (sent && (logs_sent || log_count == 0)) break;
+    }
+    if (logs_sent) {
+        AF_LOG_INFO("remote_client[" << cfg_.host_id << "]: operation-logs sent batches="
+                    << pending.size() << " logs=" << log_count);
     }
     if (!sent) {
         // 失败批次塞回各自优先级队列头部，高优先级不降级

@@ -1,52 +1,81 @@
-# 资产画像示例：自建 HTTP 图书管理系统（M6-2）
-# 部署：复制到服务端 <data_dir>/asset_profiles/ 目录，服务端 GET /asset-profiles 可见。
-# 一个受管系统一份文件，文件名任意，system_id 必须唯一。
+# 资产画像：自建 HTTP 图书管理系统（受管系统）
+# 部署：复制到服务端 <data_dir>/asset_profiles/ 目录（本实验为 data/server/asset_profiles/）。
+# 放在仓库 config/ 下服务端不会读取，只是母本；换机器时必须再复制一次。
+#
+# 实验约束：所有剧本的每一步都必须是"该角色本来就有权做的操作"，
+# 因此 roles 里不设 denied_actions —— 否则告警会被解释成"越权拦截"，
+# 与"合谋"无关，整份实验结果作废。
 
 system_id: book_system
 display_name: 自建图书管理系统
 access_mode: http
 
-# 事件 target_system 别名（大小写不敏感）：http.host 或 host:port
+# 事件 target_system 别名（大小写不敏感）：取 http.host，端口非 0 时拼成 host:port
 target_systems:
   - bookhost
   - "bookhost:18080"
+  - localhost
+  - "localhost:18080"
+  - 127.0.0.1
+  - "127.0.0.1:18080"
 
-# 未命中任何 resources 规则时的默认解释
 default_sensitivity: internal
 default_resource_type: data_record
 
 # 资源类型与敏感度分级（按顺序匹配，第一个命中生效；支持 * 与 ? 通配）
 resources:
-  - pattern: "/books*"
-    type: data_record
-    sensitivity: internal
-  - pattern: "/admin/*"
-    type: config
-    sensitivity: confidential
   - pattern: "*backup*"
     type: backup
     sensitivity: secret
-  - pattern: "*credential*"
+  - pattern: "*snapshot*"
+    type: snapshot
+    sensitivity: secret
+  - pattern: "*storage*"
+    type: storage_volume
+    sensitivity: confidential
+  - pattern: "*volume*"
+    type: storage_volume
+    sensitivity: confidential
+  - pattern: "*key*"
     type: credential
     sensitivity: secret
+  - pattern: "*config*"
+    type: config
+    sensitivity: confidential
+  - pattern: "*logs*"
+    type: audit_log
+    sensitivity: confidential
+  - pattern: "/api/admin/*"
+    type: admin_operation
+    sensitivity: confidential
+  - pattern: "*books*"
+    type: data_record
+    sensitivity: internal
 
-# 角色基线：allowed_actions 支持通配，denied_actions 优先级更高
+# 角色基线：只描述"该角色能做什么"，用于判断单步是否合规
 roles:
-  - role: reader
+  - role: admin
     allowed_actions:
-      - read
-  - role: editor
+      - "*"
+  - role: librarian
     allowed_actions:
       - read
       - create
       - write
-  - role: admin
+      - update
+      - delete
+      - export
+  - role: reader
     allowed_actions:
-      - "*"
-    denied_actions:
-      - delete_backup
+      - read
 
-# 操作员 -> 角色（operator_id 与客户端配置的 operator.id 一致）
+# 操作员 -> 角色（operator_id 必须与采集器上报的 operator_id 完全一致）
+# 采集器会从 HTTP 请求的 Authorization / af_operator Cookie 中解出真实用户名，
+# 所以这里的键就是图书系统里的登录账号。
 operator_roles:
-  op_sjg: admin
-  op_guest: reader
+  admin: admin
+  admin2: admin
+  admin3: admin
+  librarian1: librarian
+  librarian2: librarian
+  member1: reader

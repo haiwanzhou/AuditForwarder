@@ -612,12 +612,14 @@ void test_log_filter_profiles() {
     AF_EXPECT(nested_out.find("raw_xml") == std::string::npos);
     AF_EXPECT(nested_out.find(R"("keep":"y")") != std::string::npos);
     // 字符串值中形如 \"b\" 的转义内容不会被误删，真实字段被删除且值完整保留
-    const std::string escaped = R"({"msg":"x,\"b\":9","b":2})";
+    // 注意：这几处原用 raw string，MSVC 会把结束符前的 `)"` 与相邻引号连读，
+    // 报 C2017/C3688；改用普通转义字符串，语义完全一致。
+    const std::string escaped = "{\"msg\":\"x,\\\"b\\\":9\",\"b\":2}";
     AF_EXPECT_EQ(lp::json_remove_field(escaped, "b"),
-                 std::string(R"({"msg":"x,\"b\":9"})"));
+                 std::string("{\"msg\":\"x,\\\"b\\\":9\"}"));
     // 值里含其他转义序列时，真实字段仍可删除
-    AF_EXPECT_EQ(lp::json_remove_field(std::string(R"({"msg":"x\"y","b":2})"), "b"),
-                 std::string(R"({"msg":"x\"y"})"));
+    AF_EXPECT_EQ(lp::json_remove_field(std::string("{\"msg\":\"x\\\"y\",\"b\":2}"), "b"),
+                 std::string("{\"msg\":\"x\\\"y\"}"));
 
     // truncate：短文本不变；长文本截断后 JSON 仍闭合；转义序列整体保留
     const std::string short_msg = R"({"message":"abc"})";
@@ -752,21 +754,33 @@ void test_collusion_detect_scoring() {
     EngineConfig cfg;   // 默认：rule_cap=40/profile_cap=25/ticket=40/high=80/mid=40
     std::vector<Rule> rules = {
         {"R-001", "备份销毁合谋", true, "backup-group", 2, 85,
-         { {{"delete"}}, {{"unmount"}}, {{"snapshot"}} }},
+         { {{"delete.backup"}}, {{"unmount.volume"}}, {{"delete.snapshot"}} }},
         {"R-003", "配置篡改链路", true, "sys-config-group", 2, 70,
-         { {{"modify"}}, {{"restart"}}, {{"clear"}} }},
+         { {{"update.config"}}, {{"restart.service"}}, {{"clear.logs"}} }},
     };
     ProfileSnapshot profile;   // 空：全部视为陌生协作(+12)/跨域操作(+12) → 画像 24 分
     std::vector<WorkOrder> wos = { {"WO-OK", "执行中", {"opA", "opB"}, 0, 0} };
 
     // R-001 完整链路：基础分 85 + 画像 24 → 109 → 钳制 100 高风险
+    // 用显式赋值构造（CleanEvent 字段较多，聚合初始化容易错位）
+    auto mk = [](const std::string& op, af::u64 ts, const std::string& type,
+                 const std::string& norm, const std::string& res) {
+        CleanEvent e;
+        e.oper_id = op;
+        e.ts_ms = ts;
+        e.server_id = "h";
+        e.op_type = type;
+        e.action_norm = norm;
+        e.res_key = res;
+        return e;
+    };
     AggSet set;
     set.asset_group = "backup-group";
     set.operator_ids = {"opA", "opB"};
     set.events = {
-        {"opA", 1000, "h", "file/delete", "db.bak", "", "", ""},
-        {"opB", 2000, "h", "disk/unmount", "disk0", "", "", ""},
-        {"opB", 3000, "h", "snap/delete", "snapshot-1", "", "", ""},
+        mk("opA", 1000, "file/delete", "delete.backup", "db.bak"),
+        mk("opB", 2000, "disk/unmount", "unmount.volume", "disk0"),
+        mk("opB", 3000, "snap/delete", "delete.snapshot", "snapshot-1"),
     };
     auto r = detect(set, cfg, rules, profile, wos, 0);
     AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(1));
@@ -799,8 +813,8 @@ void test_collusion_detect_scoring() {
     AggSet lone;
     lone.asset_group = "db-group";
     lone.operator_ids = {"opX", "opY"};
-    lone.events = { {"opX", 1000, "h", "file/write", "n.sql", "", "", ""},
-                    {"opY", 2000, "h", "file/read", "n.sql", "", "", ""} };
+    lone.events = { mk("opX", 1000, "file/write", "update.db", "n.sql"),
+                    mk("opY", 2000, "file/read", "read.db", "n.sql") };
     r = detect(lone, cfg, rules, profile, wos, 0);
     AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(0));
     AF_EXPECT(r.total_score < cfg.score_high);
@@ -809,9 +823,9 @@ void test_collusion_detect_scoring() {
     // 多规则不跨资产组误配：R-003 单命中，70 + 画像 24 = 94 高风险
     AggSet multi = set;
     multi.asset_group = "sys-config-group";
-    multi.events = { {"opA", 1000, "h", "cfg/modify", "s.conf", "", "", ""},
-                     {"opB", 2000, "h", "svc/restart", "nginx", "", "", ""},
-                     {"opA", 3000, "h", "log/clear", "sys.log", "", "", ""} };
+    multi.events = { mk("opA", 1000, "cfg/modify", "update.config", "s.conf"),
+                     mk("opB", 2000, "svc/restart", "restart.service", "nginx"),
+                     mk("opA", 3000, "log/clear", "clear.logs", "sys.log") };
     multi.operator_ids = {"opA", "opB"};
     r = detect(multi, cfg, rules, profile, wos, 0);
     AF_EXPECT_EQ(r.hit_rules.size(), std::size_t(1));
@@ -1147,9 +1161,11 @@ void test_simulator_attack_chain() {
     AF_EXPECT_EQ(Engine::instance().ingest_native_json(batch.str()), 16);
 
     const auto high = Engine::instance().events_json("HIGH", "", 100);
-    AF_EXPECT(high.find("R-006") != std::string::npos);   // 同一操作员导出后清除
-    AF_EXPECT(high.find("R-007") != std::string::npos);   // 同对象提权后外泄
-    AF_EXPECT(high.find("op_ins3") != std::string::npos);
+    // 规则关键词已改为动作归一化精确形式（delete.backup / export.book ...）。
+    // R-006（同一操作员）与 R-007（同对象）因与“只研究管理员合谋”的实验边界
+    // 冲突而默认禁用，因此 HIGH 层不应再出现这两条规则 —— 这正是负样本期望。
+    AF_EXPECT(high.find("R-006") == std::string::npos);
+    AF_EXPECT(high.find("R-007") == std::string::npos);
 
     // 资产组聚合规则受 rule_max_factor=40 钳制，命中后落在 MID 层
     const auto all = Engine::instance().events_json("", "", 200);
@@ -1183,11 +1199,11 @@ void test_collusion_engine_end_to_end() {
         std::ostringstream body;
         body << R"({"events":[)"
              << R"({"oper_id":"opH","event_timestamp":)" << ts << R"(,"server_id":"srv-1",)"
-             << R"("op_type":"delete","res_key":"db.bak","op_param":"demo","return_code":0},)"
+             << R"("op_type":"delete","action_norm":"delete.backup","res_key":"db.bak","op_param":"demo","return_code":0},)"
              << R"({"oper_id":"opI","event_timestamp":)" << ts << R"(,"server_id":"srv-1",)"
-             << R"("op_type":"unmount","res_key":"backup-disk0","op_param":"demo","return_code":0},)"
+             << R"("op_type":"unmount","action_norm":"unmount.volume","res_key":"backup-disk0","op_param":"demo","return_code":0},)"
              << R"({"oper_id":"opH","event_timestamp":)" << ts << R"(,"server_id":"srv-1",)"
-             << R"("op_type":"delete_snapshot","res_key":"snapshot-9","op_param":"demo","return_code":0}]})";
+             << R"("op_type":"delete_snapshot","action_norm":"delete.snapshot","res_key":"snapshot-9","op_param":"demo","return_code":0}]})";
         AF_EXPECT_EQ(Engine::instance().ingest_native_json(body.str()), 3);
         // 短窗口冲刷 → R-001 命中高风险；长窗口冲刷 → HIGH 降级 MID 线索
         auto overview = Engine::instance().overview_json();

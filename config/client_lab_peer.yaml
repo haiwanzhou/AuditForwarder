@@ -1,0 +1,122 @@
+# AuditForwarder - 合谋实验专用客户端配置（第二台机器版）
+#
+# 与 client_lab.yaml 的唯一区别，都是为了"两台机器同时上报"能成立：
+#   1. host_id 改成 lab-pc2，服务端证据链才能区分是哪台机器
+#   2. remote/transport 指向服务端所在机器的局域网 IP，而不是 127.0.0.1
+#   3. 独立 data_dir，批次文件不会和另一台实例抢文件
+#   4. 代理端口 8889，方便在**同一台机器**上同时跑两个实例做预演
+#      （真正分两台电脑部署时，改回 8888 即可，8888 在各自机器上互不干扰）
+#
+# 用法：build\Release\auditforwarder-client.exe -c config/client_lab_peer.yaml -d data/client2
+
+agent:
+  id: "lab-pc2"
+  data_dir: data/client2
+  config_path: config/client_lab_peer.yaml
+
+# 默认操作员：仅当请求里解析不出身份时兜底
+operator:
+  id: "admin2"
+  name: "admin2"
+
+log:
+  level: info
+  file: data/client2/client.log
+  max_bytes: 52428800
+  max_backups: 5
+
+chain:
+  batch_size: 1
+  sign_batches: false
+  auto_persist: true
+  hmac_key: ""
+
+transport:
+  servers:
+    - "http://10.4.55.6:8443/ingest?agent=lab-pc2"
+  mode: realtime
+  interval_sec: 1
+  compress: false
+  encrypt_payload: false
+  auth_token: ""
+  verify_tls: false
+
+remote:
+  enabled: true
+  servers:
+    - "http://10.4.55.6:8443"
+  host_id: "lab-pc2"
+  heartbeat_interval_sec: 5
+  command_poll_interval_sec: 3
+  audit_summary_interval_sec: 2
+  production_mode: false
+  require_tls: false
+  crl_check: false
+  enrollment_key: ""
+  allowed_commands:
+    - collect_status
+    - echo
+    - set_collector
+    - set_collectors
+    - load_rules
+
+detector:
+  rules_path: config/rules.yaml
+  enable_behavior_baseline: true
+
+self_protect:
+  enabled: false
+
+manager:
+  enabled: false
+  auth_token: ""
+
+collectors:
+  enabled: true
+  filter:
+    file:
+      paths: []
+      include: []
+      exclude: []
+      coalesce_ms: 0
+    process:
+      exclude_images: ["*"]        # 只用 http_proxy，进程事件是噪音且会堵上报队列
+      emit_exit: false
+    network:
+      include_loopback: true
+      only_established: true
+      emit_only_new: true
+      poll_ms: 30000                # 网络快照降到 30 秒一次，减少无意义事件
+      exclude_remote_ports: []
+    etw:
+      event_ids: [4624, 4625, 4688]
+      logon_types: [2, 10, 11]
+      skip_machine_accounts: true
+      skip_system: true
+      extract_command_line: true
+  http_proxy:
+    enabled: true
+    bind: 127.0.0.1
+    listen_port: 8889
+    capture_body: true
+    # 必须写成行内数组：本项目的 YAML 解析器不认块序列，写成 "- 值" 会被
+    # 静默丢成空列表，而空列表的含义是"采集所有主机"。
+    target_hosts: ["127.0.0.1", "localhost", "10.4.55.6"]
+    identity:
+      header: "x-af-operator"
+      cookie: "af_operator"
+      from_bearer: true
+      from_body: true
+
+privilege_detect:
+  enabled: true
+
+test_injection:
+  enabled: false
+  interval_ms: 1000
+
+processors:
+  - type: enricher
+  - type: pii_masker
+  - type: deduper
+    window_ms: 50

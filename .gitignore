@@ -71,3 +71,16 @@ build-log.txt
 
 # 本地推送辅助脚本（含 Token 输入流程，不提交）
 推送到GitHub.bat
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 实验靶场（lab/book_system）的运行产物：
+# 数据库与备份/快照目录里会留下实验过程产生的痕迹，且可自动重建（setup_database 幂等），
+# 不进版本库，避免 clone 下来带着别人的测试数据。
+lab/book_system/library.db
+lab/book_system/runtime/
+
+# 客户端打包分发包（含 exe/dll，体积大，走 Release 分发而非仓库）
+friend-client/

@@ -1,0 +1,140 @@
+{
+  "enabled": true,
+  "note": "跨操作员合谋协同检测配置（热加载）。eager_eval=true 为实验/演示模式：事件一进入就评估，不等 15 分钟窗口结束；判定规则不变。",
+  "short_window_minutes": 15,
+  "long_window_hours": 4,
+  "flush_grace_seconds": 10,
+  "rule_max_factor": 40,
+  "profile_max_factor": 25,
+  "work_order_deduct": 40,
+  "forged_ticket_bonus": 10,
+  "score_high": 80,
+  "score_mid": 40,
+  "alert_dedup_seconds": 300,
+  "emergency_mode": false,
+  "emergency_until_epoch": 0,
+  "profile_enabled": true,
+  "ml_enabled": false,
+  "ml_high_threshold_pct": 70,
+  "ml_max_factor": 30,
+  "ml_model_path": "models/isolation_forest.onnx",
+  "graph_enabled": false,
+  "graph_threshold_pct": 30,
+  "graph_max_factor": 25,
+  "graph_window_minutes": 15,
+  "graph_density_threshold_pct": 30,
+  "complementary_action_pairs": [
+    {
+      "label": "备份破坏",
+      "first": [
+        "delete_backup",
+        "delete",
+        "remove",
+        "rm",
+        "删除",
+        "删备份"
+      ],
+      "second": [
+        "unmount",
+        "diskpart",
+        "format",
+        "卸载",
+        "磁盘"
+      ]
+    },
+    {
+      "label": "提权外泄",
+      "first": [
+        "grant",
+        "privilege",
+        "elevat",
+        "提权",
+        "授权"
+      ],
+      "second": [
+        "export",
+        "download",
+        "dump",
+        "导出",
+        "下载"
+      ]
+    }
+  ],
+  "asset_groups": [
+    {
+      "name": "backup-group",
+      "patterns": [
+        "*backup*",
+        "*snapshot*",
+        "*快照*",
+        "*.bak",
+        "*备份*",
+        "*storage*",
+        "*volume*",
+        "*unmount*"
+      ],
+      "note": "文档原始模式 + 图书系统的 storage/volume/unmount 路径（否则卸载卷会掉进 general-group，R-001 永久不命中）"
+    },
+    {
+      "name": "key-mgmt-group",
+      "patterns": [
+        "*key*",
+        "*secret*",
+        "*cert*",
+        "*.pem",
+        "*密钥*"
+      ]
+    },
+    {
+      "name": "sys-config-group",
+      "patterns": [
+        "*config*",
+        "*.conf",
+        "*.ini",
+        "*.yaml",
+        "*.yml",
+        "*.service",
+        "*hosts*",
+        "*system*",
+        "*restart*",
+        "*logs*"
+      ]
+    },
+    {
+      "name": "db-group",
+      "patterns": [
+        "*database*",
+        "*.db",
+        "*.sql",
+        "*mysql*",
+        "*postgres*",
+        "*oracle*",
+        "*redis*",
+        "*books*",
+        "*users*",
+        "*export*",
+        "*audit*",
+        "*loan*"
+      ]
+    },
+    {
+      "name": "general-group",
+      "patterns": [
+        "*"
+      ],
+      "note": "兜底资产组。R-005 的三步（/api/admin/user、assign-admin、/api/admin/exec）都落在这里，所以三步能聚到一个集合。"
+    }
+  ],
+  "whitelist_groups": [
+    {
+      "name": "示例-数据库协同组",
+      "operators": [
+        "op_dba1",
+        "op_dba2"
+      ],
+      "valid_until_epoch": 0,
+      "note": "预登记合法协同小组示例：请替换为实际操作员清单，0 表示长期有效"
+    }
+  ],
+  "eager_eval": true
+}

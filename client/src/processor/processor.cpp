@@ -368,8 +368,281 @@ std::string resolve_object(const AuditEvent& ev) {
     }
     return {};
 }
+
+// ---------------- 动作归一化辅助 ----------------
+
+bool ci_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
+bool ci_contains(const std::string& hay, const std::string& needle) {
+    if (needle.empty() || hay.size() < needle.size()) return false;
+    const std::string h = [&] {
+        std::string s = hay;
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }();
+    std::string n = needle;
+    for (auto& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return h.find(n) != std::string::npos;
+}
+
+// 路径切段：按 / 与 ? 分割，剔除空段、api 前缀、版本号与纯数字 ID。
+std::vector<std::string> path_segments(const std::string& uri) {
+    std::vector<std::string> out;
+    std::string cur;
+    auto flush = [&] {
+        if (cur.empty()) return;
+        std::string low;
+        low.reserve(cur.size());
+        for (char c : cur) low.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        const bool is_version = low.size() > 1 && low[0] == 'v' &&
+                                low.find_first_not_of("0123456789", 1) == std::string::npos;
+        const bool is_id = low.find_first_not_of("0123456789") == std::string::npos;
+        if (low != "api" && low != "rest" && low != "v1" && !is_version && !is_id) {
+            out.push_back(low);
+        }
+        cur.clear();
+    };
+    for (char c : uri) {
+        if (c == '/' || c == '?' || c == '&' || c == '=') flush();
+        else cur.push_back(c);
+    }
+    flush();
+    return out;
+}
+
+// 路径段中的"纯行为词"：只表示"做了什么"，不表示"对什么做"。
+// 注意不要把 backup / snapshot / key / volume 这类实体词放进来：
+// 它们既能当名词也能当动词（/api/backup 是"备份资源"，不是"做备份"），
+// 一律按实体处理，动作由 HTTP 方法给出，才得到 delete.backup 而不是 backup.unknown。
+const char* verb_of_token(const std::string& tok) {
+    static const char* kVerbs[] = {
+        "unmount", "detach", "mount", "attach", "restart", "stop", "start",
+        "clear", "purge", "clean", "restore", "recover", "export", "download",
+        "dump", "grant", "privilege", "assign", "distribute", "generate",
+        "exec", "execute", "rotate", "revoke", "login", "logout"
+    };
+    for (const char* v : kVerbs) {
+        if (tok == v) return v;
+    }
+    // 英文动词的常见变形（deleted / deletion / removing ...）做前缀收敛
+    static const char* kPrefix[] = {
+        "delet", "remov", "unmount", "detach", "restart", "clear", "pur",
+        "clean", "restor", "export", "download", "dump", "grant", "privileg",
+        "assign", "distribut", "generat", "execut", "rotat", "revok"
+    };
+    for (const char* p : kPrefix) {
+        if (tok.rfind(p, 0) == 0) return p;
+    }
+    return nullptr;
+}
+
+// 路径段中的"实体词"：表示对什么做，归一为单数规范名。
+std::string entity_of_token(const std::string& tok) {
+    struct Alias { const char* from; const char* to; };
+    static const Alias kAliases[] = {
+        {"books", "book"}, {"book", "book"},
+        {"backups", "backup"}, {"backup", "backup"}, {"bak", "backup"},
+        {"snapshots", "snapshot"}, {"snapshot", "snapshot"},
+        {"volumes", "volume"}, {"volume", "volume"}, {"storage", "volume"},
+        {"logs", "logs"}, {"log", "logs"},
+        {"configs", "config"}, {"config", "config"}, {"configuration", "config"},
+        {"settings", "config"}, {"setting", "config"},
+        {"keys", "key"}, {"key", "key"}, {"secrets", "key"}, {"secret", "key"},
+        {"certs", "key"}, {"cert", "key"},
+        {"users", "user"}, {"user", "user"},
+        {"audits", "audit"}, {"audit", "audit"},
+        {"services", "service"}, {"service", "service"},
+        {"systems", "system"}, {"system", "system"},
+        {"admins", "admin"}, {"admin", "admin"},
+        {"database", "db"}, {"databases", "db"}, {"db", "db"}, {"data", "db"},
+        {"privileges", "privilege"}, {"privilege", "privilege"},
+        {"roles", "role"}, {"role", "role"}
+    };
+    for (const auto& a : kAliases) {
+        if (tok == a.from) return a.to;
+    }
+    return {};
+}
+
+// 路径语义动作：/api/backup/3 (DELETE) → delete.backup
+//             /api/storage/volume/1/unmount → unmount.volume
+//             /api/system/logs/clear       → clear.logs
+//             /api/admin/exec + body action=purge_books → exec.purge_books
+std::string norm_from_uri(const std::string& uri, const std::string& method,
+                          const std::string& body) {
+    auto segs = path_segments(uri);
+    std::string verb;
+    std::string object;
+
+    // 从后往前找动作词：最后一个动作词即真正的语义动作
+    for (std::size_t i = segs.size(); i > 0; --i) {
+        const char* v = verb_of_token(segs[i - 1]);
+        if (v) {
+            verb = v;
+            // 动词 -> 规范形
+            if (verb == "privilege") verb = "grant";
+            if (verb == "execut")    verb = "exec";
+            if (verb == "delet")     verb = "delete";
+            if (verb == "remov")     verb = "delete";
+            if (verb == "unmount")   verb = "unmount";
+            if (verb == "clean")     verb = "clear";
+            if (verb == "pur")       verb = "clear";
+            if (verb == "restor")    verb = "restore";
+            if (verb == "updat")     verb = "update";
+            if (verb == "generat")   verb = "create";
+            if (verb == "distribut") verb = "distribute";
+            // 实体取动作词之前的最近实体；没有则继续向后找
+            for (std::size_t k = i - 1; k > 0; --k) {
+                object = entity_of_token(segs[k - 1]);
+                if (!object.empty()) break;
+            }
+            // 动作词出现在最前（如 /api/exec/...）时，实体可能在其后
+            if (object.empty()) {
+                for (std::size_t k = i; k < segs.size(); ++k) {
+                    object = entity_of_token(segs[k]);
+                    if (!object.empty()) break;
+                }
+            }
+            break;
+        }
+    }
+
+    // 无路径动作词：动词由 HTTP 方法决定，实体取**最后**一个实体词
+    // （/api/system/config → update.config，而不是 update.system）
+    if (verb.empty()) {
+        const std::string m = [&] {
+            std::string s = method;
+            for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return s;
+        }();
+        if      (m == "DELETE")              verb = "delete";
+        else if (m == "POST")                verb = "create";
+        else if (m == "PUT" || m == "PATCH") verb = "update";
+        else if (m == "GET" || m == "HEAD")  verb = "read";
+        else                                 verb = "call";
+        for (const auto& s : segs) {
+            std::string e = entity_of_token(s);
+            if (!e.empty()) object = e;
+        }
+    }
+
+    // audit 是"被审计对象的审计记录"，单说 clear.audit 会混淆"清书籍审计"与"清密钥审计"，
+    // 需要带上限定词：/api/books/audit/clear → clear.book_audit。
+    if (object == "audit") {
+        std::string qualifier;
+        for (const auto& s : segs) {
+            std::string e = entity_of_token(s);
+            if (e.empty() || e == "audit") continue;
+            qualifier = e;
+        }
+        if (!qualifier.empty()) object = qualifier + "_audit";
+    }
+
+    // exec 类接口把具体动作放在请求体里：{"action":"purge_books"}
+    if (verb == "exec" && !body.empty()) {
+        const std::string key = "\"action\"";
+        auto p = body.find(key);
+        if (p != std::string::npos) {
+            auto q = body.find('"', p + key.size() + 1);
+            if (q != std::string::npos) {
+                auto r = body.find('"', q + 1);
+                if (r != std::string::npos && r > q + 1) {
+                    std::string act = body.substr(q + 1, r - q - 1);
+                    for (auto& c : act) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (!act.empty()) object = act;
+                }
+            }
+        }
+    }
+
+    if (object.empty()) object = "unknown";
+    return verb + "." + object;
+}
+
+// 命令行/进程名语义动作：mountvol X: /D → unmount.volume
+//                       vssadmin delete shadows → delete.backup
+//                       wbadmin delete catalog  → delete.backup
+std::string norm_from_command(const std::string& text, const std::string& image) {
+    const std::string t = text + " " + image;
+    if (ci_contains(t, "vssadmin") && ci_contains(t, "delete"))                 return "delete.snapshot";
+    if (ci_contains(t, "wbadmin") && ci_contains(t, "delete"))                  return "delete.backup";
+    if (ci_contains(t, "mountvol"))                                             return "unmount.volume";
+    if (ci_contains(t, "diskpart"))                                             return "unmount.volume";
+    if (ci_contains(t, "bcdedit"))                                              return "update.config";
+    if (ci_contains(t, "reg ") && ci_contains(t, "delete"))                      return "delete.config";
+    if (ci_contains(t, "sc ") && (ci_contains(t, "stop") || ci_contains(t, "delete")))
+                                                                                return "stop.service";
+    if (ci_contains(t, "net user") && ci_contains(t, "/add"))                    return "create.user";
+    if (ci_contains(t, "net localgroup") && ci_contains(t, "add"))               return "assign.admin";
+    if ((ci_contains(t, "del ") || ci_contains(t, "rm ") || ci_contains(t, "erase ")) &&
+        (ci_contains(t, ".bak") || ci_contains(t, "backup") || ci_contains(t, "备份")))
+                                                                                return "delete.backup";
+    if (ci_contains(t, "log clear") || ci_contains(t, "wevtutil cl"))            return "clear.logs";
+    if (ci_contains(t, "taskkill") || ci_contains(t, "net stop"))                return "stop.service";
+    if (ci_contains(t, "purge") || ci_contains(t, "truncate"))                   return "clear.db";
+    if (ci_contains(t, "export") || ci_contains(t, "mysqldump") || ci_contains(t, "pg_dump"))
+                                                                                return "export.db";
+    return {};
+}
+
 }  // namespace
 
+bool ActionNormalizer::process(AuditEvent& ev) {
+    // 采集器或适配器已显式给出归一动作时不覆盖（便于测试注入与外部系统直报）
+    if (!get_attr(ev, logmeta::attr::kActionNorm).empty()) return true;
+
+    const std::string collector = logmeta::collector_id(ev);
+    const bool is_http = collector == logmeta::collector::kHttpProxy ||
+                         !get_attr(ev, logmeta::attr::kHttpUri).empty();
+
+    std::string norm;
+    if (is_http) {
+        std::string uri = get_attr(ev, logmeta::attr::kHttpUri);
+        if (uri.empty()) uri = ev.target.path;
+        const std::string method = get_attr(ev, logmeta::attr::kHttpMethod);
+        norm = norm_from_uri(uri, method, get_attr(ev, logmeta::attr::kHttpReqBody));
+    } else {
+        // 进程/命令/文件类：优先命令行，其次 message + 进程名
+        std::string text = get_attr(ev, logmeta::attr::kCommandLine);
+        if (text.empty()) text = ev.command.empty() ? ev.message : ev.command;
+        norm = norm_from_command(text, ev.actor.name);
+        if (norm.empty()) {
+            // 文件类事件：按目标路径与 action 收敛
+            const std::string path = ev.target.path;
+            if (!path.empty()) {
+                std::string object;
+                if (ci_contains(path, "backup") || ci_contains(path, ".bak") || ci_contains(path, "备份"))
+                    object = "backup";
+                else if (ci_contains(path, "snapshot") || ci_contains(path, "快照")) object = "snapshot";
+                else if (ci_contains(path, ".conf") || ci_contains(path, ".ini") ||
+                         ci_contains(path, ".yaml") || ci_contains(path, ".yml") ||
+                         ci_contains(path, "config")) object = "config";
+                else if (ci_contains(path, ".log")) object = "logs";
+                if (!object.empty()) {
+                    norm = std::string(to_string(ev.action)) + "." + object;
+                }
+            }
+        }
+    }
+
+    if (norm.empty()) {
+        // 兜底：category/action 两级，保证每条事件都有可匹配的动作名
+        norm = std::string(to_string(ev.action)) + ".unknown";
+    }
+    ev.attrs[logmeta::attr::kActionNorm] = norm;
+    return true;
+}
+
+// =====================================================================
+// SchemaMapper（OCSF 子集映射，M6-1）
+// =====================================================================
 bool SchemaMapper::process(AuditEvent& ev) {
     // 1. actor：操作员身份优先，其次登录用户，再次进程名（M7 图谱以操作员为主键）
     std::string actor = get_attr(ev, logmeta::attr::kOperatorId);

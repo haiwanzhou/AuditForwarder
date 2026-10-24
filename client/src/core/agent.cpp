@@ -150,6 +150,14 @@ Result<void> Agent::init(const AgentConfig& cfg) {
                 c.get_int("collectors.http_proxy.listen_port", cfg_.http_proxy_listen_port));
             cfg_.http_proxy_capture_body = c.get_bool("collectors.http_proxy.capture_body",
                                                       cfg_.http_proxy_capture_body);
+            cfg_.http_proxy_identity_header = c.get_string("collectors.http_proxy.identity.header",
+                                                           cfg_.http_proxy_identity_header);
+            cfg_.http_proxy_identity_cookie = c.get_string("collectors.http_proxy.identity.cookie",
+                                                           cfg_.http_proxy_identity_cookie);
+            cfg_.http_proxy_identity_from_body = c.get_bool("collectors.http_proxy.identity.from_body",
+                                                            cfg_.http_proxy_identity_from_body);
+            cfg_.http_proxy_identity_from_bearer = c.get_bool("collectors.http_proxy.identity.from_bearer",
+                                                              cfg_.http_proxy_identity_from_bearer);
             const auto& target_hosts = c.root().at("collectors").at("http_proxy").at("target_hosts").as_list();
             if (!target_hosts.empty()) {
                 cfg_.http_proxy_target_hosts.clear();
@@ -274,6 +282,9 @@ Result<void> Agent::init(const AgentConfig& cfg) {
                                                                    cfg_.operator_id, cfg_.operator_name));
     // 数据清洗与标准化：在增强（补 host/agent_id）之后、去重之前统一字段格式
     processors_.emplace_back(std::make_unique<processor::Normalizer>());
+    // 动作归一化：把 HTTP 路径/命令行收敛成 <verb>.<object>，供合谋规则精确匹配。
+    // 必须早于 SchemaMapper（后者用 set_attr_if_empty，晚写会被丢弃）。
+    processors_.emplace_back(std::make_unique<processor::ActionNormalizer>());
     // OCSF 子集 schema 映射（M6-1）：输出 actor/activity_name/object/... 到 attrs
     processors_.emplace_back(std::make_unique<processor::SchemaMapper>());
     processors_.emplace_back(std::make_unique<processor::PIIMasker>());
@@ -447,6 +458,9 @@ Result<void> Agent::start() {
         hp_cfg.listen_port  = static_cast<u16>(cfg_.http_proxy_listen_port);
         hp_cfg.target_hosts = cfg_.http_proxy_target_hosts;
         hp_cfg.capture_body = cfg_.http_proxy_capture_body;
+        hp_cfg.identity_header    = cfg_.http_proxy_identity_header;
+        hp_cfg.identity_cookie    = cfg_.http_proxy_identity_cookie;
+        hp_cfg.identity_from_body = cfg_.http_proxy_identity_from_body;
         collectors_.push_back(std::make_unique<HttpProxyCollector>(std::move(hp_cfg)));
     }
     if (cfg_.collectors_enabled) {
