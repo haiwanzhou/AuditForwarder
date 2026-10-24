@@ -51,6 +51,18 @@ struct EngineConfig {
     int     score_high         { 80 };               // 高风险阈值
     int     score_mid          { 40 };               // 中风险阈值
     u64     alert_dedup_seconds{ 300 };              // 同一聚合 key 告警降噪窗口
+    // ---- 链式滑动匹配（低频慢速合谋）----
+    // 固定窗口（tumbling window）以 :00/:15/:30/:45 对齐切分，攻击者只要把三步
+    // 跨过窗口边界（甚至隔几小时、隔天）就完全落进不同集合，固定窗口永远拼不出链。
+    // chain_mode=true 时改为「以最新事件为右端点、向前回溯 chain_span」的滑动聚合：
+    //   - 不按自然时间切片，相邻两步间隔再大也只受 chain_span 总跨度约束；
+    //   - 跨度越长证据关联越弱，由 span_decay_* 做温和降分，而不是直接漏检。
+    bool    chain_mode        { true };
+    u64     chain_span_ms     { 7ull * 24 * 3600 * 1000 };  // 链最大总跨度（0 = 不限，仅受容量约束）
+    std::size_t chain_max_events{ 200 };             // 单次链评估取用的最近事件上限
+    u64     span_decay_start_ms{ 60ull * 60 * 1000 };  // 跨度超过 1 小时后开始降分
+    int     span_decay_per_hour{ 1 };                // 每超 1 小时扣 1 分
+    int     span_decay_max    { 15 };                // 降分封顶（只削弱、不抹除）
     // 实验/演示模式：每接入一条事件就对所属窗口做一次增量评估，
     // 不必等 15 分钟窗口结束才出结果（答辩现场不可能等窗口）。
     // 只影响"何时评估"，不影响判定规则本身；LOW 结果不落库，避免刷屏。
@@ -288,6 +300,8 @@ private:
     void flush_due_locked(u64 now_ms);            // 冲刷到期窗口 → 检测 → 告警/存储
     void evaluate_locked(const AggSet& set, bool update_profile = true, bool eager = false);
     void eager_evaluate_locked(const AggSet& set);   // 实验模式：窗口未结束也评估
+    void chain_eval_locked(const CleanEvent& e);      // 链式滑动匹配：以 e 为右端点回溯聚合
+    void prune_chain_locked();                        // 裁剪链事件缓冲（跨度 + 容量）
     // ---- M6-3 Sigma correlation 关联规则 ----
     void evaluate_correlation_locked(const CleanEvent& e);      // 滚动缓冲内匹配跨事件序列
     void prune_correlation_locked();                            // 按最大 timespan 与容量裁剪
@@ -312,6 +326,8 @@ private:
 
     std::map<std::string, AggSet> short_sets_;    // aggregate_key -> 集合
     std::map<std::string, AggSet> long_sets_;
+    std::deque<CleanEvent>    chain_events_;      // 链式滑动匹配的事件缓冲（按 ts 升序）
+    std::map<std::string, u64> last_chain_alert_ms_;  // 链指纹降噪：指纹 -> 上次告警毫秒
     std::map<std::string, u64> last_alert_epoch_; // 告警降噪：aggregate_key -> 上次告警时间
     std::map<std::string, std::size_t> eager_last_count_;  // eager 模式：key -> 已评估事件数
     // ---- M6-3：Sigma correlation 滚动事件缓冲与告警降噪 ----

@@ -248,6 +248,12 @@ std::string default_config_json() {
   "score_high": 80,
   "score_mid": 40,
   "alert_dedup_seconds": 300,
+  "chain_mode": true,
+  "chain_span_minutes": 10080,
+  "chain_max_events": 200,
+  "span_decay_start_minutes": 60,
+  "span_decay_per_hour": 1,
+  "span_decay_max": 15,
   "eager_eval": false,
   "emergency_mode": false,
   "emergency_until_epoch": 0,
@@ -297,8 +303,10 @@ std::string default_rules_json() {
         { "any_of": ["unmount.volume", "detach.volume"] },
         { "any_of": ["delete.snapshot"] }
       ] },
+    // 只约束「有几个人分担了这条链」，不约束「谁做哪一步」：
+    // 甲做前两步、丙做第三步，与甲/乙/丙各做一步，同样命中。
     { "rule_id": "R-002", "name": "密钥权限拆分绕过", "enabled": true,
-      "asset_group": "key-mgmt-group", "min_operator_cnt": 3, "base_score": 80,
+      "asset_group": "key-mgmt-group", "min_operator_cnt": 2, "base_score": 75,
       "op_sequence": [
         { "any_of": ["create.key"] },
         { "any_of": ["distribute.key"] },
@@ -380,6 +388,12 @@ std::string config_to_json(const EngineConfig& c) {
       << "  \"score_high\": " << c.score_high << ",\n"
       << "  \"score_mid\": " << c.score_mid << ",\n"
       << "  \"alert_dedup_seconds\": " << c.alert_dedup_seconds << ",\n"
+      << "  \"chain_mode\": " << (c.chain_mode ? "true" : "false") << ",\n"
+      << "  \"chain_span_minutes\": " << (c.chain_span_ms / 60000) << ",\n"
+      << "  \"chain_max_events\": " << c.chain_max_events << ",\n"
+      << "  \"span_decay_start_minutes\": " << (c.span_decay_start_ms / 60000) << ",\n"
+      << "  \"span_decay_per_hour\": " << c.span_decay_per_hour << ",\n"
+      << "  \"span_decay_max\": " << c.span_decay_max << ",\n"
       << "  \"eager_eval\": " << (c.eager_eval ? "true" : "false") << ",\n"
       << "  \"emergency_mode\": " << (c.emergency_mode ? "true" : "false") << ",\n"
       << "  \"emergency_until_epoch\": " << c.emergency_until_epoch << ",\n"
@@ -452,6 +466,18 @@ EngineConfig config_from_json(const std::string& j) {
     c.score_high = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "score_high", 80)), 50), 100);
     c.score_mid = std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "score_mid", 40)), 10), c.score_high - 1);
     c.alert_dedup_seconds = static_cast<u64>(logpolicy::json_size_field(j, "alert_dedup_seconds", 300));
+    // ---- 链式滑动匹配（不再按固定窗口切分事件集）----
+    c.chain_mode = json_bool_field(j, "chain_mode", true);
+    // chain_span_minutes = 0 表示不限跨度（只受 chain_max_events 容量约束）
+    c.chain_span_ms = static_cast<u64>(logpolicy::json_size_field(j, "chain_span_minutes", 10080)) * 60000ull;
+    c.chain_max_events = static_cast<std::size_t>(logpolicy::json_size_field(j, "chain_max_events", 200));
+    c.chain_max_events = std::min<std::size_t>(std::max<std::size_t>(c.chain_max_events, 20), 2000);
+    c.span_decay_start_ms =
+        static_cast<u64>(logpolicy::json_size_field(j, "span_decay_start_minutes", 60)) * 60000ull;
+    c.span_decay_per_hour =
+        std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "span_decay_per_hour", 1)), 0), 10);
+    c.span_decay_max =
+        std::min(std::max(static_cast<int>(logpolicy::json_size_field(j, "span_decay_max", 15)), 0), 40);
     c.eager_eval = json_bool_field(j, "eager_eval", false);
     c.emergency_mode = json_bool_field(j, "emergency_mode", false);
     c.emergency_until_epoch = static_cast<u64>(logpolicy::json_size_field(j, "emergency_until_epoch", 0));
@@ -687,6 +713,54 @@ bool is_subsequence(const std::vector<RuleStep>& sequence, const std::vector<Cle
         if (step_hit(sequence[si].any_of, e)) ++si;
     }
     return si == sequence.size();
+}
+
+// 最小时间跨度匹配窗口。
+//
+// 为什么需要：链式滑动聚合会把「最近 N 天、同一资产组」的事件全放进一个集合。
+// 集合里必然混着大量与规则无关的历史事件，如果直接拿集合首末事件算跨度，
+// 会得到"跨了 7 天"的假跨度，时间衰减被误触发；证据链里也会塞满无关操作。
+//
+// 算法（两遍）：
+//   1) 正向贪心：找到最早能凑齐整条序列的末事件位置 e；
+//   2) 从 e 反向贪心：每一步都取"不晚于当前锚点、且最晚"的那条匹配事件，
+//      得到在末事件固定时的最晚起点 s。区间 [s, e] 即最小跨度窗口。
+// 这是子序列最短窗口问题的经典解法，O(n·k)。
+bool minimal_match_window(const Rule& rule, const std::vector<CleanEvent>& events,
+                          std::size_t& out_begin, std::size_t& out_end) {
+    const auto& seq = rule.sequence;
+    if (seq.empty() || events.empty()) return false;
+
+    // 1) 正向贪心：取得最早完成的末事件下标
+    std::size_t si = 0;
+    std::size_t end_idx = events.size();
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (si >= seq.size()) break;
+        if (step_hit(seq[si].any_of, events[i])) {
+            ++si;
+            if (si == seq.size()) { end_idx = i; break; }
+        }
+    }
+    if (end_idx == events.size()) return false;
+
+    // 2) 反向贪心：在 [0, end_idx] 内为每一步找最晚的可用匹配
+    std::size_t anchor = end_idx;
+    std::size_t begin_idx = 0;
+    for (std::size_t k = seq.size(); k-- > 0;) {
+        std::size_t found = anchor + 1;          // 初值 = 未找到
+        std::size_t i = anchor + 1;
+        while (i-- > 0) {
+            if (step_hit(seq[k].any_of, events[i])) { found = i; break; }
+        }
+        if (found > anchor) return false;        // 理论上不会发生（正向已证明有解）
+        begin_idx = found;
+        if (k == 0) break;
+        if (found == 0) return false;            // 前面已无位置容纳剩余步骤
+        anchor = found - 1;
+    }
+    out_begin = begin_idx;
+    out_end = end_idx;
+    return true;
 }
 
 std::string correlation_group_key(const std::string& group_by, const CleanEvent& e,
@@ -938,6 +1012,26 @@ DetectionResult detect(const AggSet& set,
             if (set.distinct_op_count() > 2) {
                 res.rule_factor += std::min((set.distinct_op_count() - 2) * 5, 20);
             }
+            // ---- 时间跨度衰减：链拉得越长，单条证据的关联性越弱 ----
+            // 注意这里不设「超过 X 分钟就不算」的硬门槛——那正是固定窗口的毛病，
+            // 攻击者拖长时间就能绕过。改为只扣分不否决：跨 12 小时的链依然是
+            // MID/HIGH，只是分数比 10 分钟内完成的同类链条低一些。
+            if (!set.events.empty() && set.events.back().ts_ms > set.events.front().ts_ms) {
+                u64 span_ms = set.events.back().ts_ms - set.events.front().ts_ms;
+                if (cfg.span_decay_start_ms > 0 && span_ms > cfg.span_decay_start_ms &&
+                    cfg.span_decay_per_hour > 0) {
+                    u64 over_hours = (span_ms - cfg.span_decay_start_ms) / 3600000ull;
+                    int minus = static_cast<int>(over_hours) * cfg.span_decay_per_hour;
+                    minus = std::min(minus, cfg.span_decay_max);
+                    if (minus > 0) {
+                        res.rule_factor = std::max(res.rule_factor - minus, 0);
+                        res.score_notes.push_back(
+                            "证据链跨度 " + std::to_string(span_ms / 60000ull) +
+                            " 分钟（跨窗口/跨时段），按长跨度衰减 -" + std::to_string(minus) +
+                            " 分（不否决命中）");
+                    }
+                }
+            }
         }
     }
 
@@ -1070,8 +1164,11 @@ void Engine::start(const std::string& data_dir) {
     short_sets_.clear();
     long_sets_.clear();
     corr_events_.clear();
+    chain_events_.clear();
     last_alert_epoch_.clear();
     last_corr_alert_ms_.clear();
+    last_chain_alert_ms_.clear();
+    eager_last_count_.clear();
     (void)fs::create_directories(collusion_dir(data_dir_));
     (void)fs::create_directories(policy_dir(data_dir_));
 
@@ -1261,7 +1358,10 @@ void Engine::ingest_json(const std::string& event_json) {
         add(short_sets_, "short");
         add(long_sets_, "long");
         // 实验模式：不等窗口结束，事件一进集合就评估一次（只看本事件所属窗口）
-        if (cfg_.eager_eval) {
+        if (cfg_.chain_mode) {
+            // 链式滑动匹配：不按固定窗口切分，跨窗口/跨时段的慢速合谋也能拼成链
+            chain_eval_locked(e);
+        } else if (cfg_.eager_eval) {
             for (auto& kv : short_sets_) {
                 if (kv.second.asset_group == ag &&
                     std::find(kv.second.operator_ids.begin(), kv.second.operator_ids.end(), e.oper_id)
@@ -1317,7 +1417,9 @@ int Engine::ingest_native_json(const std::string& body) {
             };
             add(short_sets_, "short");
             add(long_sets_, "long");
-            if (cfg_.eager_eval) {
+            if (cfg_.chain_mode) {
+                chain_eval_locked(e);
+            } else if (cfg_.eager_eval) {
                 for (auto& kv : short_sets_) {
                     if (kv.second.asset_group == ag &&
                         std::find(kv.second.operator_ids.begin(), kv.second.operator_ids.end(), e.oper_id)
@@ -1345,11 +1447,142 @@ void Engine::eager_evaluate_locked(const AggSet& set) {
     evaluate_locked(set, /*update_profile=*/false, /*eager=*/true);
 }
 
+// ---------------- 链式滑动匹配（低频慢速合谋） ----------------
+//
+// 固定窗口的根本问题不在"窗口太短"，而在"按自然时间切片"：
+// 三步操作只要分别落在 :14 和 :16、或者上午和下午，就会被切进两个互不相干的
+// 集合，各自都凑不齐序列 → 永远不报。窗口调多大都只是把攻击成本从 5 分钟
+// 抬高到 4 小时，攻击者拖到第二天照样绕过。
+//
+// 这里的做法是彻底换掉"切片"这个前提：
+//   1) 维护一个按发生时间排序的事件缓冲，不与任何窗口边界挂钩；
+//   2) 每来一条新事件，就以它为右端点向前回溯 chain_span 取候选集；
+//   3) 在候选集里为每条规则求「最短跨度匹配窗口」（minimal_match_window），
+//      只用这条最小证据链去做判定与落库；
+//   4) 跨度长不否决命中，只按 span_decay_* 温和扣分——长跨度是"可疑但关联弱"，
+//      不是"不算"。
+// 于是"早上一步、晚上一步"与"十秒内三步"走的是同一套判定，只是分数不同。
+
+void Engine::prune_chain_locked() {
+    // 容量兜底：链跨度可以配成不限，但内存不能真无限
+    const std::size_t hard_cap = std::max<std::size_t>(cfg_.chain_max_events * 8, 512);
+    while (chain_events_.size() > hard_cap) chain_events_.pop_front();
+
+    if (!chain_events_.empty() && cfg_.chain_span_ms > 0) {
+        const u64 newest = chain_events_.back().ts_ms;
+        if (newest > cfg_.chain_span_ms) {
+            const u64 cutoff = newest - cfg_.chain_span_ms;
+            while (!chain_events_.empty() && chain_events_.front().ts_ms < cutoff)
+                chain_events_.pop_front();
+        }
+    }
+
+    // 降噪表容量保护：清理已经出了降噪窗口的指纹
+    if (last_chain_alert_ms_.size() > 4096) {
+        const u64 now_ms_v = now_ms();
+        for (auto it = last_chain_alert_ms_.begin(); it != last_chain_alert_ms_.end();) {
+            if (now_ms_v >= it->second + 3600000ull) it = last_chain_alert_ms_.erase(it);
+            else ++it;
+        }
+    }
+}
+
+void Engine::chain_eval_locked(const CleanEvent& e) {
+    if (!cfg_.chain_mode || e.ts_ms == 0) return;
+
+    // 去重：重试/批次重放会把同一事件再送一遍，重复计入会让"操作员数"和
+    // 证据链长度虚高。只比对最近 2 秒内的同源事件，开销可忽略。
+    for (auto it = chain_events_.rbegin(); it != chain_events_.rend(); ++it) {
+        if (it->ts_ms + 2000 < e.ts_ms) break;
+        if (it->ts_ms == e.ts_ms && it->oper_id == e.oper_id && it->res_key == e.res_key &&
+            it->action_norm == e.action_norm)
+            return;
+    }
+    // 按发生时间插入（多台上报的到达顺序不可靠）
+    auto pos = chain_events_.end();
+    while (pos != chain_events_.begin() && (pos - 1)->ts_ms > e.ts_ms) --pos;
+    chain_events_.insert(pos, e);
+
+    prune_chain_locked();
+
+    const std::string ag = match_asset_group(cfg_.asset_groups, e.res_key);
+    if (ag.empty()) return;
+
+    // 候选集：同资产组、[e.ts - chain_span, e.ts]
+    const u64 lo = (cfg_.chain_span_ms > 0 && e.ts_ms > cfg_.chain_span_ms)
+                       ? e.ts_ms - cfg_.chain_span_ms : 0;
+    std::vector<CleanEvent> cand;
+    cand.reserve(std::min<std::size_t>(chain_events_.size(), cfg_.chain_max_events));
+    for (const auto& ev : chain_events_) {
+        if (ev.ts_ms < lo || ev.ts_ms > e.ts_ms) continue;
+        if (match_asset_group(cfg_.asset_groups, ev.res_key) != ag) continue;
+        cand.push_back(ev);
+    }
+    if (cand.size() > cfg_.chain_max_events) {
+        cand.erase(cand.begin(),
+                   cand.begin() + static_cast<std::ptrdiff_t>(cand.size() - cfg_.chain_max_events));
+    }
+    if (cand.size() < 2) return;
+
+    // 在候选集里为每条规则求最短跨度窗口，取最紧的一条作为本次证据链
+    const Rule* best_rule = nullptr;
+    std::size_t best_b = 0, best_e = 0;
+    u64 best_span = 0;
+    for (const auto& r : rules_) {
+        if (!r.enabled || r.group_by != "asset_group") continue;
+        if (r.asset_group != "*" && r.asset_group != ag) continue;
+        std::size_t b = 0, en = 0;
+        if (!minimal_match_window(r, cand, b, en)) continue;
+        const u64 span = cand[en].ts_ms - cand[b].ts_ms;
+        if (!best_rule || span < best_span) {
+            best_rule = &r;
+            best_b = b;
+            best_e = en;
+            best_span = span;
+        }
+    }
+    if (!best_rule) return;   // 没有任何规则能凑齐：不评估（画像/图谱仍由固定窗口维护）
+
+    AggSet set;
+    set.asset_group = ag;
+    set.window_kind = "chain";
+    set.events.assign(cand.begin() + static_cast<std::ptrdiff_t>(best_b),
+                      cand.begin() + static_cast<std::ptrdiff_t>(best_e) + 1);
+    set.window_start_ms = set.events.front().ts_ms;
+    set.window_end_ms = set.events.back().ts_ms;
+    // 操作员/工单只统计真正参与这条链的事件，避免把同时段无关人员算进去
+    for (const auto& ev : set.events) {
+        if (std::find(set.operator_ids.begin(), set.operator_ids.end(), ev.oper_id) == set.operator_ids.end())
+            set.operator_ids.push_back(ev.oper_id);
+        if (!ev.work_order_id.empty() &&
+            std::find(set.work_order_ids.begin(), set.work_order_ids.end(), ev.work_order_id)
+                == set.work_order_ids.end())
+            set.work_order_ids.push_back(ev.work_order_id);
+    }
+    if (set.distinct_op_count() < 2) return;
+
+    // 链指纹：首事件（操作员 + 毫秒时间戳）固定时，同一条链的 key 保持不变，
+    // 后续事件延长链也只会生成"同一批人 + 同一入口"的新指纹，便于降噪。
+    std::string ops_key;
+    for (const auto& op : set.operator_ids) { ops_key += op; ops_key += ","; }
+    set.aggregate_key = "chain|" + best_rule->rule_id + "|" + ag + "|" + ops_key +
+                        "|" + std::to_string(set.window_start_ms);
+
+    evaluate_locked(set, /*update_profile=*/false, /*eager=*/true);
+}
+
 void Engine::flush_due_locked(u64 now) {
     auto flush_map = [this](std::map<std::string, AggSet>& m, u64 now) {
         for (auto it = m.begin(); it != m.end();) {
             if (it->second.window_end_ms + cfg_.flush_grace_ms <= now) {
-                evaluate_locked(it->second, true, false);
+                if (cfg_.chain_mode) {
+                    // 链式模式下规则告警统一由 chain_eval_locked 负责（它是固定窗口
+                    // 的超集，且不会被窗口边界切断）。固定窗口在这里只保留画像维护，
+                    // 否则同一次合谋会被"固定窗口"和"滑动链"各报一次。
+                    update_profile_locked(it->second);
+                } else {
+                    evaluate_locked(it->second, true, false);
+                }
                 it = m.erase(it);
             } else {
                 ++it;
@@ -1613,11 +1846,15 @@ void Engine::evaluate_locked(const AggSet& set, bool update_profile, bool eager)
     }
 
     // 告警降噪：相同聚合 key 在降噪窗口内只告警一次
+    // 链式集合的 key 会随"证据链增长"重建，用更长的降噪窗口，避免同一条链
+    // 每来一条新事件就被重复落库（真正的新合谋会形成新指纹，不受影响）。
+    u64 dedup_secs = cfg_.alert_dedup_seconds;
+    if (set.window_kind == "chain") dedup_secs = std::max<u64>(dedup_secs, 3600);
     u64 last = 0;
     auto it = last_alert_epoch_.find(set.aggregate_key);
     if (it != last_alert_epoch_.end()) last = it->second;
     u64 now_ms_v = now_ms();
-    if (res.level != "LOW" && last && now_ms_v < last + cfg_.alert_dedup_seconds * 1000) {
+    if (res.level != "LOW" && last && now_ms_v < last + dedup_secs * 1000) {
         res.score_notes.push_back("同一聚合 key 告警降噪窗口内，抑制重复告警");
         return;
     }
@@ -1754,7 +1991,10 @@ std::string Engine::overview_json() {
       << "  \"profile_operators\": " << profile_.operator_assets.size() << ",\n"
       << "  \"profile_pairs\": " << profile_.pair_counts.size() << ",\n"
       << "  \"active_windows\": { \"short\": " << short_sets_.size()
-      << ", \"long\": " << long_sets_.size() << " },\n"
+      << ", \"long\": " << long_sets_.size()
+      << ", \"chain_buffer\": " << chain_events_.size() << " },\n"
+      << "  \"chain_mode\": " << (cfg_.chain_mode ? "true" : "false") << ",\n"
+      << "  \"chain_span_minutes\": " << (cfg_.chain_span_ms / 60000) << ",\n"
       << "  \"event_counts\": { \"HIGH\": " << high << ", \"MID\": " << mid
       << ", \"LOW\": " << low << " },\n"
       << "  \"pending_review\": " << pending_review << "\n"
