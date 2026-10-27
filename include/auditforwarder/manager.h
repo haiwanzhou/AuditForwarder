@@ -35,6 +35,12 @@ struct ManagerConfig {
     // 非空时，服务端对 /agent/audit-summaries 上报的批次签名逐条验签，失败即告警；
     // 为空时跳过验签（仅建议用于无签名的纯测试环境）。
     std::string chain_hmac_key;
+    // 存储分层（时间分片 + 冷热归档）：按数据类型分目录 + 按 YYYY-MM-DD 分片。
+    // 关闭 time_partition 时回退到旧的扁平/两级目录结构，保证向后兼容。
+    bool        storage_time_partition   { true };   // 是否按天分片
+    bool        storage_archive_enabled  { true };   // 是否启用冷热归档
+    int         storage_hot_days         { 7 };      // 热区保留天数，超过移入 archive/
+    int         storage_archive_days     { 180 };    // 归档保留天数，超过删除
 };
 
 class SimpleHttpManager : public ManagerServer {
@@ -64,6 +70,9 @@ private:
     std::thread         thr_;
     std::thread         monitor_thr_;        // 主动扫描主机在线/离线状态
     std::atomic<bool>   monitor_running_ { false };
+    // 存储分层归档：后台线程把热区过期日期桶移入 archive/ 并清理超期归档
+    std::thread         archive_thr_;
+    std::atomic<bool>   archive_running_ { false };
     Agent*              agent_  { nullptr };
     int                 listen_fd_ { -1 };
     void*               tls_ctx_ { nullptr };

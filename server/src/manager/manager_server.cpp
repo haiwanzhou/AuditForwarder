@@ -26,6 +26,7 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <zlib.h>
 
 #ifdef AF_PLATFORM_UNIX
 #  include <arpa/inet.h>
@@ -137,6 +138,20 @@ std::string peer_ip(int fd) {
 }
 
 Result<std::string> read_text_file(const std::string& path) {
+    // 自动识别 .gz 压缩文件，解压后读取
+    if (path.size() >= 3 && path.substr(path.size() - 3) == ".gz") {
+        gzFile f = gzopen(path.c_str(), "rb");
+        if (!f) return Result<std::string>(Error::Code::NotFound, path);
+        std::ostringstream ss;
+        char buf[65536];
+        int n;
+        while ((n = gzread(f, buf, sizeof(buf))) > 0) {
+            ss.write(buf, n);
+        }
+        gzclose(f);
+        if (n < 0) return Result<std::string>(Error::Code::IoError, "gzip read error: " + path);
+        return ss.str();
+    }
     std::ifstream in(path, std::ios::binary);
     if (!in) return Result<std::string>(Error::Code::NotFound, path);
     std::ostringstream ss;
@@ -154,6 +169,59 @@ Result<std::string> read_ui_asset(const std::string& request_path) {
     auto parent = read_text_file("../" + rel);
     if (parent.is_ok()) return parent;
     return direct;
+}
+
+// 把一个文件 gzip 压缩为 .gz，成功后删除原文件。
+Result<void> gzip_compress_file(const std::string& src_path) {
+#undef close  // Windows 把 close 宏定义成 closesocket，这里取消
+    std::string dst_path = src_path + ".gz";
+    gzFile out = gzopen(dst_path.c_str(), "wb9");
+    if (!out) return Result<void>(Error::Code::IoError, "gzip open failed: " + dst_path);
+    std::ifstream in(src_path, std::ios::binary);
+    if (!in) { gzclose(out); return Result<void>(Error::Code::IoError, "cannot open: " + src_path); }
+    char buf[65536];
+    while (in) {
+        in.read(buf, sizeof(buf));
+        std::streamsize n = in.gcount();
+        if (n > 0 && gzwrite(out, buf, static_cast<unsigned>(n)) != n) {
+            gzclose(out);
+            return Result<void>(Error::Code::IoError, "gzip write error: " + dst_path);
+        }
+    }
+    in.close();
+    gzclose(out);
+    (void)std::remove(src_path.c_str());  // 删除原文件
+    return Result<void>::ok();
+}
+
+// 取日志文件"采集器名"：去掉 .jsonl / .jsonl.gz / .gz 后缀。
+// 归档区文件是 .jsonl.gz，若只按 -6 截断会得到 "file_win.js" 之类的错名，
+// 导致带 collector / priority=high 条件的查询漏掉整份归档文件。
+std::string log_file_stem(const std::string& path) {
+    std::string base = fs::basename(path);
+    auto ends_with_suffix = [](const std::string& s, const char* suf) {
+        const std::size_t n = std::strlen(suf);
+        return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+    };
+    if (ends_with_suffix(base, ".gz")) base.resize(base.size() - 3);
+    if (ends_with_suffix(base, ".jsonl")) base.resize(base.size() - 6);
+    return base;
+}
+
+// 递归压缩目录下所有 .jsonl（兼容两种归档布局）：
+//   operation_logs → <day>/<host>/<collector>.jsonl
+//   扁平类型       → <day>/<host>.jsonl
+void compress_jsonl_tree(const std::string& dir, int depth, int* compressed) {
+    if (depth < 0) return;
+    auto entries = fs::list_directory(dir);
+    if (entries.is_err()) return;
+    for (const auto& e : entries.value()) {
+        if (fs::is_directory(e)) {
+            compress_jsonl_tree(e, depth - 1, compressed);
+        } else if (fs::is_regular(e) && fs::extension(e) == ".jsonl") {
+            if (gzip_compress_file(e).is_ok() && compressed) ++(*compressed);
+        }
+    }
 }
 
 std::string json_escape(const std::string& s) {
@@ -818,6 +886,15 @@ std::string alert_dir(const ManagerConfig& cfg) {
     return fs::join(cfg.data_dir.empty() ? "data" : cfg.data_dir, "alerts");
 }
 
+std::string archive_dir(const ManagerConfig& cfg) {
+    return fs::join(cfg.data_dir.empty() ? "data" : cfg.data_dir, "archive");
+}
+
+// 前置声明（定义见下方「存储分层：时间分片助手」）
+std::string sharded_type_dir(const ManagerConfig& cfg,
+                             const std::string& type_dir,
+                             const std::string& item);
+
 std::string policy_dir(const ManagerConfig& cfg) {
     return fs::join(cfg.data_dir.empty() ? "data" : cfg.data_dir, "policies");
 }
@@ -1007,7 +1084,8 @@ Result<void> append_alert(const ManagerConfig& cfg,
                           const std::string& evidence) {
     auto line = alert_json(host_id, source, severity, rule_id, message, evidence);
     std::lock_guard<std::mutex> lk(alert_store_mutex());
-    auto r = append_jsonl_retained(alert_dir(cfg), host_id + ".jsonl", line, 20000);
+    auto r = append_jsonl_retained(sharded_type_dir(cfg, alert_dir(cfg), line),
+                                   host_id + ".jsonl", line, 20000);
     if (r.is_ok()) g_remote_alerts.fetch_add(1, std::memory_order_relaxed);
     return r;
 }
@@ -1229,24 +1307,32 @@ std::size_t count_jsonl_filtered(const std::string& path,
     return count;
 }
 
-std::vector<std::string> read_jsonl_dir_filtered(const std::string& dir,
+// 前置定义：存储分层分片枚举（实现见下方「存储分层：分片目录枚举」）。
+struct LogFileRef {
+    std::string path;
+    std::string host_id;
+};
+std::vector<LogFileRef> enumerate_operation_log_files(const ManagerConfig& cfg,
+                                                      const std::string& host_id,
+                                                      const std::string& from,
+                                                      const std::string& to);
+std::vector<LogFileRef> enumerate_flat_log_files(const ManagerConfig& cfg,
+                                                 const std::string& dir,
+                                                 const std::string& host_id,
+                                                 const std::string& from,
+                                                 const std::string& to);
+
+std::vector<std::string> read_jsonl_dir_filtered(const ManagerConfig& cfg,
+                                                 const std::string& dir,
                                                  const std::string& host_id,
                                                  const std::string& operation_type,
                                                  const std::string& from,
                                                  const std::string& to,
                                                  std::size_t limit) {
     std::vector<std::string> lines;
-    if (!host_id.empty()) {
-        return read_jsonl_filtered(fs::join(dir, host_id + ".jsonl"), host_id, operation_type, from, to, limit);
-    }
-    auto listed = fs::list_directory(dir);
-    if (listed.is_err()) return lines;
-    for (const auto& item : listed.value()) {
-        if (fs::extension(item) != ".jsonl") continue;
-        // list_directory 返回的已是完整路径，直接读取（is_absolute 兼容相对/绝对两种返回）
-        auto path_to_read = fs::is_absolute(item) || item.find('/') != std::string::npos || item.find('\\') != std::string::npos
-                            ? item : fs::join(dir, item);
-        auto part = read_jsonl_filtered(path_to_read, "", operation_type, from, to, limit);
+    auto files = enumerate_flat_log_files(cfg, dir, host_id, from, to);
+    for (const auto& fr : files) {
+        auto part = read_jsonl_filtered(fr.path, host_id, operation_type, from, to, limit);
         lines.insert(lines.end(), part.begin(), part.end());
         if (limit > 0 && lines.size() > limit) {
             lines.erase(lines.begin(), lines.begin() + static_cast<std::ptrdiff_t>(lines.size() - limit));
@@ -1255,32 +1341,23 @@ std::vector<std::string> read_jsonl_dir_filtered(const std::string& dir,
     return lines;
 }
 
-// 流式统计目录下所有 jsonl 文件中匹配条件的总行数。
-std::size_t count_jsonl_dir_filtered(const std::string& dir,
+// 流式统计目录下所有 jsonl 文件中匹配条件的总行数（含日期桶分片与归档区）。
+std::size_t count_jsonl_dir_filtered(const ManagerConfig& cfg,
+                                      const std::string& dir,
                                       const std::string& host_id,
                                       const std::string& operation_type,
                                       const std::string& from,
                                       const std::string& to) {
-    if (!host_id.empty()) {
-        return count_jsonl_filtered(fs::join(dir, host_id + ".jsonl"), host_id, operation_type, from, to);
-    }
     std::size_t total = 0;
-    auto listed = fs::list_directory(dir);
-    if (listed.is_err()) return 0;
-    for (const auto& item : listed.value()) {
-        if (fs::extension(item) != ".jsonl") continue;
-        auto p = fs::is_absolute(item) || item.find('/') != std::string::npos || item.find('\\') != std::string::npos
-                 ? item : fs::join(dir, item);
-        total += count_jsonl_filtered(p, "", operation_type, from, to);
+    auto files = enumerate_flat_log_files(cfg, dir, host_id, from, to);
+    for (const auto& fr : files) {
+        total += count_jsonl_filtered(fr.path, host_id, operation_type, from, to);
     }
     return total;
 }
 
 // ================= 两级存储：operation_logs/<host_id>/<collector>.jsonl =================
-
-std::string host_operation_log_dir(const ManagerConfig& cfg, const std::string& host_id) {
-    return fs::join(operation_log_dir(cfg), host_id);
-}
+// （时间分片开启后实际落盘为 operation_logs/<YYYY-MM-DD>/<host_id>/<collector>.jsonl）
 
 // 在 JSON 对象的起始 '{' 之后注入一个字段（numeric=true 时值不加引号）。
 std::string json_inject_field(const std::string& obj,
@@ -1307,6 +1384,311 @@ std::string json_numeric_token(const std::string& json, const std::string& key) 
     std::size_t end = p;
     while (end < json.size() && std::isdigit(static_cast<unsigned char>(json[end]))) ++end;
     return json.substr(p, end - p);
+}
+
+// ================= 存储分层：时间分片助手 =================
+
+// 毫秒 epoch → "YYYY-MM-DD"（UTC）。
+std::string day_bucket_from_ms(u64 ms) {
+    std::time_t t = static_cast<std::time_t>(ms / 1000);
+    std::tm tm{};
+#ifdef AF_PLATFORM_WINDOWS
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+    return buf;
+}
+
+// 判断目录名是否为日期桶 "YYYY-MM-DD"（严格格式）。
+bool is_day_bucket_name(const std::string& name) {
+    if (name.size() != 10) return false;
+    if (name[4] != '-' || name[7] != '-') return false;
+    for (std::size_t i = 0; i < 10; ++i) {
+        if (i == 4 || i == 7) continue;
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
+    }
+    return true;
+}
+
+// 从 ISO 时间字符串（"YYYY-MM-DD..."）提取日期前缀；非法则返回空串。
+std::string date_prefix_of(const std::string& iso) {
+    if (iso.size() >= 10 && iso[4] == '-' && iso[7] == '-' &&
+        std::isdigit(static_cast<unsigned char>(iso[0])) &&
+        std::isdigit(static_cast<unsigned char>(iso[9]))) {
+        return iso.substr(0, 10);
+    }
+    return {};
+}
+
+// 从事件 JSON 提取分片日期：client_ts(ms) > timestamp(ISO) > server_ts(ms) > 今天。
+std::string event_day_bucket(const std::string& item) {
+    std::string cts = json_numeric_token(item, logmeta::attr::kClientTs);
+    if (!cts.empty()) return day_bucket_from_ms(std::strtoull(cts.c_str(), nullptr, 10));
+    std::string d = date_prefix_of(json_string_field(item, "timestamp"));
+    if (!d.empty()) return d;
+    std::string sts = json_numeric_token(item, logmeta::attr::kServerTs);
+    if (!sts.empty()) return day_bucket_from_ms(std::strtoull(sts.c_str(), nullptr, 10));
+    return day_bucket_from_ms(static_cast<u64>(std::time(nullptr)) * 1000);
+}
+
+// 返回某类型目录下"当前事件"应写入的分片目录：
+// 分片开启 → <type_dir>/<YYYY-MM-DD>；关闭 → <type_dir>（旧扁平结构，向后兼容）。
+std::string sharded_type_dir(const ManagerConfig& cfg,
+                             const std::string& type_dir,
+                             const std::string& item) {
+    if (!cfg.storage_time_partition) return type_dir;
+    return fs::join(type_dir, event_day_bucket(item));
+}
+
+// ================= 存储分层：分片目录枚举 =================
+
+// 收集一个主机目录（<...>/<host_id>/）下的全部 .jsonl / .jsonl.gz 文件。
+void collect_files_in_host_dir(const std::string& hdir,
+                               const std::string& host,
+                               std::vector<LogFileRef>& out) {
+    if (!fs::exists(hdir)) return;
+    auto files = fs::list_directory(hdir);
+    if (files.is_err()) return;
+    for (const auto& f : files.value()) {
+        if (!fs::is_regular(f)) continue;
+        std::string ext = fs::extension(f);
+        if (ext != ".jsonl" && ext != ".gz") continue;
+        out.push_back(LogFileRef{f, host});
+    }
+}
+
+// 枚举 operation_logs 下需扫描的文件（日期桶分片 + 旧两级目录 + 归档区），
+// 日期桶按 from/to 裁剪，避免全量扫描。
+std::vector<LogFileRef> enumerate_operation_log_files(const ManagerConfig& cfg,
+                                                      const std::string& host_id,
+                                                      const std::string& from,
+                                                      const std::string& to) {
+    std::vector<LogFileRef> out;
+    const std::string from_d = date_prefix_of(from);
+    const std::string to_d = date_prefix_of(to);
+
+    std::vector<std::string> roots;
+    roots.push_back(operation_log_dir(cfg));
+    if (cfg.storage_archive_enabled) {
+        roots.push_back(fs::join(archive_dir(cfg), "operation_logs"));
+    }
+
+    for (const auto& r : roots) {
+        if (!fs::exists(r)) continue;
+        auto entries = fs::list_directory(r);
+        if (entries.is_err()) continue;
+        for (const auto& e : entries.value()) {
+            const std::string name = fs::basename(e);
+            if (is_day_bucket_name(name)) {
+                // 日期桶：<YYYY-MM-DD>/<host_id>/<collector>.jsonl，按 from/to 裁剪
+                if (!from_d.empty() && name < from_d) continue;
+                if (!to_d.empty() && name > to_d) continue;
+                if (!host_id.empty()) {
+                    collect_files_in_host_dir(fs::join(e, host_id), host_id, out);
+                } else {
+                    auto hosts = fs::list_directory(e);
+                    if (hosts.is_err()) continue;
+                    for (const auto& h : hosts.value()) {
+                        if (!fs::is_directory(h)) continue;
+                        collect_files_in_host_dir(h, fs::basename(h), out);
+                    }
+                }
+            } else if (fs::is_directory(e)) {
+                // 旧两级结构：<host_id>/<collector>.jsonl（未迁移前）
+                if (!host_id.empty() && name != host_id) continue;
+                collect_files_in_host_dir(e, name, out);
+            }
+        }
+    }
+    return out;
+}
+
+// 枚举某类型目录（扁平 → 日期桶分片）下需扫描的文件，兼容旧扁平文件与归档区。
+std::vector<LogFileRef> enumerate_flat_log_files(const ManagerConfig& cfg,
+                                                 const std::string& dir,
+                                                 const std::string& host_id,
+                                                 const std::string& from,
+                                                 const std::string& to) {
+    std::vector<LogFileRef> out;
+    const std::string from_d = date_prefix_of(from);
+    const std::string to_d = date_prefix_of(to);
+    const std::string type_name = fs::basename(dir);
+
+    std::vector<std::string> roots;
+    roots.push_back(dir);
+    if (cfg.storage_archive_enabled) {
+        roots.push_back(fs::join(archive_dir(cfg), type_name));
+    }
+
+    for (const auto& r : roots) {
+        if (!fs::exists(r)) continue;
+        auto entries = fs::list_directory(r);
+        if (entries.is_err()) continue;
+        for (const auto& e : entries.value()) {
+            const std::string name = fs::basename(e);
+            if (is_day_bucket_name(name)) {
+                // 日期桶：<YYYY-MM-DD>/<host_id>.jsonl 或 .jsonl.gz
+                if (!from_d.empty() && name < from_d) continue;
+                if (!to_d.empty() && name > to_d) continue;
+                if (!host_id.empty()) {
+                    std::string p = fs::join(e, host_id + ".jsonl");
+                    std::string pgz = fs::join(e, host_id + ".jsonl.gz");
+                    if (fs::is_regular(p)) out.push_back(LogFileRef{p, host_id});
+                    else if (fs::is_regular(pgz)) out.push_back(LogFileRef{pgz, host_id});
+                } else {
+                    auto files = fs::list_directory(e);
+                    if (files.is_err()) continue;
+                    for (const auto& f : files.value()) {
+                        if (!fs::is_regular(f)) continue;
+                        std::string ext = fs::extension(f);
+                        if (ext != ".jsonl" && ext != ".gz") continue;
+                        out.push_back(LogFileRef{f, ""});
+                    }
+                }
+            } else if (fs::is_regular(e) && (fs::extension(e) == ".jsonl" || fs::extension(e) == ".gz")) {
+                // 旧扁平：<host_id>.jsonl 或 .jsonl.gz
+                std::string base = name;
+                // 去掉 .jsonl 或 .jsonl.gz 后缀
+                if (base.size() >= 7 && base.substr(base.size() - 7) == ".jsonl.gz") {
+                    base.resize(base.size() - 7);
+                } else if (base.size() >= 6 && base.substr(base.size() - 6) == ".jsonl") {
+                    base.resize(base.size() - 6);
+                }
+                if (!host_id.empty() && base != host_id) continue;
+                out.push_back(LogFileRef{e, base});
+            }
+        }
+    }
+    return out;
+}
+
+// ================= 存储分层：冷热归档 + 迁移 =================
+
+// 计算距今 N 天前的日期（YYYY-MM-DD，UTC）。
+std::string days_ago_bucket(int days) {
+    std::time_t t = static_cast<std::time_t>(std::time(nullptr)) - static_cast<std::time_t>(days) * 86400;
+    std::tm tm{};
+#ifdef AF_PLATFORM_WINDOWS
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+    return buf;
+}
+
+// 归档一个类型目录：把 hot_days 之前的日期桶从热区 move 到 archive/<type>/，并 gzip 压缩。
+void archive_type_dir(const ManagerConfig& cfg,
+                      const std::string& type_dir,
+                      const std::string& type_name) {
+    if (!cfg.storage_archive_enabled || !cfg.storage_time_partition) return;
+    if (!fs::exists(type_dir)) return;
+    const std::string cutoff = days_ago_bucket(cfg.storage_hot_days > 0 ? cfg.storage_hot_days : 1);
+    const std::string dest_root = fs::join(archive_dir(cfg), type_name);
+
+    auto entries = fs::list_directory(type_dir);
+    if (entries.is_err()) return;
+    for (const auto& e : entries.value()) {
+        std::string name = fs::basename(e);
+        if (!is_day_bucket_name(name)) continue;   // 旧扁平/两级结构交由迁移处理，这里只归档日期桶
+        if (name >= cutoff) continue;              // 仍在热区窗口内
+        std::string dest = fs::join(dest_root, name);
+        if (fs::exists(dest)) {
+            (void)fs::remove(e, true);             // 目标已存在（重复归档），直接删除源
+            continue;
+        }
+        auto cr = fs::create_directories(dest_root);
+        if (cr.is_err()) continue;
+        auto rn = fs::rename(e, dest);
+        if (rn.is_err()) {
+            AF_LOG_WARN("storage archive: cannot move " << e << " -> " << dest
+                        << ": " << rn.error().message());
+            continue;
+        }
+        // 移动成功后，递归压缩归档目录里的 .jsonl（兼容两种布局）：
+        //   operation_logs: dest/<host_id>/<collector>.jsonl
+        //   扁平类型:       dest/<host_id>.jsonl
+        int compressed = 0;
+        compress_jsonl_tree(dest, 2, &compressed);
+        if (compressed > 0) {
+            AF_LOG_INFO("storage archive: " << dest << " compressed " << compressed << " files");
+        }
+    }
+}
+
+// 清理归档区中超过 archive_days 的日期桶。
+void purge_archive_dir(const ManagerConfig& cfg, const std::string& type_name) {
+    if (!cfg.storage_archive_enabled) return;
+    const std::string root = fs::join(archive_dir(cfg), type_name);
+    if (!fs::exists(root)) return;
+    const std::string cutoff = days_ago_bucket(cfg.storage_archive_days > 0 ? cfg.storage_archive_days : 1);
+    auto entries = fs::list_directory(root);
+    if (entries.is_err()) return;
+    for (const auto& e : entries.value()) {
+        std::string name = fs::basename(e);
+        if (!is_day_bucket_name(name)) continue;
+        if (name >= cutoff) continue;
+        (void)fs::remove(e, true);
+    }
+}
+
+// 单轮归档：对所有类型目录执行「热区 → archive → 超期删除」。
+void run_storage_archive(const ManagerConfig& cfg) {
+    archive_type_dir(cfg, operation_log_dir(cfg), "operation_logs");
+    archive_type_dir(cfg, host_metrics_dir(cfg), "host_metrics");
+    archive_type_dir(cfg, alert_dir(cfg), "alerts");
+    archive_type_dir(cfg, audit_summary_dir(cfg), "audit_summaries");
+    archive_type_dir(cfg, command_result_dir(cfg), "command_results");
+
+    purge_archive_dir(cfg, "operation_logs");
+    purge_archive_dir(cfg, "host_metrics");
+    purge_archive_dir(cfg, "alerts");
+    purge_archive_dir(cfg, "audit_summaries");
+    purge_archive_dir(cfg, "command_results");
+}
+
+// 把旧两级 operation_logs/<host>/<coll>.jsonl 重分片为 <YYYY-MM-DD>/<host>/<coll>.jsonl（幂等）。
+void migrate_operation_logs_to_buckets(const ManagerConfig& cfg) {
+    if (!cfg.storage_time_partition) return;
+    const std::string root = operation_log_dir(cfg);
+    if (!fs::exists(root)) return;
+    auto entries = fs::list_directory(root);
+    if (entries.is_err()) return;
+    for (const auto& e : entries.value()) {
+        std::string host = fs::basename(e);
+        if (is_day_bucket_name(host) || !fs::is_directory(e)) continue;
+        auto files = fs::list_directory(e);
+        if (files.is_err()) continue;
+        for (const auto& f : files.value()) {
+            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
+            std::string coll = fs::basename(f);
+            coll.resize(coll.size() - 6);
+            auto content = read_text_file(f);
+            if (content.is_err()) continue;
+            std::istringstream in(content.value());
+            std::string line;
+            std::size_t moved = 0;
+            while (std::getline(in, line)) {
+                if (line.empty()) continue;
+                std::string dest_dir = fs::join(fs::join(root, event_day_bucket(line)), host);
+                auto r = append_jsonl_retained(dest_dir, coll + ".jsonl", line, 0);
+                if (r.is_ok()) ++moved;
+            }
+            if (moved > 0) {
+                AF_LOG_INFO("operation_logs migrate: " << f << " -> " << host
+                            << "/" << coll << ".jsonl 按天重分片 (" << moved << " lines)");
+                (void)fs::remove(f);
+            }
+        }
+        auto remaining = fs::list_directory(e);
+        if (remaining.is_ok() && remaining.value().empty()) {
+            (void)fs::remove(e, true);
+        }
+    }
 }
 
 // 旧扁平结构 data/operation_logs/<host>.jsonl → <host>/legacy.jsonl（启动时一次性、幂等）。
@@ -1358,7 +1740,7 @@ void migrate_flat_operation_logs(const ManagerConfig& cfg) {
     }
 }
 
-// 分层操作日志读取：host_id 目录 → 按 collector 文件 → priority/operation/时间窗过滤。
+// 分层操作日志读取：日期桶分片 + 旧两级目录 + 归档区，priority/operation/时间窗过滤。
 std::vector<std::string> read_operation_logs_filtered(const ManagerConfig& cfg,
                                                       const std::string& host_id,
                                                       const std::string& collector,
@@ -1368,69 +1750,49 @@ std::vector<std::string> read_operation_logs_filtered(const ManagerConfig& cfg,
                                                       const std::string& to,
                                                       std::size_t limit) {
     std::vector<std::string> result;
-    const std::string root = operation_log_dir(cfg);
-
-    // 收集要扫描的主机目录
-    std::vector<std::string> host_dirs;
-    if (!host_id.empty()) {
-        host_dirs.push_back(fs::join(root, host_id));
-    } else if (fs::exists(root)) {
-        auto hosts = fs::list_directory(root);
-        if (hosts.is_ok()) {
-            for (const auto& h : hosts.value()) {
-                if (fs::is_directory(h)) host_dirs.push_back(h);
-            }
-        }
-    }
-
     const std::string want_collector = logmeta::sanitize_collector_id(collector);
+    auto files = enumerate_operation_log_files(cfg, host_id, from, to);
 
-    for (const auto& hdir : host_dirs) {
-        if (!fs::exists(hdir)) continue;
-        const std::string dir_host = fs::basename(hdir);
-        auto files = fs::list_directory(hdir);
-        if (files.is_err()) continue;
-        for (const auto& f : files.value()) {
-            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
-            std::string base = fs::basename(f);
-            base.resize(base.size() - 6);  // 去掉 ".jsonl"
-            // 高优先级过滤只查 privileged.jsonl 镜像；否则排除镜像避免重复
-            if (priority == logmeta::priority::kHigh) {
-                if (base != "privileged") continue;
-            } else {
-                if (base == "privileged") continue;
-                if (!collector.empty() && base != want_collector) continue;
+    for (const auto& fr : files) {
+        const std::string& f = fr.path;
+        const std::string& dir_host = fr.host_id;
+        std::string base = log_file_stem(f);   // 兼容 .jsonl 与归档后的 .jsonl.gz
+        // 高优先级过滤只查 privileged.jsonl 镜像；否则排除镜像避免重复
+        if (priority == logmeta::priority::kHigh) {
+            if (base != "privileged") continue;
+        } else {
+            if (base == "privileged") continue;
+            if (!collector.empty() && base != want_collector) continue;
+        }
+        auto content = read_text_file(f);
+        if (content.is_err()) continue;
+        std::istringstream in(content.value());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            if (host_id.empty()) {
+                if (json_string_field(line, "host_id") != dir_host) continue;
+            } else if (json_string_field(line, "host_id") != host_id) {
+                continue;
             }
-            auto content = read_text_file(f);
-            if (content.is_err()) continue;
-            std::istringstream in(content.value());
-            std::string line;
-            while (std::getline(in, line)) {
-                if (line.empty()) continue;
-                if (host_id.empty()) {
-                    if (json_string_field(line, "host_id") != dir_host) continue;
-                } else if (json_string_field(line, "host_id") != host_id) {
-                    continue;
-                }
-                if (!collector.empty() && priority != logmeta::priority::kHigh &&
-                    json_string_field(line, "collector") != collector
-                    && !(base == "legacy")) {
-                    continue;
-                }
-                if (!priority.empty() && priority != logmeta::priority::kHigh &&
-                    json_string_field(line, "priority") != priority) {
-                    continue;
-                }
-                if (!operation_type.empty()) {
-                    auto op = json_string_field(line, "operation_type");
-                    auto ev = json_string_field(line, "event_type");
-                    if (op != operation_type && ev != operation_type) continue;
-                }
-                auto ts = json_string_field(line, "timestamp");
-                if (!from.empty() && !ts.empty() && ts < from) continue;
-                if (!to.empty() && !ts.empty() && ts > to) continue;
-                result.push_back(line);
+            if (!collector.empty() && priority != logmeta::priority::kHigh &&
+                json_string_field(line, "collector") != collector
+                && !(base == "legacy")) {
+                continue;
             }
+            if (!priority.empty() && priority != logmeta::priority::kHigh &&
+                json_string_field(line, "priority") != priority) {
+                continue;
+            }
+            if (!operation_type.empty()) {
+                auto op = json_string_field(line, "operation_type");
+                auto ev = json_string_field(line, "event_type");
+                if (op != operation_type && ev != operation_type) continue;
+            }
+            auto ts = json_string_field(line, "timestamp");
+            if (!from.empty() && !ts.empty() && ts < from) continue;
+            if (!to.empty() && !ts.empty() && ts > to) continue;
+            result.push_back(line);
         }
     }
 
@@ -1459,62 +1821,48 @@ std::size_t count_operation_logs_filtered(const ManagerConfig& cfg,
                                            const std::string& from,
                                            const std::string& to) {
     std::size_t count = 0;
-    const std::string root = operation_log_dir(cfg);
-    std::vector<std::string> host_dirs;
-    if (!host_id.empty()) {
-        host_dirs.push_back(fs::join(root, host_id));
-    } else if (fs::exists(root)) {
-        auto hosts = fs::list_directory(root);
-        if (hosts.is_ok())
-            for (const auto& h : hosts.value())
-                if (fs::is_directory(h)) host_dirs.push_back(h);
-    }
     const std::string want_collector = logmeta::sanitize_collector_id(collector);
-    for (const auto& hdir : host_dirs) {
-        if (!fs::exists(hdir)) continue;
-        const std::string dir_host = fs::basename(hdir);
-        auto files = fs::list_directory(hdir);
-        if (files.is_err()) continue;
-        for (const auto& f : files.value()) {
-            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
-            std::string base = fs::basename(f);
-            base.resize(base.size() - 6);
-            if (priority == logmeta::priority::kHigh) {
-                if (base != "privileged") continue;
-            } else {
-                if (base == "privileged") continue;
-                if (!collector.empty() && base != want_collector) continue;
+    auto files = enumerate_operation_log_files(cfg, host_id, from, to);
+
+    for (const auto& fr : files) {
+        const std::string& f = fr.path;
+        const std::string& dir_host = fr.host_id;
+        std::string base = log_file_stem(f);   // 兼容 .jsonl 与归档后的 .jsonl.gz
+        if (priority == logmeta::priority::kHigh) {
+            if (base != "privileged") continue;
+        } else {
+            if (base == "privileged") continue;
+            if (!collector.empty() && base != want_collector) continue;
+        }
+        auto fc = read_text_file(f);
+        if (fc.is_err()) continue;
+        std::istringstream in(fc.value());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            if (host_id.empty()) {
+                if (json_string_field(line, "host_id") != dir_host) continue;
+            } else if (json_string_field(line, "host_id") != host_id) {
+                continue;
             }
-            auto fc = read_text_file(f);
-            if (fc.is_err()) continue;
-            std::istringstream in(fc.value());
-            std::string line;
-            while (std::getline(in, line)) {
-                if (line.empty()) continue;
-                if (host_id.empty()) {
-                    if (json_string_field(line, "host_id") != dir_host) continue;
-                } else if (json_string_field(line, "host_id") != host_id) {
-                    continue;
-                }
-                if (!collector.empty() && priority != logmeta::priority::kHigh &&
-                    json_string_field(line, "collector") != collector
-                    && !(base == "legacy")) {
-                    continue;
-                }
-                if (!priority.empty() && priority != logmeta::priority::kHigh &&
-                    json_string_field(line, "priority") != priority) {
-                    continue;
-                }
-                if (!operation_type.empty()) {
-                    auto op = json_string_field(line, "operation_type");
-                    auto ev = json_string_field(line, "event_type");
-                    if (op != operation_type && ev != operation_type) continue;
-                }
-                auto ts = json_string_field(line, "timestamp");
-                if (!from.empty() && !ts.empty() && ts < from) continue;
-                if (!to.empty() && !ts.empty() && ts > to) continue;
-                ++count;
+            if (!collector.empty() && priority != logmeta::priority::kHigh &&
+                json_string_field(line, "collector") != collector
+                && !(base == "legacy")) {
+                continue;
             }
+            if (!priority.empty() && priority != logmeta::priority::kHigh &&
+                json_string_field(line, "priority") != priority) {
+                continue;
+            }
+            if (!operation_type.empty()) {
+                auto op = json_string_field(line, "operation_type");
+                auto ev = json_string_field(line, "event_type");
+                if (op != operation_type && ev != operation_type) continue;
+            }
+            auto ts = json_string_field(line, "timestamp");
+            if (!from.empty() && !ts.empty() && ts < from) continue;
+            if (!to.empty() && !ts.empty() && ts > to) continue;
+            ++count;
         }
     }
     return count;
@@ -1564,9 +1912,9 @@ std::string logs_analytics_json(const ManagerConfig& cfg,
                                 const std::string& to,
                                 std::size_t limit) {
     std::size_t total_logs = count_operation_logs_filtered(cfg, host_id, collector, priority, "", from, to);
-    std::size_t total_alerts = count_jsonl_dir_filtered(alert_dir(cfg), host_id, "", from, to);
+    std::size_t total_alerts = count_jsonl_dir_filtered(cfg, alert_dir(cfg), host_id, "", from, to);
     auto logs = read_operation_logs_filtered(cfg, host_id, collector, priority, "", from, to, limit);
-    auto alerts = read_jsonl_dir_filtered(alert_dir(cfg), host_id, "", from, to, limit);
+    auto alerts = read_jsonl_dir_filtered(cfg, alert_dir(cfg), host_id, "", from, to, limit);
     std::map<std::string, std::size_t> operation_types;
     std::map<std::string, std::size_t> alert_severities;
     std::map<std::string, std::size_t> host_counts;
@@ -1602,36 +1950,23 @@ std::string collector_counts_json(const ManagerConfig& cfg, const std::string& h
     std::map<std::string, std::map<std::string, std::size_t>> per_host;
     std::map<std::string, std::size_t> totals;
     std::size_t grand = 0;
-    const std::string root = operation_log_dir(cfg);
-    std::vector<std::string> host_dirs;
-    if (!host_filter.empty()) {
-        host_dirs.push_back(fs::join(root, host_filter));
-    } else if (fs::exists(root)) {
-        auto hosts = fs::list_directory(root);
-        if (hosts.is_ok())
-            for (const auto& h : hosts.value())
-                if (fs::is_directory(h)) host_dirs.push_back(h);
-    }
-    for (const auto& hdir : host_dirs) {
-        if (!fs::exists(hdir)) continue;
-        const std::string host = fs::basename(hdir);
-        auto files = fs::list_directory(hdir);
-        if (files.is_err()) continue;
-        for (const auto& f : files.value()) {
-            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
-            std::string collector = fs::basename(f);
-            collector.resize(collector.size() - 6);  // 去掉 ".jsonl"
-            if (collector == "privileged") continue;  // 镜像不重复计数
-            auto content = read_text_file(f);
-            if (content.is_err()) continue;
-            std::size_t n = 0;
-            std::istringstream in(content.value());
-            std::string line;
-            while (std::getline(in, line)) if (!line.empty()) ++n;
-            per_host[host][collector] += n;
-            totals[collector] += n;
-            grand += n;
-        }
+    // 走统一的分片枚举：日期桶 + 旧两级目录 + 归档区（含 .jsonl.gz）全覆盖
+    auto files = enumerate_operation_log_files(cfg, host_filter, "", "");
+    for (const auto& fr : files) {
+        if (!fs::is_regular(fr.path)) continue;
+        const std::string host = fr.host_id.empty() ? "unknown" : fr.host_id;
+        const std::string collector = log_file_stem(fr.path);
+        if (collector == "privileged") continue;  // 镜像不重复计数
+        if (collector.empty()) continue;
+        auto content = read_text_file(fr.path);
+        if (content.is_err()) continue;
+        std::size_t n = 0;
+        std::istringstream in(content.value());
+        std::string line;
+        while (std::getline(in, line)) if (!line.empty()) ++n;
+        per_host[host][collector] += n;
+        totals[collector] += n;
+        grand += n;
     }
     std::ostringstream o;
     o << "{\n  \"host_id\": \"" << json_escape(host_filter) << "\",\n"
@@ -2059,6 +2394,8 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
     running_.store(true);
     // 旧扁平 operation_logs/<host>.jsonl → <host>/legacy.jsonl（幂等）
     migrate_flat_operation_logs(cfg_);
+    // 旧两级 operation_logs/<host>/<coll>.jsonl → 按天重分片 <YYYY-MM-DD>/<host>/<coll>.jsonl（幂等）
+    migrate_operation_logs_to_buckets(cfg_);
     // 确保过滤策略文件存在（首次启动写入默认 strict/lenient 档）
     (void)load_or_create_text(log_filter_profiles_path(cfg_), default_log_filter_profiles_json());
     load_remote_counters(cfg_);
@@ -2104,6 +2441,21 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
         }
     });
 
+    // 启动后台归档：周期性把热区过期日期桶移入 archive/，并清理超期归档
+    if (cfg_.storage_archive_enabled || cfg_.storage_time_partition) {
+        archive_running_.store(true);
+        archive_thr_ = std::thread([this] {
+            while (archive_running_.load()) {
+                // 每小时归档一轮；拆成小段 sleep 以便 stop() 能及时退出
+                for (int i = 0; i < 60 && archive_running_.load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(60));
+                }
+                if (!archive_running_.load()) break;
+                run_storage_archive(cfg_);
+            }
+        });
+    }
+
     AF_LOG_INFO("manager: listening on " << cfg_.listen
                 << "  (status_timeout=" << cfg_.status_timeout_seconds << "s)");
     // 初始化每主机独立 SQLite 数据库
@@ -2121,12 +2473,14 @@ void SimpleHttpManager::stop() {
     if (!running_.exchange(false)) return;
     collusion::Engine::instance().stop();   // 合谋检测模块停止（画像落盘）
     monitor_running_.store(false);
+    archive_running_.store(false);
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, 2);
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
     if (monitor_thr_.joinable()) monitor_thr_.join();
+    if (archive_thr_.joinable()) archive_thr_.join();
     if (thr_.joinable()) thr_.join();
     if (tls_ctx_) {
         SSL_CTX_free(static_cast<SSL_CTX*>(tls_ctx_));
@@ -3121,7 +3475,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             return validation_error_json({{"host_id", "format", "主机 ID 不能为空且只能包含字母、数字、短横线和下划线"}});
         }
         std::lock_guard<std::mutex> lk(host_store_mutex());
-        auto saved = append_jsonl_retained(host_metrics_dir(cfg_), host_id + ".jsonl", body, 10000);
+        auto saved = append_jsonl_retained(sharded_type_dir(cfg_, host_metrics_dir(cfg_), body),
+                                           host_id + ".jsonl", body, 10000);
         if (saved.is_err()) {
             status = 500;
             return "{\n  \"error\": \"cannot save host metrics\"\n}";
@@ -3131,7 +3486,7 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         o << "{\n"
           << "  \"accepted\": true,\n"
           << "  \"host_id\": \"" << json_escape(host_id) << "\",\n"
-          << "  \"storage\": \"" << json_escape(fs::join(host_metrics_dir(cfg_), host_id + ".jsonl")) << "\",\n"
+          << "  \"storage\": \"" << json_escape(fs::join(sharded_type_dir(cfg_, host_metrics_dir(cfg_), body), host_id + ".jsonl")) << "\",\n"
           << "  \"retention\": \"last 10000 metric records per host\"\n"
           << "}";
         return o.str();
@@ -3176,7 +3531,9 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             const LogFilterProfile prof = resolve_log_filter_profile(cfg_, collector);
             item = apply_log_filter_profile(item, prof);
             const std::string prio = json_string_field(item, "priority");
-            const std::string dir = host_operation_log_dir(cfg_, host_id);
+            // 时间分片：<operation_logs>/<YYYY-MM-DD>/<host_id>/<collector>.jsonl
+            const std::string dir =
+                fs::join(sharded_type_dir(cfg_, operation_log_dir(cfg_), item), host_id);
             // 主存储：<host>/<collector>.jsonl
             auto saved = append_jsonl_retained(dir, collector + ".jsonl", item, prof.retention_lines);
             if (saved.is_err()) {
@@ -3249,7 +3606,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             return validation_error_json({{"host_id", "format", "主机 ID 不能为空且只能包含字母、数字、短横线和下划线"}});
         }
         std::lock_guard<std::mutex> lk(host_store_mutex());
-        auto saved = append_jsonl_retained(audit_summary_dir(cfg_), host_id + ".jsonl", body, 5000);
+        auto saved = append_jsonl_retained(sharded_type_dir(cfg_, audit_summary_dir(cfg_), body),
+                                           host_id + ".jsonl", body, 5000);
         if (saved.is_err()) {
             status = 500;
             return "{\n  \"error\": \"cannot save audit summaries\"\n}";
@@ -3323,7 +3681,8 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             return validation_error_json({{"command_id", "required", "命令 ID 不能为空且长度不能超过 80 个字符"}});
         }
         std::lock_guard<std::mutex> lk(host_store_mutex());
-        auto saved = append_jsonl_retained(command_result_dir(cfg_), host_id + ".jsonl", body, 10000);
+        auto saved = append_jsonl_retained(sharded_type_dir(cfg_, command_result_dir(cfg_), body),
+                                           host_id + ".jsonl", body, 10000);
         if (saved.is_err()) {
             status = 500;
             return "{\n  \"error\": \"cannot save command result\"\n}";
@@ -3355,7 +3714,7 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
         }
         std::vector<std::string> lines;
         if (path == "/alerts") {
-            lines = read_jsonl_dir_filtered(alert_dir(cfg_), host_id, operation_type, from, to, limit);
+            lines = read_jsonl_dir_filtered(cfg_, alert_dir(cfg_), host_id, operation_type, from, to, limit);
         } else {
             auto collector = query_param(query, "collector");
             auto priority  = query_param(query, "priority");
@@ -3431,8 +3790,9 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
             auto lines = read_operation_logs_filtered(cfg_, host_id, "", "", "", "", "", 50000);
             for (const auto& l : lines) content += l + "\n";
         } else {
-            auto r = read_text_file(fs::join(dir, host_id + ".jsonl"));
-            if (r.is_ok()) content = r.value();
+            // 时间分片：聚合 <type>/<YYYY-MM-DD>/<host>.jsonl + 旧扁平 + 归档区
+            auto lines = read_jsonl_dir_filtered(cfg_, dir, host_id, "", "", "", 50000);
+            for (const auto& l : lines) content += l + "\n";
         }
         std::ostringstream o;
         o << "{\n"

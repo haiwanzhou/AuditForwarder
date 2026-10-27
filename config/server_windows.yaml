@@ -49,6 +49,12 @@ manager:
   require_client_cert: false
   tls_crl_check: false
 
+storage:
+  time_partition: true              # 按天分片：<类型>/<YYYY-MM-DD>/ 目录
+  archive_enabled: true             # 启用冷热归档（热区 → archive/ → 超期删除）
+  hot_days: 7                       # 热区保留天数，超过移入 archive/
+  archive_days: 180                 # 归档保留天数，超过删除
+
 collectors:
   enabled: false
 

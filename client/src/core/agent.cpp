@@ -398,6 +398,12 @@ Result<void> Agent::init(const AgentConfig& cfg) {
         mc.login_password_sha256 = cfg_.manager_login_password_sha256;
         mc.data_dir   = cfg_.data_dir;
         mc.chain_hmac_key = cfg_.chain_hmac_key;  // 与客户端批次签名使用同一 HMAC 密钥验签
+        // 存储分层配置（可选 storage 段，缺失用默认值）
+        auto& scfg = Config::instance();
+        mc.storage_time_partition  = scfg.get_bool("storage.time_partition", true);
+        mc.storage_archive_enabled = scfg.get_bool("storage.archive_enabled", true);
+        mc.storage_hot_days        = static_cast<int>(scfg.get_int("storage.hot_days", 7));
+        mc.storage_archive_days    = static_cast<int>(scfg.get_int("storage.archive_days", 180));
         manager_ = std::make_unique<SimpleHttpManager>(mc);
     }
 
