@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-10-27 · 存储分层 v2：类型 × 时间分区 + 冷热归档 + SQLite 留存
+
+### 背景
+
+服务端 JSONL 存储原先只有「类型」一层目录，每个文件跨全部时间无限增长；清理靠
+「读整个文件 → 裁尾 → 全量重写」，文件越大越慢；查询把 `from/to` 过滤放在**读完所有行之后**，
+等于每次查询都全量扫描，时间维度完全没被利用。每主机 SQLite 则完全没有留存策略。
+
+### 分层结构
+
+```
+data/server/
+├─ hosts.json / operators.json / policies/               低变更元数据（整体读写）
+├─ <类型>/<YYYY-MM-DD>/<host>/<collector>.jsonl          热区：高频类型按天
+├─ <类型>/<YYYY-MM>/<host>.jsonl                         热区：低频类型按月
+└─ archive/<类型>/<桶>/…/<collector>.jsonl.gz            冷归档：gzip，读时透明解压
+```
+
+### 能力
+
+| 项 | 说明 |
+| --- | --- |
+| 分片键 | `client_ts` → `timestamp` → `server_ts` → 今天（迟到事件回写其所属旧桶） |
+| 按类型策略 | `storage.types.<type>.{granularity,hot_days,archive_days}`，未写则跟随全局 |
+| 查询裁剪 | 先用 `from/to` 求相交的时间桶，只扫这些目录，其余整段跳过 |
+| 冷热归档 | 启动即跑一轮 + 每小时一轮：热区过期桶移到 `archive/` 并 gzip；超期归档删除 |
+| SQLite 留存 | `storage.db_retention_days`：按 `timestamp` 删除各表历史行，删除量大时 checkpoint + VACUUM |
+| 迁移 | 启动时把旧扁平/两级结构按行内时间戳重分片，幂等；兼容历史 `.jsonl.gz` |
+
+### 修复（本次一并解决）
+
+1. 归档文件 `.jsonl.gz` 按 `-6` 裁后缀得到 `file_win.js`，导致 `collector=` / `priority=high`
+   过滤时整份归档被跳过 —— 新增 `log_file_stem()` 统一处理。
+2. `/logs/collector-counts` 仍按旧两级目录直扫，分片后恒返回 0 —— 改走统一枚举器。
+3. 归档只压缩子目录里的 `.jsonl`，扁平类型（metrics/alerts/audit_summaries/command_results）
+   归档后不压缩 —— 新增 `compress_jsonl_tree()` 兼容两种布局。
+4. 归档遇同名桶直接 `remove` 源目录，迟到事件重建的旧桶会被静默删除 —— 改为 `merge_dir_into()` 合并。
+5. 合谋检测告警原先写扁平 `alerts/<host>.jsonl`，绕过分层体系 —— 改为 `alerts/<YYYY-MM-DD>/<host>.jsonl`。
+
+### 配置示例（`config/server_windows.yaml`）
+
+```yaml
+storage:
+  time_partition: true
+  archive_enabled: true
+  hot_days: 7
+  archive_days: 180
+  db_retention_days: 180
+  types:
+    audit_summaries: { granularity: month, hot_days: 30, archive_days: 365 }
+```
+
+---
+
 ## 2026-10-24（晚间）· 链式滑动匹配：拖长时间不再能绕过合谋检测
 
 ### 背景（用户实测发现的问题）

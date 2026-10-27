@@ -16,6 +16,13 @@ namespace af {
 // 资产画像注册表（M6-2），完整定义见 asset_profile.h
 namespace asset { class AssetProfileRegistry; }
 
+// 单类型存储策略：覆盖全局 storage_* 默认值（未设置项用 -1/空表示跟随全局）。
+struct StorageTypePolicy {
+    std::string granularity;          // "day"（默认）/ "month"
+    int         hot_days     { -1 };  // -1 = 跟随 storage_hot_days
+    int         archive_days { -1 };  // -1 = 跟随 storage_archive_days
+};
+
 struct ManagerConfig {
     std::string listen       { "127.0.0.1:8443" };
     std::string auth_token;
@@ -41,6 +48,10 @@ struct ManagerConfig {
     bool        storage_archive_enabled  { true };   // 是否启用冷热归档
     int         storage_hot_days         { 7 };      // 热区保留天数，超过移入 archive/
     int         storage_archive_days     { 180 };    // 归档保留天数，超过删除
+    // 单类型覆盖（key: operation_logs / host_metrics / alerts / audit_summaries / command_results）
+    std::map<std::string, StorageTypePolicy> storage_types;
+    // 每主机 SQLite（data/server/hosts/<id>/host.db）保留天数；<=0 关闭清理
+    int         storage_db_retention_days { 180 };
 };
 
 class SimpleHttpManager : public ManagerServer {
@@ -82,6 +93,9 @@ private:
 
     // 每主机独立 SQLite 数据库（数据隔离存储）
     std::unique_ptr<db::HostDbManager> host_db_mgr_;
+
+    // 按保留天数清理各主机 SQLite 的历史行（与 JSONL 归档同一后台线程驱动）
+    void purge_host_databases();
 
     // 资产画像注册表（M6-2）：懒加载 <data_dir>/asset_profiles/*.yaml
     std::mutex                         asset_profile_mutex_;

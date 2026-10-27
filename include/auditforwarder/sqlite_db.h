@@ -29,6 +29,9 @@ public:
     // 执行无返回的 SQL（建表、插入、更新等）。
     Result<void> exec(const std::string& sql);
 
+    // 执行无返回的 SQL，并返回受影响行数（DELETE/UPDATE 用）。
+    Result<int> exec_changes(const std::string& sql);
+
     // 查询并返回全部行。每行为列值数组。
     Result<std::vector<std::vector<std::string>>> query(const std::string& sql);
 
@@ -63,6 +66,10 @@ public:
 
     // 列出所有已创建数据库的主机 ID。
     std::vector<std::string> list_hosts() const;
+
+    // 按保留天数清理单主机库的历史行（events/metrics/alerts/audit/connection_requests），
+    // 删除量较大时顺带 checkpoint + VACUUM 回收磁盘。返回删除的总行数。
+    Result<std::size_t> purge_older_than(const std::string& host_id, int days);
 
     // 数据根目录。
     std::string root_dir() const { return root_dir_; }

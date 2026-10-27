@@ -224,6 +224,77 @@ void compress_jsonl_tree(const std::string& dir, int depth, int* compressed) {
     }
 }
 
+// 把一个目录的内容合并进已存在的目标目录（同名文件按内容追加），完成后删除源目录。
+// 用途：迟到事件会按 client_ts 重新创建"已归档"的旧日期桶，归档时若直接覆盖/删除源
+// 会静默丢掉这批数据；这里改为合并。
+// 注意：归档区文件统一是 <name>.jsonl.gz，而热区源文件是 <name>.jsonl，
+// 所以"同名判断"必须同时匹配 <name> 与 <name>.gz，否则会把归档文件覆盖掉。
+void merge_dir_into(const std::string& src, const std::string& dest) {
+    auto entries = fs::list_directory(src);
+    if (entries.is_err()) return;
+    for (const auto& e : entries.value()) {
+        const std::string name = fs::basename(e);
+        const std::string target = fs::join(dest, name);
+        if (fs::is_directory(e)) {
+            (void)fs::create_directories(target);
+            merge_dir_into(e, target);
+            continue;
+        }
+        if (!fs::is_regular(e)) continue;
+
+        // 去掉 .gz 后缀得到"纯文本目标路径"，归档侧的候选是 plain 与 plain.gz 两种
+        std::string plain = name;
+        if (plain.size() >= 3 && plain.substr(plain.size() - 3) == ".gz") {
+            plain.resize(plain.size() - 3);
+        }
+        const std::string plain_path = fs::join(dest, plain);
+        const std::string gz_path    = plain_path + ".gz";
+        const bool has_gz    = fs::exists(gz_path);
+        const bool has_plain = fs::exists(plain_path);
+
+        if (!has_gz && !has_plain) {
+            // 目标不存在：直接搬过去，稍后统一压缩
+            if (fs::rename(e, target).is_err()) {
+                AF_LOG_WARN("storage archive: cannot move " << e << " -> " << target);
+            }
+            continue;
+        }
+
+        // 同名冲突：旧内容（可能在 .gz 里）+ 新内容 → 写成纯文本 → 重新压缩
+        auto src_content = read_text_file(e);
+        if (src_content.is_err()) { (void)fs::remove(e); continue; }
+        const std::string& add = src_content.value();
+        if (add.empty()) { (void)fs::remove(e); continue; }
+
+        std::string merged;
+        if (has_gz) {
+            auto old = read_text_file(gz_path);      // 自动解压
+            if (old.is_ok()) merged = old.value();
+            (void)fs::remove(gz_path);
+        } else {
+            auto old = read_text_file(plain_path);
+            if (old.is_ok()) merged = old.value();
+        }
+        if (!merged.empty() && merged.back() != '\n') merged.push_back('\n');
+        merged += add;
+        if (merged.back() != '\n') merged.push_back('\n');
+
+        {
+            std::ofstream out(plain_path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                AF_LOG_WARN("storage archive: cannot write " << plain_path);
+                continue;
+            }
+            out << merged;
+        }
+        (void)fs::remove(e);
+        (void)gzip_compress_file(plain_path);   // 归档区统一为 .gz
+    }
+    // 源目录已空则删除
+    auto left = fs::list_directory(src);
+    if (left.is_ok() && left.value().empty()) (void)fs::remove(src, true);
+}
+
 std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 16);
@@ -1402,12 +1473,36 @@ std::string day_bucket_from_ms(u64 ms) {
     return buf;
 }
 
+// 毫秒 epoch → "YYYY-MM"（UTC），供按月分片的低频类型使用。
+std::string month_bucket_from_ms(u64 ms) {
+    std::time_t t = static_cast<std::time_t>(ms / 1000);
+    std::tm tm{};
+#ifdef AF_PLATFORM_WINDOWS
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m", &tm);
+    return buf;
+}
+
 // 判断目录名是否为日期桶 "YYYY-MM-DD"（严格格式）。
 bool is_day_bucket_name(const std::string& name) {
     if (name.size() != 10) return false;
     if (name[4] != '-' || name[7] != '-') return false;
     for (std::size_t i = 0; i < 10; ++i) {
         if (i == 4 || i == 7) continue;
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
+    }
+    return true;
+}
+
+// 判断目录名是否为月份桶 "YYYY-MM"（严格格式）。
+bool is_month_bucket_name(const std::string& name) {
+    if (name.size() != 7 || name[4] != '-') return false;
+    for (std::size_t i = 0; i < 7; ++i) {
+        if (i == 4) continue;
         if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
     }
     return true;
@@ -1423,24 +1518,71 @@ std::string date_prefix_of(const std::string& iso) {
     return {};
 }
 
-// 从事件 JSON 提取分片日期：client_ts(ms) > timestamp(ISO) > server_ts(ms) > 今天。
-std::string event_day_bucket(const std::string& item) {
+// 单类型解析后的存储策略（全局默认值 + storage.types.<type> 覆盖）。
+struct ResolvedStorage {
+    bool monthly      { false };
+    int  hot_days     { 7 };
+    int  archive_days { 180 };
+};
+
+ResolvedStorage resolve_storage(const ManagerConfig& cfg, const std::string& type_name) {
+    ResolvedStorage r;
+    r.hot_days     = cfg.storage_hot_days     > 0 ? cfg.storage_hot_days     : 1;
+    r.archive_days = cfg.storage_archive_days > 0 ? cfg.storage_archive_days : 1;
+    auto it = cfg.storage_types.find(type_name);
+    if (it != cfg.storage_types.end()) {
+        if (it->second.granularity == "month") r.monthly = true;
+        if (it->second.hot_days     > 0) r.hot_days     = it->second.hot_days;
+        if (it->second.archive_days > 0) r.archive_days = it->second.archive_days;
+    }
+    // 自检：热区窗口必须短于归档保留期，否则「刚归档即被清」
+    if (r.hot_days >= r.archive_days) {
+        r.hot_days = std::max(1, r.archive_days / 2);
+    }
+    return r;
+}
+
+// 事件 → 分片桶名：client_ts(ms) > timestamp(ISO) > server_ts(ms) > 今天。
+std::string event_bucket(const std::string& item, bool monthly) {
+    auto convert = [monthly](u64 ms) {
+        return monthly ? month_bucket_from_ms(ms) : day_bucket_from_ms(ms);
+    };
     std::string cts = json_numeric_token(item, logmeta::attr::kClientTs);
-    if (!cts.empty()) return day_bucket_from_ms(std::strtoull(cts.c_str(), nullptr, 10));
+    if (!cts.empty() && cts != "0") {
+        return convert(std::strtoull(cts.c_str(), nullptr, 10));
+    }
     std::string d = date_prefix_of(json_string_field(item, "timestamp"));
-    if (!d.empty()) return d;
+    if (!d.empty()) return monthly ? d.substr(0, 7) : d;
     std::string sts = json_numeric_token(item, logmeta::attr::kServerTs);
-    if (!sts.empty()) return day_bucket_from_ms(std::strtoull(sts.c_str(), nullptr, 10));
-    return day_bucket_from_ms(static_cast<u64>(std::time(nullptr)) * 1000);
+    if (!sts.empty() && sts != "0") {
+        return convert(std::strtoull(sts.c_str(), nullptr, 10));
+    }
+    return convert(static_cast<u64>(std::time(nullptr)) * 1000);
+}
+
+// 桶目录是否与 [from_d, to_d] 时间段有交集（支持日桶与月桶）。
+bool bucket_overlaps(const std::string& bucket, const std::string& from_d, const std::string& to_d) {
+    if (bucket.empty()) return true;
+    if (is_month_bucket_name(bucket)) {
+        const std::string lo = bucket + "-01";
+        const std::string hi = bucket + "-31";
+        if (!from_d.empty() && hi < from_d) return false;
+        if (!to_d.empty() && lo > to_d) return false;
+        return true;
+    }
+    if (!from_d.empty() && bucket < from_d) return false;
+    if (!to_d.empty() && bucket > to_d) return false;
+    return true;
 }
 
 // 返回某类型目录下"当前事件"应写入的分片目录：
-// 分片开启 → <type_dir>/<YYYY-MM-DD>；关闭 → <type_dir>（旧扁平结构，向后兼容）。
+// 分片开启 → <type_dir>/<YYYY-MM-DD>（或 <YYYY-MM>）；关闭 → <type_dir>（旧扁平结构）。
 std::string sharded_type_dir(const ManagerConfig& cfg,
                              const std::string& type_dir,
                              const std::string& item) {
     if (!cfg.storage_time_partition) return type_dir;
-    return fs::join(type_dir, event_day_bucket(item));
+    const ResolvedStorage rs = resolve_storage(cfg, fs::basename(type_dir));
+    return fs::join(type_dir, event_bucket(item, rs.monthly));
 }
 
 // ================= 存储分层：分片目录枚举 =================
@@ -1482,10 +1624,9 @@ std::vector<LogFileRef> enumerate_operation_log_files(const ManagerConfig& cfg,
         if (entries.is_err()) continue;
         for (const auto& e : entries.value()) {
             const std::string name = fs::basename(e);
-            if (is_day_bucket_name(name)) {
-                // 日期桶：<YYYY-MM-DD>/<host_id>/<collector>.jsonl，按 from/to 裁剪
-                if (!from_d.empty() && name < from_d) continue;
-                if (!to_d.empty() && name > to_d) continue;
+            if (is_day_bucket_name(name) || is_month_bucket_name(name)) {
+                // 时间桶：<桶>/<host_id>/<collector>.jsonl（日桶或月桶），按 from/to 裁剪
+                if (!bucket_overlaps(name, from_d, to_d)) continue;
                 if (!host_id.empty()) {
                     collect_files_in_host_dir(fs::join(e, host_id), host_id, out);
                 } else {
@@ -1529,10 +1670,9 @@ std::vector<LogFileRef> enumerate_flat_log_files(const ManagerConfig& cfg,
         if (entries.is_err()) continue;
         for (const auto& e : entries.value()) {
             const std::string name = fs::basename(e);
-            if (is_day_bucket_name(name)) {
-                // 日期桶：<YYYY-MM-DD>/<host_id>.jsonl 或 .jsonl.gz
-                if (!from_d.empty() && name < from_d) continue;
-                if (!to_d.empty() && name > to_d) continue;
+            if (is_day_bucket_name(name) || is_month_bucket_name(name)) {
+                // 时间桶：<桶>/<host_id>.jsonl 或 .jsonl.gz（日桶或月桶）
+                if (!bucket_overlaps(name, from_d, to_d)) continue;
                 if (!host_id.empty()) {
                     std::string p = fs::join(e, host_id + ".jsonl");
                     std::string pgz = fs::join(e, host_id + ".jsonl.gz");
@@ -1581,33 +1721,45 @@ std::string days_ago_bucket(int days) {
     return buf;
 }
 
-// 归档一个类型目录：把 hot_days 之前的日期桶从热区 move 到 archive/<type>/，并 gzip 压缩。
+// 桶是否已整段落在 cutoff 之前（日桶按整日、月桶按整月判定）。
+bool bucket_expired(const std::string& bucket, const std::string& cutoff_day) {
+    if (is_month_bucket_name(bucket)) return (bucket + "-31") < cutoff_day;
+    return bucket < cutoff_day;
+}
+
+// 归档一个类型目录：把 hot_days 之前的桶从热区 move 到 archive/<type>/，并 gzip 压缩。
 void archive_type_dir(const ManagerConfig& cfg,
                       const std::string& type_dir,
                       const std::string& type_name) {
     if (!cfg.storage_archive_enabled || !cfg.storage_time_partition) return;
     if (!fs::exists(type_dir)) return;
-    const std::string cutoff = days_ago_bucket(cfg.storage_hot_days > 0 ? cfg.storage_hot_days : 1);
+    const ResolvedStorage rs = resolve_storage(cfg, type_name);
+    const std::string cutoff = days_ago_bucket(rs.hot_days);
     const std::string dest_root = fs::join(archive_dir(cfg), type_name);
 
     auto entries = fs::list_directory(type_dir);
     if (entries.is_err()) return;
     for (const auto& e : entries.value()) {
         std::string name = fs::basename(e);
-        if (!is_day_bucket_name(name)) continue;   // 旧扁平/两级结构交由迁移处理，这里只归档日期桶
-        if (name >= cutoff) continue;              // 仍在热区窗口内
-        std::string dest = fs::join(dest_root, name);
-        if (fs::exists(dest)) {
-            (void)fs::remove(e, true);             // 目标已存在（重复归档），直接删除源
-            continue;
+        if (!is_day_bucket_name(name) && !is_month_bucket_name(name)) {
+            continue;   // 旧扁平/两级结构交由迁移处理，这里只归档时间桶
         }
+        if (!bucket_expired(name, cutoff)) continue;   // 仍在热区窗口内
+        std::string dest = fs::join(dest_root, name);
         auto cr = fs::create_directories(dest_root);
         if (cr.is_err()) continue;
-        auto rn = fs::rename(e, dest);
-        if (rn.is_err()) {
-            AF_LOG_WARN("storage archive: cannot move " << e << " -> " << dest
-                        << ": " << rn.error().message());
-            continue;
+        if (fs::exists(dest)) {
+            // 目标已存在：通常是迟到事件按 client_ts 重建了已归档的旧日期桶，
+            // 这里合并（追加）而不是删除源，避免静默丢数据。
+            merge_dir_into(e, dest);
+            AF_LOG_INFO("storage archive: merged late bucket " << name << " into " << dest);
+        } else {
+            auto rn = fs::rename(e, dest);
+            if (rn.is_err()) {
+                AF_LOG_WARN("storage archive: cannot move " << e << " -> " << dest
+                            << ": " << rn.error().message());
+                continue;
+            }
         }
         // 移动成功后，递归压缩归档目录里的 .jsonl（兼容两种布局）：
         //   operation_logs: dest/<host_id>/<collector>.jsonl
@@ -1620,18 +1772,19 @@ void archive_type_dir(const ManagerConfig& cfg,
     }
 }
 
-// 清理归档区中超过 archive_days 的日期桶。
+// 清理归档区中超过 archive_days 的桶。
 void purge_archive_dir(const ManagerConfig& cfg, const std::string& type_name) {
     if (!cfg.storage_archive_enabled) return;
     const std::string root = fs::join(archive_dir(cfg), type_name);
     if (!fs::exists(root)) return;
-    const std::string cutoff = days_ago_bucket(cfg.storage_archive_days > 0 ? cfg.storage_archive_days : 1);
+    const ResolvedStorage rs = resolve_storage(cfg, type_name);
+    const std::string cutoff = days_ago_bucket(rs.archive_days);
     auto entries = fs::list_directory(root);
     if (entries.is_err()) return;
     for (const auto& e : entries.value()) {
         std::string name = fs::basename(e);
-        if (!is_day_bucket_name(name)) continue;
-        if (name >= cutoff) continue;
+        if (!is_day_bucket_name(name) && !is_month_bucket_name(name)) continue;
+        if (!bucket_expired(name, cutoff)) continue;
         (void)fs::remove(e, true);
     }
 }
@@ -1651,36 +1804,40 @@ void run_storage_archive(const ManagerConfig& cfg) {
     purge_archive_dir(cfg, "command_results");
 }
 
-// 把旧两级 operation_logs/<host>/<coll>.jsonl 重分片为 <YYYY-MM-DD>/<host>/<coll>.jsonl（幂等）。
+// 把旧两级 operation_logs/<host>/<coll>.jsonl(.gz) 重分片为 <桶>/<host>/<coll>.jsonl（幂等）。
 void migrate_operation_logs_to_buckets(const ManagerConfig& cfg) {
     if (!cfg.storage_time_partition) return;
     const std::string root = operation_log_dir(cfg);
     if (!fs::exists(root)) return;
+    const ResolvedStorage rs = resolve_storage(cfg, "operation_logs");
     auto entries = fs::list_directory(root);
     if (entries.is_err()) return;
     for (const auto& e : entries.value()) {
         std::string host = fs::basename(e);
-        if (is_day_bucket_name(host) || !fs::is_directory(e)) continue;
+        if (is_day_bucket_name(host) || is_month_bucket_name(host)) continue;
+        if (!fs::is_directory(e)) continue;
         auto files = fs::list_directory(e);
         if (files.is_err()) continue;
         for (const auto& f : files.value()) {
-            if (!fs::is_regular(f) || fs::extension(f) != ".jsonl") continue;
-            std::string coll = fs::basename(f);
-            coll.resize(coll.size() - 6);
-            auto content = read_text_file(f);
+            if (!fs::is_regular(f)) continue;
+            const std::string ext = fs::extension(f);
+            if (ext != ".jsonl" && ext != ".gz") continue;   // 兼容历史 .jsonl.gz
+            const std::string coll = log_file_stem(f);
+            if (coll.empty()) continue;
+            auto content = read_text_file(f);   // 透明解压
             if (content.is_err()) continue;
             std::istringstream in(content.value());
             std::string line;
             std::size_t moved = 0;
             while (std::getline(in, line)) {
                 if (line.empty()) continue;
-                std::string dest_dir = fs::join(fs::join(root, event_day_bucket(line)), host);
+                std::string dest_dir = fs::join(fs::join(root, event_bucket(line, rs.monthly)), host);
                 auto r = append_jsonl_retained(dest_dir, coll + ".jsonl", line, 0);
                 if (r.is_ok()) ++moved;
             }
             if (moved > 0) {
                 AF_LOG_INFO("operation_logs migrate: " << f << " -> " << host
-                            << "/" << coll << ".jsonl 按天重分片 (" << moved << " lines)");
+                            << "/" << coll << ".jsonl 重分片 (" << moved << " lines)");
                 (void)fs::remove(f);
             }
         }
@@ -2441,32 +2598,65 @@ Result<void> SimpleHttpManager::start(Agent& agent) {
         }
     });
 
-    // 启动后台归档：周期性把热区过期日期桶移入 archive/，并清理超期归档
+    // 初始化每主机独立 SQLite 数据库（归档线程需要它做留存清理，必须先建好）
+    host_db_mgr_ = std::make_unique<db::HostDbManager>();
+    auto dbinit = host_db_mgr_->init(cfg_.data_dir);
+    if (dbinit.is_err()) {
+        AF_LOG_ERROR("host_db_mgr init failed: " << dbinit.error().message());
+    }
+
+    // 存储配置自检：热区窗口必须短于归档保留期，否则归档后立刻被清理
+    if (cfg_.storage_archive_days > 0 && cfg_.storage_hot_days >= cfg_.storage_archive_days) {
+        const int fixed = std::max(1, cfg_.storage_archive_days / 2);
+        AF_LOG_WARN("storage: hot_days(" << cfg_.storage_hot_days
+                    << ") >= archive_days(" << cfg_.storage_archive_days
+                    << ")，自动调整为 " << fixed);
+        cfg_.storage_hot_days = fixed;
+    }
+    AF_LOG_INFO("storage: time_partition=" << (cfg_.storage_time_partition ? "on" : "off")
+                << " archive=" << (cfg_.storage_archive_enabled ? "on" : "off")
+                << " hot_days=" << cfg_.storage_hot_days
+                << " archive_days=" << cfg_.storage_archive_days
+                << " db_retention_days=" << cfg_.storage_db_retention_days
+                << " type_overrides=" << cfg_.storage_types.size());
+
+    // 启动后台归档：启动即跑一轮让重启后立刻收敛，之后每小时一轮
     if (cfg_.storage_archive_enabled || cfg_.storage_time_partition) {
         archive_running_.store(true);
         archive_thr_ = std::thread([this] {
+            run_storage_archive(cfg_);
+            purge_host_databases();
             while (archive_running_.load()) {
-                // 每小时归档一轮；拆成小段 sleep 以便 stop() 能及时退出
+                // 每小时一轮；拆成小段 sleep 以便 stop() 能及时退出
                 for (int i = 0; i < 60 && archive_running_.load(); ++i) {
                     std::this_thread::sleep_for(std::chrono::seconds(60));
                 }
                 if (!archive_running_.load()) break;
                 run_storage_archive(cfg_);
+                purge_host_databases();
             }
         });
     }
 
     AF_LOG_INFO("manager: listening on " << cfg_.listen
                 << "  (status_timeout=" << cfg_.status_timeout_seconds << "s)");
-    // 初始化每主机独立 SQLite 数据库
-    host_db_mgr_ = std::make_unique<db::HostDbManager>();
-    auto dbinit = host_db_mgr_->init(cfg_.data_dir);
-    if (dbinit.is_err()) {
-        AF_LOG_ERROR("host_db_mgr init failed: " << dbinit.error().message());
-    }
     // 合谋检测模块并行启动：复用 data_dir，与原有审计互不侵入
     collusion::Engine::instance().start(cfg_.data_dir);
     return Result<void>::ok();
+}
+
+// 按保留天数清理各主机 SQLite 的历史行（与 JSONL 归档同一后台线程驱动）。
+void SimpleHttpManager::purge_host_databases() {
+    if (!host_db_mgr_ || cfg_.storage_db_retention_days <= 0) return;
+    for (const auto& host : host_db_mgr_->list_hosts()) {
+        auto r = host_db_mgr_->purge_older_than(host, cfg_.storage_db_retention_days);
+        if (r.is_err()) {
+            AF_LOG_WARN("storage: host.db " << host << " 清理失败: " << r.error().message());
+        } else if (r.value() > 0) {
+            AF_LOG_INFO("storage: host.db " << host << " 清理 " << r.value()
+                        << " 行（保留 " << cfg_.storage_db_retention_days << " 天）");
+        }
+    }
 }
 
 void SimpleHttpManager::stop() {
@@ -3583,7 +3773,13 @@ std::string SimpleHttpManager::route(const std::string& method, const std::strin
           << "  \"accepted_count\": " << accepted << ",\n"
           << "  \"host_id\": \"" << json_escape(first_host) << "\",\n"
           << "  \"storage_dir\": \"" << json_escape(operation_log_dir(cfg_)) << "\",\n"
-          << "  \"layout\": \"operation_logs/<host_id>/<collector>.jsonl (+privileged.jsonl)\",\n"
+          << "  \"layout\": \"" << (cfg_.storage_time_partition
+                 ? (resolve_storage(cfg_, "operation_logs").monthly
+                        ? "operation_logs/<YYYY-MM>/<host_id>/<collector>.jsonl (+privileged.jsonl)"
+                        : "operation_logs/<YYYY-MM-DD>/<host_id>/<collector>.jsonl (+privileged.jsonl)")
+                 : "operation_logs/<host_id>/<collector>.jsonl (+privileged.jsonl)")
+          << "\",\n"
+          << "  \"archive_dir\": \"" << json_escape(fs::join(archive_dir(cfg_), "operation_logs")) << "\",\n"
           << "  \"indexed_fields\": [\"host_id\", \"collector\", \"priority\", \"operation_type\", \"event_type\", \"timestamp\"]\n"
           << "}";
         response_body = o.str();

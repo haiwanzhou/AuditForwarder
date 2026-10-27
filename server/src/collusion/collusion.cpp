@@ -232,6 +232,21 @@ std::string workorders_path(const std::string& data_dir) {
     return fs::join(policy_dir(data_dir), "collusion_workorders.json");
 }
 
+// 告警落盘路径：与 manager 侧写入保持一致，按天分片到 alerts/<YYYY-MM-DD>/<host>.jsonl，
+// 这样才能被归档线程统一搬移/压缩/清理（原先写 alerts/<host>.jsonl 会绕过分层体系）。
+std::string alert_day_dir(const std::string& data_dir, u64 epoch_sec) {
+    std::time_t t = static_cast<std::time_t>(epoch_sec);
+    std::tm tm{};
+#ifdef AF_PLATFORM_WINDOWS
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+    return fs::join(fs::join(data_dir.empty() ? "data" : data_dir, "alerts"), buf);
+}
+
 // ---------------- 默认配置 / 规则 / 工单桩（首次运行自动生成，支持热更新） ----------------
 
 std::string default_config_json() {
@@ -1769,7 +1784,7 @@ void Engine::evaluate_correlation_locked(const CleanEvent& e) {
                   << "\"evidence\":\"" << json_escape(evidence.str()) << "\","
                   << "\"status\":\"open\""
                   << "}";
-            auto adir = fs::join(data_dir_.empty() ? "data" : data_dir_, "alerts");
+            auto adir = alert_day_dir(data_dir_, now_epoch());   // 按天分片，纳入归档体系
             (void)fs::create_directories(adir);
             std::ofstream aout(fs::join(adir, host + ".jsonl"), std::ios::binary | std::ios::app);
             if (aout) aout << aline.str() << "\n";
@@ -1914,7 +1929,8 @@ void Engine::evaluate_locked(const AggSet& set, bool update_profile, bool eager)
 
     persist_risk_locked(ev.str(), res.level);
 
-    // 平台告警（复用现有 alerts/<host>.jsonl，可在“日志与告警”面板查看）：
+    // 平台告警（按天分片写入 alerts/<YYYY-MM-DD>/<host>.jsonl，与 manager 侧一致，
+    // 可在“日志与告警”面板查看，并纳入归档线程的搬移/压缩/清理）：
     // HIGH/MID 推送；LOW 仅留存线索，不推送。
     if (res.level == "HIGH" || res.level == "MID") {
         std::string host = sorted.empty() ? "collusion" : sorted.front().server_id;
@@ -1943,7 +1959,7 @@ void Engine::evaluate_locked(const AggSet& set, bool update_profile, bool eager)
               << "\"evidence\":\"" << json_escape(evidence.str()) << "\","
               << "\"status\":\"open\""
               << "}";
-        auto adir = fs::join(data_dir_.empty() ? "data" : data_dir_, "alerts");
+        auto adir = alert_day_dir(data_dir_, now_epoch());   // 按天分片，纳入归档体系
         (void)fs::create_directories(adir);
         std::ofstream aout(fs::join(adir, host + ".jsonl"), std::ios::binary | std::ios::app);
         if (aout) aout << aline.str() << "\n";

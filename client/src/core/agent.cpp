@@ -404,6 +404,21 @@ Result<void> Agent::init(const AgentConfig& cfg) {
         mc.storage_archive_enabled = scfg.get_bool("storage.archive_enabled", true);
         mc.storage_hot_days        = static_cast<int>(scfg.get_int("storage.hot_days", 7));
         mc.storage_archive_days    = static_cast<int>(scfg.get_int("storage.archive_days", 180));
+        mc.storage_db_retention_days =
+            static_cast<int>(scfg.get_int("storage.db_retention_days", 180));
+        // 单类型覆盖：storage.types.<type>.{granularity,hot_days,archive_days}
+        for (const char* type : {"operation_logs", "host_metrics", "alerts",
+                                 "audit_summaries", "command_results"}) {
+            const std::string base = std::string("storage.types.") + type;
+            StorageTypePolicy p;
+            p.granularity  = scfg.get_string(base + ".granularity");
+            p.hot_days     = static_cast<int>(scfg.get_int(base + ".hot_days", -1));
+            p.archive_days = static_cast<int>(scfg.get_int(base + ".archive_days", -1));
+            // 仅在显式配置时才写入覆盖表，避免用空值覆盖全局默认
+            if (!p.granularity.empty() || p.hot_days > 0 || p.archive_days > 0) {
+                mc.storage_types[type] = p;
+            }
+        }
         manager_ = std::make_unique<SimpleHttpManager>(mc);
     }
 

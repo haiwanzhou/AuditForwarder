@@ -5,6 +5,8 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <sstream>
 
@@ -77,6 +79,13 @@ Result<void> SqliteDb::exec_unlocked(const std::string& sql) {
         return Result<void>(Error::Code::IoError, "sqlite exec: " + last_error_);
     }
     return Result<void>::ok();
+}
+
+Result<int> SqliteDb::exec_changes(const std::string& sql) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto r = exec_unlocked(sql);
+    if (r.is_err()) return Result<int>(r.error());
+    return sqlite3_changes(db_->handle);
 }
 
 Result<std::vector<std::vector<std::string>>> SqliteDb::query(const std::string& sql) {
@@ -242,6 +251,43 @@ std::vector<std::string> HostDbManager::list_hosts() const {
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// 按保留天数清理单主机库。timestamp 统一写入为 ISO8601 UTC（YYYY-MM-DDTHH:MM:SSZ），
+// 因此可以直接用字符串字典序做时间比较，无需 SQLite 日期函数。
+Result<std::size_t> HostDbManager::purge_older_than(const std::string& host_id, int days) {
+    if (days <= 0) return Result<std::size_t>(static_cast<std::size_t>(0));
+    auto r = host_db(host_id);            // 内部自带加锁，此处不要再持 mtx_
+    if (r.is_err()) return Result<std::size_t>(r.error());
+    SqliteDb* db = r.value();
+    if (!db || !db->is_open()) return Result<std::size_t>(static_cast<std::size_t>(0));
+
+    const std::time_t t = std::time(nullptr) - static_cast<std::time_t>(days) * 86400;
+    std::tm tm_buf {};
+    char cutoff[32] {0};
+#ifdef _WIN32
+    if (gmtime_s(&tm_buf, &t) != 0) return Result<std::size_t>(static_cast<std::size_t>(0));
+#else
+    if (!gmtime_r(&t, &tm_buf)) return Result<std::size_t>(static_cast<std::size_t>(0));
+#endif
+    std::strftime(cutoff, sizeof(cutoff), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+
+    static const char* kTables[] = {"events", "metrics", "alerts", "audit", "connection_requests"};
+    std::size_t total = 0;
+    for (const char* table : kTables) {
+        const std::string sql = "DELETE FROM " + std::string(table) +
+                                " WHERE timestamp < '" + std::string(cutoff) + "'";
+        auto d = db->exec_changes(sql);
+        if (d.is_ok() && d.value() > 0) total += static_cast<std::size_t>(d.value());
+    }
+    // 删除量大时才回收空间（VACUUM 会重写整库，代价高，不宜每轮都做）
+    if (total >= 2000) {
+        (void)db->exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        (void)db->exec("VACUUM");
+    } else if (total > 0) {
+        (void)db->exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    return Result<std::size_t>(total);
 }
 
 } // namespace af::db
