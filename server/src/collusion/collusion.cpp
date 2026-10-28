@@ -888,11 +888,12 @@ bool clean_event_json(const std::string& json, CleanEvent& out) {
     if (out.res_key.empty()) return false;
 
     // 归一化动作（<verb>.<object>）：客户端 ActionNormalizer 产出，规则据此精确匹配。
-    // 客户端把归一化动作放在 attrs.ozsf.action_norm（键名带点，直接出现在 JSON 文本里），
-    // 服务端优先取顶层 action_norm / ocsf.activity_name，取不到再从 attrs.ozsf.action_norm 兜底。
+    // 优先级：顶层 action_norm → ozsf.action_norm（精确归一化）→ ocsf.activity_name（HTTP method 单字兜底）。
+    // 注意：ocsf.activity_name 是 "create"/"delete" 这种单字，它不是空，
+    // 必须让 ozsf.action_norm 优先，否则精确归一化会被单字挡住，规则永远匹配不上。
     out.action_norm = logpolicy::json_string_field(json, "action_norm");
-    if (out.action_norm.empty()) out.action_norm = logpolicy::json_string_field(json, "ocsf.activity_name");
     if (out.action_norm.empty()) out.action_norm = logpolicy::json_string_field(json, "ozsf.action_norm");
+    if (out.action_norm.empty()) out.action_norm = logpolicy::json_string_field(json, "ocsf.activity_name");
 
     out.op_param = logpolicy::json_string_field(json, "op_param");
     if (out.op_param.empty()) out.op_param = logpolicy::json_string_field(json, "message");
