@@ -289,10 +289,13 @@ std::string default_config_json() {
       "second": ["export", "download", "dump", "导出", "下载"] }
   ],
   "asset_groups": [
-    { "name": "backup-group",    "patterns": ["*backup*", "*snapshot*", "*快照*", "*.bak", "*备份*"] },
+    { "name": "backup-group",    "patterns": ["*backup*", "*snapshot*", "*快照*", "*.bak", "*备份*", "*storage*", "*volume*"],
+      "note": "存储卷/挂载点与备份、快照同属备份链资产：R-001 的卸载步骤落在 volume 上，不纳入本组会断链" },
     { "name": "key-mgmt-group",  "patterns": ["*key*", "*secret*", "*cert*", "*.pem", "*密钥*"] },
-    { "name": "sys-config-group","patterns": ["*config*", "*.conf", "*.ini", "*.yaml", "*.yml", "*.service", "*hosts*"] },
-    { "name": "db-group",        "patterns": ["*database*", "*.db", "*.sql", "*mysql*", "*postgres*", "*oracle*", "*redis*"] },
+    { "name": "sys-config-group","patterns": ["*config*", "*.conf", "*.ini", "*.yaml", "*.yml", "*.service", "*service*", "*hosts*", "*system*", "*log*"],
+      "note": "服务名与日志端点纳入：R-003 的重启/清日志步骤按 /system/service、/system/logs 形式出现" },
+    { "name": "db-group",        "patterns": ["*database*", "*.db", "*.sql", "*mysql*", "*postgres*", "*oracle*", "*redis*", "*book*", "*user*"],
+      "note": "业务库表与账号对象纳入：R-004 的授权/导出/清审计落在 /users 与 /books 资源上" },
     { "name": "general-group",   "patterns": ["*"], "note": "兜底资产组：仅产生低风险线索，可按需删除" }
   ],
   "whitelist_groups": [
