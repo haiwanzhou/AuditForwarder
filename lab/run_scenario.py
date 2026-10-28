@@ -44,7 +44,11 @@ def call(opener, base, method, path, body=None, token=None):
     try:
         with opener.open(req, timeout=15) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw.strip() else {})
+            try:
+                return resp.status, (json.loads(raw) if raw.strip() else {})
+            except json.JSONDecodeError:
+                # 图书系统首页返回 HTML，不是 JSON；不能因此把成功响应当成连接失败
+                return resp.status, {"raw": raw[:200]}
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
         try:
